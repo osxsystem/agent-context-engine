@@ -31,12 +31,9 @@ use crate::config::{
     CURRENT_VERSION, ConfigError, Settings, config_path, ensure_dir_and_load, write_settings_atomic,
 };
 use crate::defender;
-use crate::embedding::voyage::EmbedClient;
 use crate::indexing::IndexEngine;
-use crate::llm::LlmClient;
 use crate::mcp::{McpHandler, RepoMcpHandler, run_codebase_retrieval};
 use crate::path_in_repo;
-use crate::query;
 use crate::store;
 
 // ─── IntoResponse for ConfigError ─────────────────────────────────────────
@@ -202,6 +199,11 @@ pub fn build_router(
             get(plan_get_order_status),
         )
         .route("/api/plan/usage", get(plan_get_usage))
+        .route("/api/plan/free-trial", get(plan_get_free_trial))
+        .route(
+            "/api/plan/free-trial/claim",
+            post(plan_post_free_trial_claim),
+        )
         .route("/mcp-repo/:repo_id", any(handle_repo_mcp))
         .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
@@ -480,115 +482,53 @@ async fn delete_repo_index(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
-    // Resolve the generation BEFORE the bump — this is the directory currently on
-    // disk that we must remove. The read guard is dropped immediately.
-    let current_generation = repo_generation(&state, &repo).await;
-
-    // Cancel any in-progress indexing, wait for it to finish, then drop the
-    // cached DB handle. This guarantees no pipeline holds a RocksDB lock on
-    // the directory when we attempt to remove it.
-    state.index_engine.close_repo_db(&repo).await;
-
-    // Clear in-memory state immediately — the index is functionally gone from
-    // the user's perspective regardless of whether the directory removal succeeds.
-    state.index_engine.clear_repo_index(&repo).await;
-
-    // Bump the generation and persist (disk FIRST, then memory — mirroring
-    // put_config's ordering) BEFORE touching the old directory. Ordering is the fix
-    // for a real incident: the old code removed the directory first (a gated, ~30s
-    // Windows+Defender lock-drain retry loop) and bumped only afterwards. A re-index
-    // triggered during that window read the *old* generation (bump not yet durable)
-    // and parked behind the same per-repo open gate the removal held — wedging the UI
-    // in an indeterminate "Indexing…" with a dead Cancel, then failing with "open
-    // surrealdb" once it recreated the still-draining old path. Persisting the bump
-    // first guarantees a concurrent re-index resolves the NEW generation (a pristine
-    // path the draining handle never touched) and opens immediately. Persisting to
-    // memory before responding also lets the UI's subsequent "Xóa repo" PUT
-    // /api/config preserve the bump (it reads repo_generations from the live handle;
-    // see put_config).
-    let next_generation = current_generation.saturating_add(1);
-    let target = config_path(&state.home_dir);
-    let normalized_repo = crate::store::normalize_repo_path(&repo);
-    let to_write = {
-        let mut s = state.settings.read().await.clone();
-        s.repo_generations
-            .insert(normalized_repo.clone(), next_generation);
-        // "Remove Repo": drop it from the configured list in the SAME durable
-        // write as the generation bump. Doing it here (not via a follow-up PUT
-        // /api/config) makes the removal durable BEFORE the slow lock-drain below,
-        // so a reload mid-teardown — or a lost PUT — can't resurrect the repo from
-        // disk. The generation entry is intentionally KEPT (see repo_generations
-        // doc) so a future re-add reuses the higher generation instead of racing
-        // the still-draining old LOCK.
-        if remove_repo {
-            s.repos.retain(|r| r != &normalized_repo);
-        }
-        s
-    };
-    let persist = tokio::task::spawn_blocking({
-        let to_write = to_write.clone();
-        move || write_settings_atomic(&target, &to_write)
-    })
-    .await;
-    match persist {
-        Ok(Ok(())) => {
-            // Disk write succeeded — now swap memory under the write lock so the
-            // live handle matches disk (GET /api/config reads disk; in-memory is
-            // the source of truth for indexing triggers and the put_config diff).
-            let mut guard = state.settings.write().await;
-            guard
-                .repo_generations
-                .insert(normalized_repo.clone(), next_generation);
-            if remove_repo {
-                guard.repos.retain(|r| r != &normalized_repo);
-            }
-        }
-        Ok(Err(e)) => {
-            // Persisting the bump failed. Without a durable bump a re-index could
-            // reuse the old generation path — and we have NOT removed it yet, so the
-            // old index is intact. Surface the error so the user can retry rather
-            // than silently degrade.
-            let body = json!({ "error": format!("failed to persist index generation: {e}") });
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-        Err(join_err) => {
-            let body = json!({ "error": format!("internal error: {join_err}") });
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-    }
-
+    // The entire remove core (close handle, clear in-memory state, atomic
+    // generation-bump persist disk-then-memory, ungated old-dir removal) lives in
+    // the shared `engine_ops::remove_index` so the CLI runs the EXACT same logic.
+    // `also_drop_repo = remove_repo` folds the "Remove Repo" repos.retain(...) into
+    // the SAME durable write as the bump (see the fn doc for the atomicity
+    // rationale). The two response shapes below are unchanged.
+    //
     // NOTE: even for a full "Remove Repo" we deliberately do NOT drop the
-    // in-memory status entry — `clear_repo_index` above reset it in place. The
-    // detached watcher has no stop handle, so the status entry is the only thing
-    // that keeps a future `register_repo` (re-add) from spawning a second watcher
-    // (unbounded growth on repeated remove/re-add). The leftover idle entry is
-    // harmless: GET /api/config (disk) no longer lists the repo, so the UI renders
-    // it gone; the poll may re-sync once per tick, the same bounded path already
-    // used to surface MCP-auto-registered repos.
-
-    // Now remove the OLD generation's directory WITHOUT the open gate. The bump above
-    // is durable, so every future open targets `next_generation` — nothing can race
-    // or recreate `current_generation`, and there is nothing to serialize against. A
-    // gate-held removal here would block the fresh generation's open for the whole
-    // ~30s drain (the gate is keyed by repo, not generation); the ungated removal lets
-    // a re-index proceed on the clean path immediately while this drains in the
-    // foreground. If it outlives the retry budget, the boot-time sweep reclaims it
-    // (store::sweep_stale_generations).
-    let removed =
-        store::remove_old_generation_dir(&state.data_dir, &repo, current_generation).await;
-
-    if removed {
-        Json(json!({ "status": "ok" })).into_response()
-    } else {
-        // The directory wasn't fully removed yet (OS still holds the files), but the
-        // generation bump already redirected future indexing to a fresh path — so the
-        // repo is fully usable now and the orphan will be swept on next boot. Report
-        // "pending" for transparency (the UI can note the leftover), not as a blocker.
-        Json(json!({
-            "status": "pending",
-            "message": "old index directory not fully removed yet; it will be reclaimed on next restart"
-        }))
-        .into_response()
+    // in-memory status entry — `clear_repo_index` inside the shared fn reset it in
+    // place. The detached watcher has no stop handle, so the status entry is the
+    // only thing that keeps a future `register_repo` (re-add) from spawning a
+    // second watcher (unbounded growth on repeated remove/re-add). The leftover
+    // idle entry is harmless: GET /api/config (disk) no longer lists the repo, so
+    // the UI renders it gone; the poll may re-sync once per tick, the same bounded
+    // path already used to surface MCP-auto-registered repos.
+    match crate::engine_ops::remove_index(
+        &state.home_dir,
+        &state.data_dir,
+        &state.index_engine,
+        &state.settings,
+        &repo,
+        remove_repo,
+    )
+    .await
+    {
+        Ok(crate::engine_ops::RemoveOutcome::Removed) => {
+            Json(json!({ "status": "ok" })).into_response()
+        }
+        Ok(crate::engine_ops::RemoveOutcome::Pending) => {
+            // The directory wasn't fully removed yet (OS still holds the files), but the
+            // generation bump already redirected future indexing to a fresh path — so the
+            // repo is fully usable now and the orphan will be swept on next boot. Report
+            // "pending" for transparency (the UI can note the leftover), not as a blocker.
+            Json(json!({
+                "status": "pending",
+                "message": "old index directory not fully removed yet; it will be reclaimed on next restart"
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            // Persisting the bump failed (or an internal join error). Without a durable
+            // bump a re-index could reuse the old generation path — and the old index is
+            // intact (we abort before removal). Surface the error so the user can retry
+            // rather than silently degrade.
+            let body = json!({ "error": format!("failed to persist index generation: {e}") });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
     }
 }
 
@@ -654,21 +594,33 @@ async fn get_index_stats(State(state): State<AppState>, Path(repo_id): Path<Stri
         Err(r) => return r,
     };
 
-    let files = match store::ops::count_indexed_files(&db, &repo).await {
-        Ok(v) => v,
-        Err(e) => return db_error("count files", e),
-    };
-    let chunks = match store::ops::count_chunks(&db).await {
-        Ok(v) => v,
-        Err(e) => return db_error("count chunks", e),
-    };
-    let symbols = match store::ops::count_symbols(&db).await {
-        Ok(v) => v,
-        Err(e) => return db_error("count symbols", e),
-    };
-    let embedding_dim = match store::ops::sample_embedding_dim(&db).await {
-        Ok(v) => v,
-        Err(e) => return db_error("sample embedding dim", e),
+    // The four summary counts are a pure function of the index content, so they
+    // are computed once at the end of each successful index run and cached in
+    // `index_meta` (key `stats_cache`). Fast path: serve the cached counts — no
+    // three full-table `count() GROUP ALL` scans (measured p50 ≈ 9.7s at kernel
+    // scale). Cold miss (DB indexed before this key existed, or a first index not
+    // yet finished): compute live ONCE, then persist the cache BEST-EFFORT — so
+    // the slow path happens at most once per repo after upgrade, then warm
+    // forever. The persist is best-effort on purpose: the old direct-count serve
+    // path never wrote, so it had no write-failure mode; a transient cache-write
+    // hiccup must NOT 500 a request whose counts are already correct (mirrors how
+    // /graph's cold miss recomputes). A genuine COUNT failure still errors, as the
+    // old path did.
+    let stats = match store::ops::get_cached_stats(&db).await {
+        Ok(Some(s)) => s,
+        _ => match store::ops::compute_stats(&db, &repo).await {
+            Ok(s) => {
+                if let Err(e) = store::ops::persist_stats(&db, &s).await {
+                    tracing::warn!(
+                        repo = %repo,
+                        error = %format!("{e:#}"),
+                        "failed to persist stats_cache on /index-stats cold miss; serving computed counts anyway"
+                    );
+                }
+                s
+            }
+            Err(e) => return db_error("compute index stats", e),
+        },
     };
 
     let status = state.index_engine.repo_status(&repo).await;
@@ -689,11 +641,11 @@ async fn get_index_stats(State(state): State<AppState>, Path(repo_id): Path<Stri
 
     Json(json!({
         "repo": repo,
-        "files": files,
-        "chunks": chunks,
-        "symbols": symbols,
+        "files": stats.files,
+        "chunks": stats.chunks,
+        "symbols": stats.symbols,
         "embedding_model": embedding_model,
-        "embedding_dim": embedding_dim,
+        "embedding_dim": stats.embedding_dim,
         "db_path": db_dir.to_string_lossy(),
         "state": state_str,
         "last_indexed_at": last_indexed_at,
@@ -808,6 +760,11 @@ async fn post_ignore_file(
         let mut vi = state.index_engine.vector_index.write().await;
         vi.apply_incremental(&repo, &[file_path], &[], &[]);
     }
+    // The shard changed → invalidate the persisted file so the next warm rebuilds it.
+    {
+        let root = crate::vector::shard_file::repo_shard_root(&state.index_engine.data_dir, &repo);
+        let _ = std::fs::remove_file(root.join("CURRENT"));
+    }
 
     // 3. Append relative path to per-repo ignored_paths.
     let mut ignored = store::ops::get_ignored_paths(&db).await.unwrap_or_default();
@@ -912,11 +869,22 @@ async fn get_repo_graph(State(state): State<AppState>, Path(repo_id): Path<Strin
         Err(r) => return r,
     };
 
-    const EDGE_LIMIT: usize = 600;
-    const NODE_LIMIT: usize = 250;
-    match store::ops::call_graph(&db, EDGE_LIMIT, NODE_LIMIT).await {
-        Ok(graph) => Json(graph).into_response(),
-        Err(e) => db_error("build graph", e),
+    // The bounded call-graph payload is a pure function of the `calls` table,
+    // so it is computed once at the end of each successful index run and cached
+    // in `index_meta` (key `graph_cache`). Fast path: serve the cached payload
+    // directly — no `call_graph` recompute (two full-table GROUP BY aggregations,
+    // ~80s at kernel scale). Cold miss (DB indexed before this key existed, or a
+    // first index not yet finished): compute live ONCE, store it, and return —
+    // so the slow path happens at most once per repo after upgrade, then warm
+    // forever. Note: the canonical node/edge limits live in `store::ops`
+    // (GRAPH_NODE_LIMIT / GRAPH_EDGE_LIMIT) and are shared with the index-time
+    // cache refresh so the cached payload matches this endpoint's contract.
+    match store::ops::get_cached_graph(&db).await {
+        Ok(Some(graph)) => Json(graph).into_response(),
+        _ => match store::ops::compute_and_cache_graph(&db).await {
+            Ok(graph) => Json(graph).into_response(),
+            Err(e) => db_error("build graph", e),
+        },
     }
 }
 
@@ -1025,29 +993,6 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
 
-    // Build voyage client.
-    let voyage_client = match EmbedClient::new(
-        &settings.embedding.provider,
-        settings.embedding.model.clone(),
-        settings.embedding.api_keys.clone(),
-        settings.embedding.voyage_base_url.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            let body = json!({ "error": format!("failed to create embedding client: {e}") });
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-    };
-
-    // Build LLM client for reranking (None if no keys configured or rerank disabled).
-    let llm_client = if req.rerank {
-        LlmClient::new(&settings.llm)
-    } else {
-        None
-    };
-
-    let top_k = req.top_k.max(1);
-
     // A repo is mandatory: queries are always scoped to one repository. Reject a
     // repo-less query rather than silently searching across every configured repo.
     let repo_filter = match req.repo.as_deref().map(str::trim) {
@@ -1057,21 +1002,19 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
             return (StatusCode::BAD_REQUEST, Json(body)).into_response();
         }
     };
-    let repo_filter = crate::store::normalize_repo_path(repo_filter);
 
-    match query::run_query(
-        &req.query,
-        top_k,
-        Some(&repo_filter),
-        &voyage_client,
+    // Delegate to the shared query op (VoyageClient build, optional LlmClient,
+    // repo normalization, query::run_query with all settings-derived args) so the
+    // CLI and server produce byte-identical retrieval. The `settings` snapshot was
+    // cloned above — no settings guard is held across the await below.
+    match crate::engine_ops::run_query_op(
+        &settings,
         &state.index_engine,
         &state.repo_dbs,
-        settings.llm.rerank_min_prune_lines,
-        llm_client.as_ref(),
-        std::time::Duration::from_secs(settings.mcp_index_wait_secs),
-        settings.llm.agentic_rag,
-        settings.llm.agentic_rag_max_turns,
-        settings.llm.agentic_rag_max_chunk_chars,
+        repo_filter,
+        &req.query,
+        req.top_k,
+        req.rerank,
     )
     .await
     {
@@ -1233,39 +1176,33 @@ async fn get_index_events(State(state): State<AppState>, Path(repo_id): Path<Str
     let repo_filter = repo.clone();
 
     let event_stream = stream
-        .filter_map(move |result| match result {
-            Ok(event) => {
-                let matches = match &event {
-                    crate::indexing::events::IndexEvent::Started { repo, .. } => {
-                        *repo == repo_filter
+        .filter_map(move |result| {
+            match result {
+                Ok(event) => {
+                    let matches = match &event {
+                        crate::indexing::events::IndexEvent::Started { repo, .. } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::FileParsed { .. } => true,
+                        crate::indexing::events::IndexEvent::FileSkipped { .. } => true,
+                        crate::indexing::events::IndexEvent::FileEmbedded { .. } => true,
+                        crate::indexing::events::IndexEvent::FileStored { .. } => true,
+                        crate::indexing::events::IndexEvent::FileIndexed { .. } => true,
+                        crate::indexing::events::IndexEvent::Phase2Start { repo } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::Phase2Done { repo, .. } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::SymbolIndexStart { repo } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::SymbolIndexDone { repo, .. } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::Completed { repo, .. } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::Failed { repo, .. } => *repo == repo_filter,
+                        crate::indexing::events::IndexEvent::Cancelled { repo } => *repo == repo_filter,
+                    };
+                    if matches {
+                        let data = serde_json::to_string(&event).unwrap_or_default();
+                        Some(Ok::<_, Infallible>(Event::default().data(data)))
+                    } else {
+                        None
                     }
-                    crate::indexing::events::IndexEvent::FileParsed { .. } => true,
-                    crate::indexing::events::IndexEvent::FileSkipped { .. } => true,
-                    crate::indexing::events::IndexEvent::FileEmbedded { .. } => true,
-                    crate::indexing::events::IndexEvent::FileStored { .. } => true,
-                    crate::indexing::events::IndexEvent::FileIndexed { .. } => true,
-                    crate::indexing::events::IndexEvent::Phase2Start { repo } => {
-                        *repo == repo_filter
-                    }
-                    crate::indexing::events::IndexEvent::Phase2Done { repo, .. } => {
-                        *repo == repo_filter
-                    }
-                    crate::indexing::events::IndexEvent::Completed { repo, .. } => {
-                        *repo == repo_filter
-                    }
-                    crate::indexing::events::IndexEvent::Failed { repo, .. } => {
-                        *repo == repo_filter
-                    }
-                    crate::indexing::events::IndexEvent::Cancelled { repo } => *repo == repo_filter,
-                };
-                if matches {
-                    let data = serde_json::to_string(&event).unwrap_or_default();
-                    Some(Ok::<_, Infallible>(Event::default().data(data)))
-                } else {
-                    None
                 }
+                Err(_) => None,
             }
-            Err(_) => None,
         })
         .map(|e| e);
 
@@ -1382,6 +1319,106 @@ fn plan_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+// Salt mixed into the machine-id hash. Now lives in `crate::config` since the
+// id is computed once at boot and persisted to settings.json. See
+// `config::ensure_machine_id` and `config::MACHINE_ID_SALT`.
+
+/// Read the persisted machine_id from the live settings handle. Boot guarantees
+/// `Some(...)` after `ensure_machine_id`; `None`/empty would only occur if a
+/// caller mutated the field at runtime. Returns the value or a 500 response.
+async fn machine_id_from_settings(state: &AppState) -> Result<String, Response> {
+    let id = state
+        .settings
+        .read()
+        .await
+        .machine_id
+        .clone()
+        .filter(|s| !s.is_empty());
+    id.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "machine id unavailable: settings not initialized" })),
+        )
+            .into_response()
+    })
+}
+
+async fn plan_get_free_trial(State(_): State<AppState>) -> Response {
+    let base = plan_admin_base();
+    let url = format!("{base}/api/free-trial");
+
+    let res = match plan_http_client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = res.bytes().await.unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn plan_post_free_trial_claim(State(state): State<AppState>) -> Response {
+    // The machine id is read from persisted settings (populated once at boot
+    // by `ensure_machine_id`). The browser never sees it. The previous
+    // implementation derived it on the fly via machine_uid::get(); now both
+    // free-trial and paid checkout share the same persisted source so a
+    // hardware-uid hiccup at runtime can never re-roll the id.
+    let machine_id = match machine_id_from_settings(&state).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    let base = plan_admin_base();
+    let url = format!("{base}/api/free-trial/claim");
+
+    let res = match plan_http_client()
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&json!({ "machine_id": machine_id }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body_bytes = res.bytes().await.unwrap_or_default();
+
+    // Inject base_url on success so the frontend knows where the key points to
+    // (mirrors plan_post_checkout). Applies to both 201 Claimed and 200
+    // Recovered responses.
+    if status.is_success()
+        && let Ok(mut obj) = serde_json::from_slice::<Value>(&body_bytes)
+    {
+        let admin_url = plan_admin_base();
+        obj["base_url"] = Value::String(format!("{admin_url}/v1"));
+        return (status, Json(obj)).into_response();
+    }
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body_bytes))
+        .unwrap()
+}
+
 async fn plan_get_packages(State(_): State<AppState>) -> Response {
     let base = plan_admin_base();
     let url = format!("{base}/api/packages");
@@ -1406,7 +1443,27 @@ async fn plan_get_packages(State(_): State<AppState>) -> Response {
         .unwrap()
 }
 
-async fn plan_post_checkout(State(_): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn plan_post_checkout(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    // Inject the persisted machine_id into the request so the admin gateway
+    // can dedup paid purchases per machine (one machine = one user, with
+    // accumulated budgets/expiry on repeat purchase). The browser never sees
+    // or controls this — it only sends `package_id`.
+    let machine_id = match machine_id_from_settings(&state).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let mut body = body;
+    if let Value::Object(ref mut obj) = body {
+        obj.insert("machine_id".to_string(), Value::String(machine_id));
+    } else {
+        // Frontend always sends a JSON object; if it doesn't, build one from
+        // scratch so the admin gateway never sees a missing machine_id.
+        body = json!({ "machine_id": machine_id });
+    }
+
     let base = plan_admin_base();
     let url = format!("{base}/api/checkout");
 

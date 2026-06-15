@@ -20,7 +20,14 @@ async fn start_server(home: &TempDir) -> SocketAddr {
         .await
         .expect("failed to bind ephemeral port");
     let addr = listener.local_addr().expect("no local addr");
-    let settings = Settings::default();
+    let settings = Settings {
+        // Seed a deterministic machine_id so the plan-proxy handlers (free-trial
+        // claim, checkout) have a value to forward without depending on the
+        // host's hardware uid. Production calls `ensure_machine_id` at boot to
+        // guarantee `Some(...)`; tests do the same shortcut here.
+        machine_id: Some("test-machine-id".to_string()),
+        ..Settings::default()
+    };
     let settings_handle = Arc::new(RwLock::new(settings.clone()));
     let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
     // Tests pass the same TempDir as both home_dir and data_dir — settings.json
@@ -34,6 +41,7 @@ async fn start_server(home: &TempDir) -> SocketAddr {
         &settings,
         repo_dbs.clone(),
         settings_handle.clone(),
+        false,
     )
     .await;
     let app = build_router(
@@ -72,8 +80,8 @@ async fn test_get_creates_default() {
 
     let body: serde_json::Value = res.json().await.expect("parse json");
 
-    // version should be CURRENT_VERSION (= 8 after data_dir + embeddings_dir + mcp_tools + custom_extensions + index_ignore_filenames + voyage_base_url + repo_generations migrations)
-    assert_eq!(body["version"], 8);
+    // version should be CURRENT_VERSION (= 9 after data_dir + embeddings_dir + mcp_tools + custom_extensions + index_ignore_filenames + voyage_base_url + repo_generations + purchased_plans migrations)
+    assert_eq!(body["version"], 9);
 
     // repos should be an empty array
     assert!(
@@ -155,12 +163,12 @@ async fn test_put_round_trips() {
     );
     let expected_repos: Vec<String> = vec!["/home/user/myproject", "/home/user/other"]
         .into_iter()
-        .map(|r| context_engine_rs::store::normalize_repo_path(r))
+        .map(context_engine_rs::store::normalize_repo_path)
         .collect();
     assert_eq!(get_body.repos, expected_repos);
     assert_eq!(get_body.embedding.model, "voyage-code-3");
     assert_eq!(get_body.llm.rerank_model, "gemini-2.0-flash");
-    assert_eq!(get_body.version, 8);
+    assert_eq!(get_body.version, 9);
 }
 
 // ─── Test 3 (Unix only): file mode bits should be 0o600 ───────────────────
@@ -424,14 +432,11 @@ async fn test_cancel_index_and_reindex() {
             .await
             .expect("SSE connect");
         let mut stream = sse_res.bytes_stream();
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await {
-                Ok(Some(Ok(bytes))) => {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    sse_collected_clone.lock().await.push(text);
-                }
-                _ => break,
-            }
+        while let Ok(Some(Ok(bytes))) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await
+        {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            sse_collected_clone.lock().await.push(text);
         }
     });
 
@@ -1039,4 +1044,126 @@ async fn test_put_data_dir_persists_but_does_not_relocate() {
          the running process honored the PUT — split-brain). \
          unexpected: {new_db:?}"
     );
+}
+
+// ─── Plan-proxy routes ──────────────────────────────────────────────────
+// The engine's /api/plan/* routes proxy to the admin gateway at
+// CONTEXT_ENGINE_ADMIN_URL. We boot a tiny mock gateway covering free-trial
+// AND checkout, point the env var at it once, and exercise both flows in a
+// single test — process-global env mutation cannot race a parallel test.
+#[tokio::test]
+async fn test_plan_proxy_forwards_machine_id_and_injects_base_url() {
+    use axum::{routing::{get, post}, Json, Router};
+
+    let mock = Router::new()
+        .route(
+            "/api/free-trial",
+            get(|| async {
+                Json(serde_json::json!({
+                    "available": true,
+                    "voyage_budget": 1000,
+                    "openai_budget": 500,
+                    "duration_days": 7
+                }))
+            }),
+        )
+        .route(
+            "/api/free-trial/claim",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                // Engine MUST forward a non-empty machine_id read from settings.
+                let mid = body
+                    .get("machine_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert_eq!(mid, "test-machine-id", "engine must forward machine_id");
+                Json(serde_json::json!({
+                    "proxy_key": "ft_test_key",
+                    "expires_at": "2099-01-01 00:00:00"
+                }))
+            }),
+        )
+        .route(
+            "/api/checkout",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                // Browser only sends `package_id`; engine MUST inject machine_id
+                // before forwarding so the admin gateway can credit the right
+                // per-machine user when SePay's webhook fires.
+                let mid = body
+                    .get("machine_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert_eq!(mid, "test-machine-id", "engine must inject machine_id");
+                (
+                    axum::http::StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "redirect_url": "https://example.test/pay",
+                        "invoice_number": "PKG_TEST_X"
+                    })),
+                )
+            }),
+        );
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock).await.expect("mock server");
+    });
+
+    // SAFETY: single-threaded test setup, this is the only test that reads
+    // CONTEXT_ENGINE_ADMIN_URL.
+    unsafe {
+        std::env::set_var("CONTEXT_ENGINE_ADMIN_URL", format!("http://{mock_addr}"));
+    }
+
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+    let client = Client::new();
+
+    // GET /api/plan/free-trial → forwarded availability.
+    let res = client
+        .get(format!("http://{addr}/api/plan/free-trial"))
+        .send()
+        .await
+        .expect("get free-trial");
+    assert_eq!(res.status().as_u16(), 200);
+    let info: serde_json::Value = res.json().await.expect("json");
+    assert_eq!(info["available"], true);
+    assert_eq!(info["voyage_budget"], 1000);
+    assert_eq!(info["duration_days"], 7);
+
+    // POST /api/plan/free-trial/claim → key + injected base_url. machine_id is
+    // read from persisted settings (seeded by start_server), never re-derived.
+    let res = client
+        .post(format!("http://{addr}/api/plan/free-trial/claim"))
+        .send()
+        .await
+        .expect("post claim");
+    assert_eq!(res.status().as_u16(), 200);
+    let data: serde_json::Value = res.json().await.expect("json");
+    assert_eq!(data["proxy_key"], "ft_test_key");
+    assert_eq!(
+        data["base_url"],
+        format!("http://{mock_addr}/v1"),
+        "engine must inject base_url on success"
+    );
+
+    // POST /api/plan/checkout → mock returns 201 only when machine_id was
+    // injected (assertion in mock handler enforces it).
+    let res = client
+        .post(format!("http://{addr}/api/plan/checkout"))
+        .json(&serde_json::json!({ "package_id": 42 }))
+        .send()
+        .await
+        .expect("post checkout");
+    assert_eq!(res.status().as_u16(), 201);
+    let data: serde_json::Value = res.json().await.expect("json");
+    assert_eq!(data["invoice_number"], "PKG_TEST_X");
+    assert_eq!(
+        data["base_url"],
+        format!("http://{mock_addr}/v1"),
+        "engine must inject base_url on checkout success"
+    );
+
+    unsafe {
+        std::env::remove_var("CONTEXT_ENGINE_ADMIN_URL");
+    }
 }

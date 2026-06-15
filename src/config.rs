@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 8;
+pub const CURRENT_VERSION: u32 = 9;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
@@ -24,6 +24,7 @@ pub const MIGRATIONS: &[MigrationFn] = &[
     migrate_v5_to_v6,
     migrate_v6_to_v7,
     migrate_v7_to_v8,
+    migrate_v8_to_v9,
 ];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
@@ -122,6 +123,20 @@ fn migrate_v7_to_v8(mut value: Value) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
+/// v8→v9: introduce `purchased_plans` (Vec<PurchasedPlan>). Defaults to an empty
+/// array. Plans used to live in browser localStorage, which lost them whenever
+/// the UI was opened from a different browser/machine; persisting them in
+/// settings.json (next to the proxy keys they reference) makes them follow the
+/// install. The UI folds any pre-existing localStorage plans into this list on
+/// first load after the upgrade, so nothing already claimed is dropped.
+fn migrate_v8_to_v9(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        obj.entry("purchased_plans".to_string())
+            .or_insert_with(|| Value::Array(vec![]));
+    }
+    Ok(value)
+}
+
 // ─── Settings ──────────────────────────────────────────────────────────────
 
 fn default_index_ignore_filenames() -> Vec<String> {
@@ -131,8 +146,11 @@ fn default_index_ignore_filenames() -> Vec<String> {
 fn default_embed_concurrency() -> usize {
     // Per-key concurrency: each API key is allowed this many concurrent
     // embedding batches in-flight. Runtime total = this value × number of
-    // keys. Default 16.
-    16
+    // keys. The embed stage is network-bound (the pipeline's pacing stage);
+    // 64 saturates typical gateways and keeps parse/store stages fed on
+    // multi-core machines. Gateway proven to handle 32+ parallel at sub-1.5s
+    // with zero 429s; 64 gives headroom. Default 64.
+    64
 }
 
 fn default_vector_resident_cap_mb() -> usize {
@@ -151,7 +169,7 @@ pub struct EmbeddingConfig {
     pub api_keys: Vec<String>,
     /// Per-key concurrency: number of embedding batches in-flight per API key.
     /// Runtime total in-flight batches = embed_concurrency × api_keys.len().
-    /// Defaults to 16.
+    /// Defaults to 64 (network-bound pacing stage; saturates typical gateways).
     #[serde(default = "default_embed_concurrency")]
     pub embed_concurrency: usize,
     /// Custom Voyage AI-compatible endpoint. Honored only when
@@ -273,6 +291,44 @@ fn default_enabled_mcp_tools() -> Vec<String> {
     ]
 }
 
+/// A plan/key the user has bought (or claimed as a free trial) through the buy
+/// flow. Persisted in settings.json (was browser localStorage) so the list
+/// follows the install across browsers/machines instead of being lost on a new
+/// device. Identity for dedup is `proxy_key` (the same key can be re-claimed
+/// under multiple invoices, e.g. renewals, but is one plan sharing one budget
+/// pool); `invoice` is the display/lookup fallback when no key is present.
+///
+/// Live budget/remaining is NOT stored here — the UI fetches it fresh from
+/// `/api/plan/usage` per key — so this struct only carries identity + display
+/// metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PurchasedPlan {
+    /// Invoice / order number. Identity fallback and lookup key when `proxy_key`
+    /// is absent; also shown as the plan title when `package_name` is empty.
+    pub invoice: String,
+    /// The proxy API key granted by this plan. Primary dedup identity. May be
+    /// empty only for malformed legacy entries.
+    #[serde(default)]
+    pub proxy_key: String,
+    /// Base URL the key authenticates against (proxy endpoint).
+    #[serde(default)]
+    pub base_url: String,
+    /// Human-readable package name for display (e.g. "5 Beer", "Basic").
+    #[serde(default)]
+    pub package_name: String,
+    /// Unix epoch milliseconds when the plan was added locally. Display only.
+    #[serde(default)]
+    pub purchased_at: Option<i64>,
+    /// Unix epoch milliseconds of expiry, or null for non-expiring plans. Synced
+    /// from the server's authoritative value on each usage fetch.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// True for free-trial keys — drives the dedicated "expired, buy a plan"
+    /// badge in the UI. Defaults to false for paid plans.
+    #[serde(default)]
+    pub is_free_trial: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     /// Schema version. Server always stamps CURRENT_VERSION on write.
@@ -352,7 +408,38 @@ pub struct Settings {
     /// generation instead of resetting to 0 and racing the old LOCK again.
     #[serde(default)]
     pub repo_generations: HashMap<String, u32>,
+    /// Stable per-machine identifier used to dedup payment + free-trial flows
+    /// against a single user (one machine = one user). Computed once on first
+    /// boot via `ensure_machine_id` and persisted; never recomputed at runtime.
+    ///
+    /// Seed value: `sha256(MACHINE_ID_SALT ‖ \0 ‖ hardware_uid)` as hex when
+    /// `machine_uid::get()` succeeds. This intentionally matches the legacy
+    /// formula used by the free-trial claim flow before persistence — old
+    /// claims tied to a hardware-derived id keep matching after the upgrade.
+    /// On the rare host where `machine_uid::get()` fails we fall back to a
+    /// random UUIDv4. The fallback is only "safe" because the result is
+    /// persisted: every subsequent run reads the same value, so idempotency
+    /// (one machine → one user) holds across restarts.
+    ///
+    /// `None` on the in-memory struct only ever occurs *during boot* between
+    /// `ensure_dir_and_load` and `ensure_machine_id`. After boot the field is
+    /// always `Some` — handlers can `unwrap_or_default` defensively but should
+    /// never see empty.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// Plans/keys the user has bought or claimed, persisted here (was browser
+    /// localStorage) so they follow the install across browsers/machines.
+    /// CLIENT-OWNED: the UI reads, mutates, and PUTs this list like `repos`;
+    /// the server round-trips it verbatim. Deduped by `proxy_key` in the UI.
+    #[serde(default)]
+    pub purchased_plans: Vec<PurchasedPlan>,
 }
+
+/// Salt mixed into the machine-id hash. A fixed compile-in constant: it must
+/// stay byte-identical across versions/restarts so the seed value computed by
+/// `ensure_machine_id` matches what the legacy free-trial claim flow used to
+/// compute on the fly. Changing this breaks every existing free-trial claim.
+pub const MACHINE_ID_SALT: &str = "vibervn-context-engine::free-trial::v1";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -370,6 +457,8 @@ impl Default for Settings {
             custom_extensions: Vec::new(),
             index_ignore_filenames: default_index_ignore_filenames(),
             repo_generations: HashMap::new(),
+            machine_id: None,
+            purchased_plans: Vec::new(),
         }
     }
 }
@@ -635,6 +724,73 @@ pub fn ensure_dir_and_load(home_dir: &Path) -> Result<Settings, ConfigError> {
     }
 
     Ok(settings)
+}
+
+/// Ensure `settings.machine_id` is `Some(...)` and persisted on disk. Called
+/// once at boot, after `ensure_dir_and_load`. Mutates `settings` in place.
+///
+/// First boot (or upgrades from a settings file written before this field
+/// existed): compute `sha256(MACHINE_ID_SALT ‖ \0 ‖ hardware_uid)` as hex,
+/// matching the legacy free-trial claim formula so machines that already
+/// claimed pick the SAME id and continue to dedup against their existing user.
+/// If `machine_uid::get()` fails (rare hosts where no hardware uid is
+/// reachable), fall back to a random UUIDv4. The fallback is only sound
+/// BECAUSE we persist it immediately — the next boot reads the same value, so
+/// "one machine = one user" still holds across restarts.
+///
+/// Subsequent boots: field already populated → no-op (don't recompute, don't
+/// rewrite).
+pub fn ensure_machine_id(home_dir: &Path, settings: &mut Settings) -> Result<(), ConfigError> {
+    if settings
+        .machine_id
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let id = compute_seed_machine_id();
+    settings.machine_id = Some(id);
+    let path = config_path(home_dir);
+    write_settings_atomic(&path, settings)
+}
+
+/// Compute the machine-id seed used by `ensure_machine_id`. Public-in-crate so
+/// tests can assert the legacy formula is preserved.
+fn compute_seed_machine_id() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(MACHINE_ID_SALT.as_bytes());
+    hasher.update(b"\x00");
+    match machine_uid::get() {
+        Ok(uid) => {
+            hasher.update(uid.as_bytes());
+        }
+        Err(_) => {
+            // Fallback only — not the common path. Mix high-entropy host signals
+            // (system time + process id + a fresh allocation address) into the
+            // hash so the result is unique per first-boot. Acceptable here
+            // because we persist it on the same call: the next boot reads the
+            // same value, preserving idempotency.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            hasher.update(b"fallback-v1\x00");
+            hasher.update(nanos.to_le_bytes());
+            hasher.update(std::process::id().to_le_bytes());
+            let probe: Box<u8> = Box::new(0);
+            hasher.update((Box::as_ref(&probe) as *const u8 as usize).to_le_bytes());
+        }
+    }
+    let bytes = hasher.finalize();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    use std::fmt::Write as _;
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -1085,6 +1241,89 @@ mod tests {
     }
 
     #[test]
+    fn test_v8_to_v9_migration_stamps_empty_purchased_plans() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // A v8 file has no `purchased_plans` key. After migration it must read as
+        // an empty list (no plans invented) and the on-disk file must carry an
+        // explicit array so an older binary trips VersionTooNew rather than
+        // silently dropping the field on its next save.
+        let v8 = r#"{
+            "version": 8,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[],"embed_concurrency":16,"voyage_base_url":null},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]},
+            "data_dir": null,
+            "embeddings_dir": null,
+            "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"],
+            "custom_extensions": [],
+            "index_ignore_filenames": ["CLAUDE.md","AGENTS.md"],
+            "repo_generations": {}
+        }"#;
+        fs::write(&path, v8).expect("write v8 settings.json");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v8");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!(
+            loaded.purchased_plans.is_empty(),
+            "purchased_plans must default to empty after v8→v9 migration"
+        );
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(CURRENT_VERSION as u64));
+        assert!(
+            v.get("purchased_plans").map(|x| x.is_array()).unwrap_or(false),
+            "on-disk purchased_plans should be an explicit array after migration, got: {:?}",
+            v.get("purchased_plans")
+        );
+    }
+
+    /// A purchased plan round-trips through atomic write + migration-aware load
+    /// using the real persistence path the server uses on every PUT /api/config.
+    #[test]
+    fn test_purchased_plans_round_trip() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let s = Settings {
+            purchased_plans: vec![PurchasedPlan {
+                invoice: "PKG_123".to_owned(),
+                proxy_key: "key-abc".to_owned(),
+                base_url: "https://example/v1".to_owned(),
+                package_name: "5 Beer".to_owned(),
+                purchased_at: Some(1_700_000_000_000),
+                expires_at: Some(1_710_000_000_000),
+                is_free_trial: false,
+            }],
+            ..Settings::default()
+        };
+        write_settings_atomic(&path, &s).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(loaded.purchased_plans, s.purchased_plans);
+        assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    /// A minimal plan object (only the required `invoice`) deserializes cleanly
+    /// with every optional field defaulted — the additive `#[serde(default)]`
+    /// contract the UI relies on when reading older/sparser entries.
+    #[test]
+    fn test_purchased_plan_deserializes_minimal() {
+        let plan_json = r#"{"invoice":"PKG_1","proxy_key":"k"}"#;
+        let p: PurchasedPlan = serde_json::from_str(plan_json).expect("deserialize minimal plan");
+        assert_eq!(p.invoice, "PKG_1");
+        assert_eq!(p.proxy_key, "k");
+        assert!(p.base_url.is_empty());
+        assert!(p.purchased_at.is_none());
+        assert!(p.expires_at.is_none());
+        assert!(!p.is_free_trial);
+    }
+
+    #[test]
     fn test_embedding_config_deserializes_without_voyage_base_url() {
         let json = r#"{"provider":"voyage","model":"voyage-4-lite","api_keys":["k"],"embed_concurrency":16}"#;
         let cfg: EmbeddingConfig =
@@ -1117,5 +1356,36 @@ mod tests {
             "voyage_base_url must round-trip through write+load"
         );
         assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    /// `ensure_machine_id` populates the field on first call, persists it to
+    /// disk, and is a no-op on the next call (same value, no rewrite).
+    #[test]
+    fn ensure_machine_id_persists_and_is_idempotent() {
+        let home = TempDir::new().expect("tempdir");
+        let mut s = ensure_dir_and_load(home.path()).expect("load default");
+        // Default settings have no machine_id yet (file just bootstrapped, but
+        // the on-disk default does not include this field).
+        assert!(
+            s.machine_id.as_deref().map(str::is_empty).unwrap_or(true),
+            "fresh settings should have no machine_id"
+        );
+
+        ensure_machine_id(home.path(), &mut s).expect("first ensure");
+        let id = s.machine_id.clone().expect("populated");
+        assert!(!id.is_empty());
+
+        // Reload from disk — value persisted.
+        let reloaded = ensure_dir_and_load(home.path()).expect("reload");
+        assert_eq!(
+            reloaded.machine_id.as_deref(),
+            Some(id.as_str()),
+            "machine_id must persist across reload"
+        );
+
+        // Second ensure on the same in-memory struct is a no-op.
+        let mut s2 = reloaded;
+        ensure_machine_id(home.path(), &mut s2).expect("second ensure");
+        assert_eq!(s2.machine_id.as_deref(), Some(id.as_str()));
     }
 }

@@ -1,12 +1,32 @@
 [package]
 name = "context-engine-rs"
-version = "0.1.38"
+version = "0.1.47"
 edition = "2024"
 # The benchmark harness lives in src/bin/chunk_bench.rs as a second binary.
 # Without default-run, `cargo run`/`cargo watch -x 'run -r'` becomes ambiguous
 # ("could not determine which binary to run") and the dev server fails to start.
 # Pin the server binary as the default so the bench binary is opt-in via --bin.
 default-run = "context-engine-rs"
+
+# `bench-query` is a self-contained CLI that boots the engine through the SAME
+# shared `engine_boot::boot_engine` the server uses, then runs remove/rebuild/
+# index/query through the SAME `engine_ops` fns — so it can never drift from the
+# server. The dir is `src/bin/bench_query/` (snake_case, like chunk_bench's auto-
+# discovered dir); this explicit [[bin]] just renames the artifact to the
+# hyphenated `bench-query` invoked by the `bench-small-repo` justfile recipe.
+[[bin]]
+name = "bench-query"
+path = "src/bin/bench_query/main.rs"
+
+# `bench-incremental` is the incremental-path measurement ORACLE: it boots the
+# engine through the SAME shared `engine_boot::boot_engine` path, does a clean
+# full rebuild to set up realistic on-disk DB state, appends a sentinel line to N
+# real indexed files (guaranteeing a `Modified` classification), runs ONE manual
+# incremental index, captures the per-stage `PERF SUMMARY incremental` breakdown,
+# and ALWAYS restores the files. Measurement-only; implements no optimization.
+[[bin]]
+name = "bench-incremental"
+path = "src/bin/bench_incremental/main.rs"
 
 [dependencies]
 ignore = "0.4"
@@ -20,6 +40,8 @@ clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 tempfile = "3"
 anyhow = "1"
+memmap2 = "0.9"
+bytemuck = "1"
 surrealdb = { version = "2", default-features = false, features = ["kv-rocksdb"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rayon = "1"
@@ -47,6 +69,8 @@ tree-sitter-pascal = "0.10"
 tree-sitter-liquid = { path = "vendor/tree-sitter-liquid" }
 base64 = "0.22"
 md5 = "0.7"
+sha2 = "0.10"
+machine-uid = "0.5"
 filetime = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"

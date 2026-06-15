@@ -9,7 +9,7 @@ pub mod watcher;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -28,6 +28,9 @@ use crate::store::ops::set_meta;
 use crate::store::{self, RepoDbMap};
 use crate::vector::{SearchResult, ShardedSearch, ShardedVectorIndex, VectorIndex};
 
+use surrealdb::Surreal;
+use surrealdb::engine::local::Db;
+
 // ─── Repo indexing status ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +39,30 @@ pub enum IndexState {
     Idle,
     Indexing,
     Error,
+}
+
+/// Which stage of an in-flight run the pipeline is currently in.
+///
+/// The file-count progress bar (`indexed_files / total_files`) only describes
+/// the `Embedding` stage. After every file is embedded the bar pins at 100% but
+/// the run is NOT done: `SymbolIndex` (concurrent index rebuild) and
+/// `ResolveEdges` (Phase 2) run for many minutes at kernel scale with no
+/// file-count motion. This enum lets the UI show what's happening past 100%.
+///
+/// Only meaningful while `state == Indexing`; `Idle` otherwise.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPhase {
+    /// Not in an indexing run (state is Idle/Error), or run hasn't started a stage.
+    Idle,
+    /// Parse → embed → store loop. Progress = `indexed_files / total_files`.
+    Embedding,
+    /// Rebuilding symbol indexes (concurrent `DEFINE INDEX`). Indeterminate —
+    /// a single blocking DB op with no sub-progress to report.
+    SymbolIndex,
+    /// Phase 2 edge resolution. Progress = `phase_done / phase_total` (edges)
+    /// when `phase_total > 0`; indeterminate while `phase_total == 0`.
+    ResolveEdges,
 }
 
 /// Per-repo status snapshot returned by `GET /api/index-status`.
@@ -53,6 +80,21 @@ pub struct RepoStatus {
     pub total_files: u64,
     pub last_indexed_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Current pipeline stage. `Idle` unless `state == Indexing`.
+    #[serde(default = "default_phase")]
+    pub phase: IndexPhase,
+    /// Sub-progress numerator for `phase == ResolveEdges` (edges resolved so far).
+    /// `0` for all other phases. Paired with `phase_total`.
+    #[serde(default)]
+    pub phase_done: u64,
+    /// Sub-progress denominator for `phase == ResolveEdges` (total edges to
+    /// resolve). `0` means indeterminate (show a pulsing bar, no percentage).
+    #[serde(default)]
+    pub phase_total: u64,
+}
+
+fn default_phase() -> IndexPhase {
+    IndexPhase::Idle
 }
 
 impl Default for RepoStatus {
@@ -63,6 +105,9 @@ impl Default for RepoStatus {
             total_files: 0,
             last_indexed_at: None,
             error: None,
+            phase: IndexPhase::Idle,
+            phase_done: 0,
+            phase_total: 0,
         }
     }
 }
@@ -78,6 +123,13 @@ pub struct ProgressHandle {
 }
 
 impl ProgressHandle {
+    /// Test-only constructor over a bare status map, so pipeline tests can
+    /// observe phase/sub-progress transitions without booting the full engine.
+    #[cfg(test)]
+    pub fn new_for_test(statuses: Arc<RwLock<HashMap<String, RepoStatus>>>, repo: String) -> Self {
+        Self { statuses, repo }
+    }
+
     /// Set the denominator once the parsed file set is known.
     pub async fn set_run_total(&self, total: u64) {
         let mut map = self.statuses.write().await;
@@ -93,9 +145,91 @@ impl ProgressHandle {
             s.indexed_files = processed;
         }
     }
+
+    /// Move the run to a new pipeline stage. Resets the edge sub-progress
+    /// counters (only `ResolveEdges` populates them).
+    pub async fn set_phase(&self, phase: IndexPhase) {
+        let mut map = self.statuses.write().await;
+        let s = map.entry(self.repo.clone()).or_default();
+        s.phase = phase;
+        s.phase_done = 0;
+        s.phase_total = 0;
+    }
+
+    /// Set the edge-resolution denominator at the start of Phase 2.
+    pub async fn set_phase_total(&self, total: u64) {
+        let mut map = self.statuses.write().await;
+        let s = map.entry(self.repo.clone()).or_default();
+        s.phase_total = total;
+    }
+
+    /// Advance the edge-resolution numerator. Monotonic — never decreases.
+    /// Called throttled (every N batches) to bound RwLock churn at scale.
+    pub async fn set_phase_done(&self, done: u64) {
+        let mut map = self.statuses.write().await;
+        let s = map.entry(self.repo.clone()).or_default();
+        if done > s.phase_done {
+            s.phase_done = done;
+        }
+    }
 }
 
 // ─── IndexEngine ──────────────────────────────────────────────────────────
+
+/// Debounce window for the per-repo graph/stats cache recompute.
+///
+/// WHY this exists (connection contention): there is exactly ONE RocksDB handle
+/// per repo (exclusive per-dir lock — see `store::get_or_open`), and the
+/// graph/stats cache recompute is an O(repo) full-table GROUP BY that does NOT
+/// cooperatively yield (~90s at kernel scale). If it fires on EVERY index
+/// completion — as it used to — an edit burst (user saves N files → N
+/// completions) runs it back-to-back, permanently pinning the one connection so
+/// every incremental's own queries stall behind it. Detaching it onto a
+/// `tokio::spawn` frees the consumer TASK but NOT the CONNECTION.
+///
+/// The fix is to DEFER the recompute until the repo has gone quiet: we only run
+/// it after no new completion has arrived for this window. Long enough to absorb
+/// a save burst, short enough the cache isn't very stale. The `/graph` and
+/// `/index-stats` serve paths each have a cold-miss fallback that recomputes
+/// on-demand, so a request landing in the gap before the deferred recompute is
+/// still correct (just pays the one-off aggregation itself).
+///
+/// CONSIDERED-AND-REJECTED: *cancelling* an in-flight recompute on a new trigger
+/// does NOT reliably free the connection — the ~90s GROUP BY is a single
+/// non-yielding RocksDB call, so a `CancellationToken` can only take effect
+/// BETWEEN the graph query and the stats query, never mid-query. Debounce (defer
+/// until quiet) sidesteps the contention entirely instead of racing it. Making
+/// the aggregation itself incremental (O(changed)) is the long-term ideal but is
+/// a much larger change (the graph cache is a global degree-ranked hub subgraph,
+/// not trivially incremental) and is explicitly a FUTURE optimization, NOT this
+/// task — debounce already keeps the recompute off the incremental's critical
+/// path so the locked ≤10s wall criterion holds without it.
+const CACHE_RECOMPUTE_DEBOUNCE: Duration = Duration::from_millis(4000);
+
+/// Per-repo recompute scheduler state. Tracks a single-flight debounced cache
+/// recompute. Guarded by `IndexEngine::recompute_slots` (a `std::sync::Mutex` —
+/// every critical section is tiny and never spans an `.await`).
+#[derive(Default)]
+struct RecomputeSlot {
+    /// Instant of the most recent index completion. The debounce timer waits
+    /// until `last_completion.elapsed() >= CACHE_RECOMPUTE_DEBOUNCE` before
+    /// running, so each new completion pushes the run further out (leading edge
+    /// absorbed, trailing edge fires once the burst settles).
+    last_completion: Option<Instant>,
+    /// True while a scheduler task exists for this repo (either sleeping in the
+    /// debounce window or mid-recompute). Single-flight: at most one task per
+    /// repo — a completion arriving while one exists never spawns a second.
+    scheduled: bool,
+    /// True while the spawned task is actually running the (~90s) aggregation
+    /// rather than sleeping. A completion landing in this phase sets `rearm` so
+    /// exactly ONE more pass runs after the current one, guaranteeing the final
+    /// cache reflects the last completion.
+    recomputing: bool,
+    /// Trailing-edge re-arm flag: set by a completion that arrived while the task
+    /// was mid-recompute. Checked after the recompute finishes to decide whether
+    /// to loop once more (rearm) or retire (clear `scheduled`).
+    rearm: bool,
+}
 
 /// Central orchestrator for all indexing operations.
 /// Stored in `AppState` and shared via `Arc`.
@@ -147,6 +281,13 @@ pub struct IndexEngine {
     /// the query layer. Only the generation counter is read mid-run; `data_dir`
     /// stays boot-frozen.
     settings_handle: Arc<RwLock<Settings>>,
+    /// Per-repo debounced single-flight graph/stats cache recompute state.
+    /// See [`CACHE_RECOMPUTE_DEBOUNCE`] and [`RecomputeSlot`] for the WHY
+    /// (connection contention) and the coalescing mechanism. A `std::sync::Mutex`
+    /// because every critical section is a few field reads/writes and never spans
+    /// an `.await`. Wrapped in `Arc` so the detached scheduler task can hold a
+    /// reference without borrowing the engine.
+    recompute_slots: Arc<std::sync::Mutex<HashMap<String, RecomputeSlot>>>,
 }
 
 #[derive(Debug)]
@@ -182,6 +323,41 @@ pub(crate) async fn warm_repo_shard(
         }
     };
     // DB scan happens here with NO vector_index lock held.
+    // First, the staleness stamp = current chunk-row count. Cheap; also tells us
+    // whether a persisted shard file is current.
+    let stamp = crate::store::ops::count_chunks(&db).await.unwrap_or(0);
+
+    // Fast path: a valid, current persisted shard file → mmap it (near-instant,
+    // no SELECT + decode). Its f32 payload is OS-page-cache-resident, off our heap.
+    // dim is unknown until we have a shard; probe the model dim from any one chunk
+    // via the file header's own dim (open_current validates it against expected).
+    // We pass the model dim by reading it from the file header indirectly: try the
+    // common dims is brittle, so we instead trust the header's dim and only reject
+    // on a mismatch with a known dim. Here we accept the file's own dim by passing
+    // it through a two-step: peek is folded into open_current (expected_dim=0 means
+    // "accept the header dim"). See shard_file::open_current.
+    match crate::vector::shard_file::open_current(data_dir, repo, 0, stamp) {
+        Ok(Some((shard, generation_loaded))) => {
+            let count = shard.len();
+            if count > 0 {
+                let mut vi = vector_index.write().await;
+                vi.install_shard(repo, shard, active);
+                // Reap stale generations now that the new one is installed; keep
+                // only the generation we just mapped (under the same write lock
+                // that governs CURRENT, so no reader/reaper race).
+                crate::vector::shard_file::reap_stale_generations(
+                    data_dir, repo, &[generation_loaded],
+                );
+                info!(repo = %repo, count, generation = generation_loaded, "warm: mmap'd persisted shard (no DB scan)");
+                return count;
+            }
+        }
+        Ok(None) => {} // no usable file — build from DB below
+        Err(e) => warn!(repo = %repo, error = %e, "warm: shard file open failed; rebuilding from DB"),
+    }
+
+    // Slow path: build from the chunk table (the existing SELECT + decode), then
+    // persist a new generation so subsequent warms mmap it.
     let shard = match VectorIndex::load_from_db(&db).await {
         Ok(vi) => vi,
         Err(e) => {
@@ -193,10 +369,31 @@ pub(crate) async fn warm_repo_shard(
     if count == 0 {
         return 0;
     }
-    // Short write lock: install the already-built shard. No DB work under the lock.
+    // Persist the built shard to a fresh generation + flip CURRENT (win32-safe:
+    // no existing mapped file is touched). Best-effort — a write failure just
+    // means the next warm rebuilds from DB again.
+    let persisted = match crate::vector::shard_file::write_new_generation(data_dir, repo, &shard, stamp) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            warn!(repo = %repo, error = %e, "warm: failed to persist shard file (will rebuild next warm)");
+            None
+        }
+    };
+    // Re-open the just-written file as an mmap so the resident shard is page-cache
+    // backed (not the heap copy we just built). Falls back to the heap shard if the
+    // re-open fails for any reason.
     let mut vi = vector_index.write().await;
-    vi.install_shard(repo, shard, active);
-    info!(repo = %repo, count, "warm: installed vector shard");
+    if let Some(g) = persisted
+        && let Ok(Some((mmap_shard, _))) = crate::vector::shard_file::open_current(data_dir, repo, shard.dim(), stamp)
+    {
+        vi.install_shard(repo, mmap_shard, active);
+        crate::vector::shard_file::reap_stale_generations(data_dir, repo, &[g]);
+        info!(repo = %repo, count, generation = g, "warm: built from DB, persisted + mmap'd shard");
+    } else {
+        // Heap fallback: install the in-RAM shard we built.
+        vi.install_shard(repo, shard, active);
+        info!(repo = %repo, count, "warm: installed in-RAM shard (persist/mmap unavailable)");
+    }
     count
 }
 
@@ -251,6 +448,18 @@ pub(crate) async fn seed_statuses_from_db(
     }
 }
 
+/// Outcome of a `vector_search` call.
+///
+/// `warming` distinguishes a transient cold/warming shard from a genuine empty:
+/// it is true only when a single-repo query found the target shard NOT resident
+/// after the bounded warm-wait expired. An empty `results` with `warming=true`
+/// means "retry shortly", NOT "the index contains nothing". A resident shard that
+/// matches nothing yields `warming=false` (a real empty).
+pub struct VectorSearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub warming: bool,
+}
+
 impl IndexEngine {
     /// Create the engine and spawn the watcher background task.
     ///
@@ -265,6 +474,7 @@ impl IndexEngine {
         settings: &Settings,
         repo_dbs: RepoDbMap,
         settings_handle: Arc<RwLock<Settings>>,
+        no_watchers: bool,
     ) -> Arc<Self> {
         let (trigger_tx, trigger_rx) = tokio::sync::mpsc::channel::<IndexTrigger>(256);
 
@@ -296,6 +506,7 @@ impl IndexEngine {
             event_bus: IndexEventBus::new(),
             cancel_tokens: Mutex::new(HashMap::new()),
             settings_handle: settings_handle.clone(),
+            recompute_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         // Initialise status entries.
@@ -331,13 +542,35 @@ impl IndexEngine {
             });
         }
 
-        // Start watcher for each repo.
-        for repo in settings.repos.clone() {
-            let tx = trigger_tx.clone();
-            let repo_path = crate::store::normalize_repo_path(&repo);
+        // Startup sweep: reap stale vector-shard generations. No mmap handles
+        // survive a restart, so every non-CURRENT generation dir is reapable. This
+        // bounds disk use across restarts (a crashed/aborted rewrite can leave an
+        // extra gen dir behind). Cheap (directory listing per repo); run in the
+        // background so it never delays boot.
+        {
+            let data_dir_sweep = engine.data_dir.clone();
+            let repos_sweep = settings.repos.clone();
             tokio::spawn(async move {
-                start_watcher(repo_path, tx).await;
+                for repo in repos_sweep {
+                    // keep=[] → reap everything except CURRENT (reap_stale_generations
+                    // always preserves the CURRENT gen internally).
+                    crate::vector::shard_file::reap_stale_generations(&data_dir_sweep, &repo, &[]);
+                }
             });
+        }
+
+        // Start watcher for each repo — UNLESS the caller suppressed watchers
+        // (the bench oracle does, so a boot watcher on a repo already in
+        // settings.repos can't fire its own incremental on the bench's on-disk
+        // edits and contaminate the measured run; see BootOptions::no_watchers).
+        if !no_watchers {
+            for repo in settings.repos.clone() {
+                let tx = trigger_tx.clone();
+                let repo_path = crate::store::normalize_repo_path(&repo);
+                tokio::spawn(async move {
+                    start_watcher(repo_path, tx).await;
+                });
+            }
         }
 
         // Spawn the single consumer task — passes the SHARED handle so the consumer
@@ -369,6 +602,35 @@ impl IndexEngine {
         tokio::spawn(async move {
             start_watcher(repo_path, tx).await;
         });
+    }
+
+    /// Register a repo's status entry WITHOUT spawning a filesystem watcher.
+    ///
+    /// For measurement tools (e.g. `bench-incremental`) that mutate files on disk
+    /// to drive a controlled incremental run and must guarantee the ONLY trigger
+    /// in flight is the one they explicitly send. A live watcher would fire its
+    /// own debounced trigger on those same edits (and on the restore), polluting
+    /// the measured window with extra runs racing for the single per-repo
+    /// connection. Idempotent: a no-op if the repo already has a status entry.
+    pub async fn register_repo_no_watcher(&self, repo: &str) {
+        let repo = crate::store::normalize_repo_path(repo);
+        let mut statuses = self.statuses.write().await;
+        statuses.entry(repo).or_default();
+    }
+
+    /// True if a debounced graph/stats cache recompute is still pending or running
+    /// for `repo` (a scheduler task exists — sleeping in the debounce window or
+    /// mid-aggregation). False once it has retired and the shared connection is
+    /// idle. Lets a measurement tool wait for the post-rebuild recompute to fully
+    /// drain before timing an incremental, so the recompute never overlaps the
+    /// measured window on the single per-repo connection.
+    pub fn recompute_pending(&self, repo: &str) -> bool {
+        let repo = crate::store::normalize_repo_path(repo);
+        let slots = match self.recompute_slots.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        slots.get(&repo).map(|s| s.scheduled).unwrap_or(false)
     }
 
     /// Send a manual trigger to index a single repo.
@@ -542,9 +804,10 @@ impl IndexEngine {
         top_k: usize,
         repo_filter: Option<&str>,
         warm_wait: std::time::Duration,
-    ) -> Vec<SearchResult> {
+    ) -> VectorSearchOutcome {
         // Single-repo scope: block-warm a cold repo before searching so the first
         // query of the session returns complete results instead of empty.
+        let mut warming = false;
         if let Some(repo) = repo_filter {
             let resident = self.vector_index.read().await.is_resident(repo);
             if !resident {
@@ -554,6 +817,13 @@ impl IndexEngine {
                 // query re-attempts the warm.
                 let _ = tokio::time::timeout(warm_wait, self.warm_repo_blocking(repo.to_string()))
                     .await;
+                // Re-check residency AFTER the bounded warm. If the shard is STILL
+                // not resident, the warm-wait expired before load_from_db finished
+                // (e.g. a multi-GB shard, or it was evicted under memory pressure).
+                // The search below will return empty — but that empty means "still
+                // warming", NOT "the index contains nothing". Surface that distinction
+                // so callers retry instead of concluding the codebase is empty.
+                warming = !self.vector_index.read().await.is_resident(repo);
             }
         }
 
@@ -585,7 +855,7 @@ impl IndexEngine {
             });
         }
 
-        results
+        VectorSearchOutcome { results, warming }
     }
 
     /// Per-repo async warm lock, lazily created. Mirrors `get_repo_lock`.
@@ -641,9 +911,135 @@ impl IndexEngine {
         )
         .await;
     }
+
+    /// Record an index completion for `repo` and (re)arm the debounced
+    /// single-flight cache recompute. Replaces the old fire-on-every-completion
+    /// `tokio::spawn` of `compute_and_cache_graph` + `compute_and_cache_stats`.
+    ///
+    /// Mechanism (see [`CACHE_RECOMPUTE_DEBOUNCE`] / [`RecomputeSlot`]):
+    /// - Always stamp `last_completion = now` so the debounce timer is pushed out.
+    /// - If a scheduler task already exists for this repo (`scheduled`), do NOT
+    ///   spawn a second (single-flight). If that existing task is mid-recompute,
+    ///   set `rearm` so exactly one more pass runs afterward (trailing edge); if
+    ///   it is still sleeping, the bumped `last_completion` extends its wait — no
+    ///   flag needed.
+    /// - Otherwise spawn ONE scheduler task that sleeps until the repo is quiet,
+    ///   then runs the recompute once (looping only if re-armed mid-recompute).
+    ///
+    /// Lifecycle: the task holds only `Arc` clones (the `recompute_slots` map, the
+    /// repo string, and the Arc-backed `Surreal<Db>` handle), never the engine, so
+    /// it cannot keep the engine alive beyond a bounded window. It always retires
+    /// (clears `scheduled`) once the burst settles — at most one in-flight task
+    /// plus at most one queued pass per repo, so no unbounded timer-task growth.
+    fn note_index_completion(&self, repo: &str, db: Surreal<Db>) {
+        let mut slots = match self.recompute_slots.lock() {
+            Ok(g) => g,
+            // A panicked holder can only have poisoned a tiny non-await critical
+            // section; recover the map and carry on (best-effort cache refresh).
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let slot = slots.entry(repo.to_string()).or_default();
+        slot.last_completion = Some(Instant::now());
+        if slot.scheduled {
+            // A task already owns this repo. If it is currently running the
+            // aggregation, re-arm so one more pass picks up THIS completion.
+            // If it is still in the debounce sleep, the bumped timestamp above
+            // already defers it — nothing else to do.
+            if slot.recomputing {
+                slot.rearm = true;
+            }
+            return;
+        }
+        slot.scheduled = true;
+        drop(slots); // release before spawning — keep the critical section tiny
+
+        let slots_arc = Arc::clone(&self.recompute_slots);
+        let repo_owned = repo.to_string();
+        tokio::spawn(async move {
+            run_debounced_recompute(slots_arc, repo_owned, db).await;
+        });
+    }
 }
 
-// ─── Consumer task ────────────────────────────────────────────────────────
+/// The detached per-repo debounced single-flight recompute task. Sleeps until the
+/// repo has been quiet for [`CACHE_RECOMPUTE_DEBOUNCE`], runs the graph+stats
+/// recompute once (best-effort), then either re-arms (if a completion arrived
+/// mid-recompute) or retires. Exactly one of these exists per repo at a time.
+async fn run_debounced_recompute(
+    slots: Arc<std::sync::Mutex<HashMap<String, RecomputeSlot>>>,
+    repo: String,
+    db: Surreal<Db>,
+) {
+    loop {
+        // ── Debounce phase: sleep until the repo is quiet. Each iteration
+        // re-reads `last_completion`; a completion arriving during the sleep
+        // bumps it (via note_index_completion) and we wait again. ──
+        loop {
+            let wait = {
+                let slots_g = match slots.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                match slots_g.get(&repo).and_then(|s| s.last_completion) {
+                    Some(last) => CACHE_RECOMPUTE_DEBOUNCE.checked_sub(last.elapsed()),
+                    None => None, // shouldn't happen; treat as quiet
+                }
+            };
+            match wait {
+                Some(remaining) if !remaining.is_zero() => {
+                    tokio::time::sleep(remaining).await;
+                }
+                _ => break, // quiet long enough (or no stamp) — proceed
+            }
+        }
+
+        // ── Mark recomputing so a completion now sets `rearm` (trailing edge)
+        // instead of being silently absorbed by the debounce timer. ──
+        {
+            let mut slots_g = match slots.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(s) = slots_g.get_mut(&repo) {
+                s.recomputing = true;
+                s.rearm = false;
+            }
+        }
+
+        // ── Recompute phase: O(repo) full-table aggregation on the SHARED
+        // Arc-backed handle (one handle per repo is mandatory — never open a
+        // second connection). Best-effort: a failure here just means the serve
+        // path's cold-miss fallback recomputes on the next request. ──
+        let t = Instant::now();
+        if let Err(e) = store::ops::compute_and_cache_graph(&db).await {
+            warn!(repo = %repo, error = %format!("{e:#}"), "failed to refresh graph_cache after index");
+        }
+        if let Err(e) = store::ops::compute_and_cache_stats(&db, &repo).await {
+            warn!(repo = %repo, error = %format!("{e:#}"), "failed to refresh stats_cache after index");
+        }
+        info!(repo = %repo, cache_recompute_ms = t.elapsed().as_millis() as u64,
+              "background graph/stats cache recompute complete");
+
+        // ── Decide: re-arm (a completion landed mid-recompute) or retire. This
+        // block takes the lock and makes the decision atomically with no `.await`,
+        // so it cannot race a concurrent completion. ──
+        {
+            let mut slots_g = match slots.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(s) = slots_g.get_mut(&repo) {
+                s.recomputing = false;
+                if s.rearm {
+                    s.rearm = false;
+                    continue; // one more debounced pass for the late completion
+                }
+                s.scheduled = false; // retire: no task owns this repo now
+            }
+        }
+        return;
+    }
+}
 
 async fn run_consumer(
     engine: Arc<IndexEngine>,
@@ -678,6 +1074,9 @@ async fn run_consumer(
             status.error = None;
             status.indexed_files = 0;
             status.total_files = 0;
+            status.phase = IndexPhase::Embedding;
+            status.phase_done = 0;
+            status.phase_total = 0;
         }
 
         // Build embedding client — reject if no keys configured.
@@ -689,6 +1088,9 @@ async fn run_consumer(
             let s = statuses.entry(repo.clone()).or_default();
             s.state = IndexState::Error;
             s.error = Some(msg.clone());
+            s.phase = IndexPhase::Idle;
+            s.phase_done = 0;
+            s.phase_total = 0;
             engine_ref.event_bus.emit(IndexEvent::Failed {
                 repo: repo.clone(),
                 error: msg,
@@ -709,6 +1111,9 @@ async fn run_consumer(
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Error;
                     s.error = Some(e.to_string());
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
                     engine_ref.event_bus.emit(IndexEvent::Failed {
                         repo: repo.clone(),
                         error: e.to_string(),
@@ -821,8 +1226,10 @@ async fn run_consumer(
             .with_extra_extensions(settings_ref.custom_extensions.clone())
             .with_ignore_filenames(settings_ref.index_ignore_filenames.clone())
             .with_ignore_paths(per_repo_ignored_paths)
+            .with_data_dir(engine_ref.data_dir.clone())
         };
 
+        let pipeline_run_start = Instant::now();
         match pipeline
             .run(
                 &db,
@@ -838,29 +1245,83 @@ async fn run_consumer(
         {
             Ok(stats) => {
                 let elapsed_ms = run_start.elapsed().as_millis() as u64;
-                info!(repo = %repo, indexed = stats.indexed_files, "indexing complete");
-                let mut statuses = engine_ref.statuses.write().await;
-                let s = statuses.entry(repo.clone()).or_default();
-                s.state = IndexState::Idle;
-                s.indexed_files = stats.indexed_files;
-                s.total_files = stats.total_files;
-                s.last_indexed_at = Some(Utc::now());
-                s.error = None;
+                info!(repo = %repo, indexed = stats.indexed_files,
+                      pipeline_run_wall_ms = pipeline_run_start.elapsed().as_millis() as u64,
+                      "indexing complete");
+                // Set the observable "done" status and persist the durable
+                // timestamp INSIDE a tight scope so the `statuses` write guard is
+                // RELEASED before the O(repo) cache recompute below. A status
+                // reader (e.g. the UI poll / MCP freshness check / bench
+                // wait_for_index) takes `statuses.read()`; if we held the write
+                // guard across the ~90s graph/stats aggregation, no reader could
+                // OBSERVE state=Idle until that finished — the user would keep
+                // seeing "Indexing..." for ~90s after the work was actually done.
+                // This honors the project rule: read/write guards on shared state
+                // must be dropped before any `.await` on DB or heavy work.
+                {
+                    let mut statuses = engine_ref.statuses.write().await;
+                    let s = statuses.entry(repo.clone()).or_default();
+                    s.state = IndexState::Idle;
+                    s.indexed_files = stats.indexed_files;
+                    s.total_files = stats.total_files;
+                    s.last_indexed_at = Some(Utc::now());
+                    s.error = None;
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
+                } // <-- statuses write guard dropped here: "done" is now observable.
                 // Persist durable timestamp so the MCP tool can check freshness
-                // without relying on in-memory state.
+                // without relying on in-memory state. Runs OFF the statuses lock.
                 let _ = set_meta(&db, "last_indexed_at", &chrono::Utc::now().to_rfc3339()).await;
-                // Clear needs_rebuild flag after successful rebuild.
-                if force_rebuild {
-                    let _ = db
-                        .query("DELETE FROM index_meta WHERE key = 'needs_rebuild'")
-                        .await;
-                }
+                // Emit Completed BEFORE the cache recompute so subscribers learn
+                // the run finished immediately, not after the aggregation.
                 engine_ref.event_bus.emit(IndexEvent::Completed {
                     repo: repo.clone(),
                     indexed_files: stats.indexed_files,
                     total_files: stats.total_files,
                     elapsed_ms,
                 });
+                // Clear needs_rebuild flag after successful rebuild.
+                if force_rebuild {
+                    let _ = db.query("DELETE FROM index_meta WHERE key = 'needs_rebuild'").await;
+                }
+                // Refresh the cached call-graph + /index-stats payloads. Both are
+                // pure functions of the `calls` / chunk / symbol tables (which
+                // change on full AND incremental runs), persisted (keys
+                // `graph_cache` / `stats_cache`) so the `/graph` and
+                // `/index-stats` endpoints don't each pay full-table aggregation
+                // (~80s + ~10s at kernel scale) per request.
+                //
+                // CRITICAL — this recompute is O(repo) full-table aggregation
+                // (~90s at kernel scale) on the SINGLE per-repo RocksDB handle
+                // (exclusive per-dir lock — one handle per repo is mandatory).
+                // The aggregation does not cooperatively yield, so for its whole
+                // duration it PINS that one connection. Firing it inline on every
+                // completion — even detached onto a `tokio::spawn` — means an edit
+                // burst (N saved files → N completions) runs it back-to-back, and
+                // the NEXT incremental's own queries stall behind it on the shared
+                // connection. Detaching frees the consumer TASK but NOT the
+                // CONNECTION, which is the real contention the ≤10s wall criterion
+                // trips over during active editing.
+                //
+                // So instead of spawning here, we DEBOUNCE + SINGLE-FLIGHT it:
+                // mark the repo dirty and (re)arm a per-repo timer that runs the
+                // recompute ONCE, only after the repo has been quiet for
+                // CACHE_RECOMPUTE_DEBOUNCE. Burst completions coalesce into at
+                // most one in-flight recompute plus one queued trailing pass, so
+                // the recompute never sits between a trigger and its observable
+                // done during a save burst. The /graph and /index-stats serve
+                // paths each have a cold-miss fallback that recomputes on-demand,
+                // covering the gap before the deferred recompute lands. The
+                // recompute STILL fires (the first-ever full-rebuild cache
+                // population just lands one debounce window later). See
+                // `note_index_completion` / `run_debounced_recompute` and the
+                // CONSIDERED-AND-REJECTED note on CACHE_RECOMPUTE_DEBOUNCE.
+                //
+                // Best-effort throughout: a failure to build/store the cache must
+                // NOT affect the run. The handle's `Surreal<Db>` clone is
+                // Arc-backed (shares the one cached per-repo connection).
+                engine_ref.note_index_completion(&repo, db.clone());
             }
             Err(e) => {
                 let is_cancelled = e
@@ -872,6 +1333,9 @@ async fn run_consumer(
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Idle;
                     s.error = None;
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
                     engine_ref
                         .event_bus
                         .emit(IndexEvent::Cancelled { repo: repo.clone() });
@@ -884,6 +1348,9 @@ async fn run_consumer(
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Error;
                     s.error = Some(err_str.clone());
+                    s.phase = IndexPhase::Idle;
+                    s.phase_done = 0;
+                    s.phase_total = 0;
                     engine_ref.event_bus.emit(IndexEvent::Failed {
                         repo: repo.clone(),
                         error: err_str,
@@ -1083,6 +1550,7 @@ mod load_repos_tests {
             &settings,
             repo_dbs.clone(),
             settings_handle,
+            false,
         )
         .await;
 
@@ -1104,11 +1572,67 @@ mod load_repos_tests {
         // Exactly the seeded 3 vectors — coalescing means no doubled inserts.
         let mut q = vec![0.0f32; 4];
         q[0] = 1.0;
-        let out = vi.search(&q, 100, Some(&repo), &[repo.clone()]);
+        let out = vi.search(&q, 100, Some(&repo), std::slice::from_ref(&repo));
         assert_eq!(
             out.results.len(),
             3,
             "single-flight warm must install the shard once (3 seeded vectors, not doubled)"
         );
+    }
+
+    /// A shard that is NOT resident after the warm attempt yields warming=true with
+    /// empty results — the "retry, not empty" signal. Forced deterministically with a
+    /// 0-chunk repo: warm_repo_shard loads nothing (count==0) and never installs a
+    /// shard, so it stays non-resident regardless of timing — exactly the condition
+    /// `warming = !is_resident(repo)` detects after the bounded warm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vector_search_signals_warming_when_shard_not_resident() {
+        let home = TempDir::new().expect("tempdir");
+        let repo = "/proj/cold".to_string();
+        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+        // 0 chunks → warm installs no shard → non-resident after the warm attempt.
+        seed_repo(&repo_dbs, home.path(), &repo, 0).await;
+        let settings = crate::config::Settings { repos: vec![repo.clone()], ..Default::default() };
+        let settings_handle = Arc::new(RwLock::new(settings.clone()));
+        let engine = IndexEngine::start(
+            home.path().to_path_buf(), home.path().join("embeddings"),
+            &settings, repo_dbs.clone(), settings_handle, false,
+        ).await;
+
+        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let outcome = engine
+            .vector_search(&q, 10, Some(&repo), std::time::Duration::from_secs(5))
+            .await;
+        assert!(outcome.results.is_empty(), "non-resident shard search returns empty");
+        assert!(outcome.warming, "non-resident shard after warm attempt must signal warming=true");
+    }
+
+    /// A resident shard that genuinely matches nothing yields warming=false — a real
+    /// empty, NOT a warming state. (Here the shard is warmed first via a generous wait.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vector_search_resident_empty_is_not_warming() {
+        let home = TempDir::new().expect("tempdir");
+        let repo = "/proj/resident".to_string();
+        let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+        seed_repo(&repo_dbs, home.path(), &repo, 3).await;
+        let settings = crate::config::Settings { repos: vec![repo.clone()], ..Default::default() };
+        let settings_handle = Arc::new(RwLock::new(settings.clone()));
+        let engine = IndexEngine::start(
+            home.path().to_path_buf(), home.path().join("embeddings"),
+            &settings, repo_dbs.clone(), settings_handle, false,
+        ).await;
+
+        // Warm the shard explicitly so it is resident before the search.
+        engine.warm_repo_blocking(repo.clone()).await;
+        assert!(engine.vector_index.read().await.is_resident(&repo), "precondition: resident");
+
+        // Query with a generous wait; the shard is resident so warming must be false.
+        // top_k=0 forces an empty result set on a resident shard (genuine empty).
+        let q = vec![1.0f32, 0.0, 0.0, 0.0];
+        let outcome = engine
+            .vector_search(&q, 0, Some(&repo), std::time::Duration::from_secs(10))
+            .await;
+        assert!(outcome.results.is_empty(), "top_k=0 yields empty on a resident shard");
+        assert!(!outcome.warming, "resident shard must NOT signal warming, even when empty");
     }
 }

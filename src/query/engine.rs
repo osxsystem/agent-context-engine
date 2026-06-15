@@ -8,7 +8,7 @@ use surrealdb::engine::local::Db;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::embedding::voyage::VoyageClient;
+use crate::embedding::voyage::EmbedClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
 use crate::path_in_repo;
@@ -94,7 +94,7 @@ pub async fn run_query(
     query: &str,
     top_k: usize,
     repo_filter: Option<&str>,
-    voyage_client: &VoyageClient,
+    voyage_client: &EmbedClient,
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
@@ -105,10 +105,21 @@ pub async fn run_query(
     agentic_rag_max_chunk_chars: u32,
 ) -> Result<QueryResult> {
     run_query_with_filters(
-        query, top_k, repo_filter, voyage_client, index_engine, repo_dbs,
-        min_prune_lines, llm_client, warm_wait, agentic_rag,
-        agentic_rag_max_turns, agentic_rag_max_chunk_chars, None,
-    ).await
+        query,
+        top_k,
+        repo_filter,
+        voyage_client,
+        index_engine,
+        repo_dbs,
+        min_prune_lines,
+        llm_client,
+        warm_wait,
+        agentic_rag,
+        agentic_rag_max_turns,
+        agentic_rag_max_chunk_chars,
+        None,
+    )
+    .await
 }
 
 /// Extended query entry point that accepts pre-parsed structured filters
@@ -118,7 +129,7 @@ pub async fn run_query_with_filters(
     query: &str,
     top_k: usize,
     repo_filter: Option<&str>,
-    voyage_client: &VoyageClient,
+    voyage_client: &EmbedClient,
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
@@ -137,7 +148,11 @@ pub async fn run_query_with_filters(
         filters.merge(ext);
     }
     // Use clean query for embedding (filters stripped), or original if clean is empty
-    let embed_query = if clean_query.is_empty() { query } else { &clean_query };
+    let embed_query = if clean_query.is_empty() {
+        query
+    } else {
+        &clean_query
+    };
 
     // ── Step 1: Embed query ───────────────────────────────────────────────
     let embed_start = Instant::now();
@@ -151,7 +166,9 @@ pub async fn run_query_with_filters(
     // ── Step 2: Vector search ─────────────────────────────────────────────
     let search_start = Instant::now();
     // Search for 2× top_k so graph expansion has candidates to work with.
-    let raw_results = index_engine.vector_search(&embedding, top_k * 2, repo_filter, warm_wait).await;
+    let raw_results = index_engine
+        .vector_search(&embedding, top_k * 2, repo_filter, warm_wait)
+        .await;
     let search_ms = search_start.elapsed().as_millis() as u64;
 
     if raw_results.is_empty() {
@@ -190,8 +207,13 @@ pub async fn run_query_with_filters(
 
     let mut base_chunks: Vec<MergeChunk> = Vec::with_capacity(filtered.len());
     for sr in &filtered {
-        let (content, symbol, symbol_fqn, symbol_kind) =
-            fetch_chunk_content(&db_map, &sr.chunk_id.file, sr.chunk_id.line_start, sr.chunk_id.line_end).await;
+        let (content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
+            &db_map,
+            &sr.chunk_id.file,
+            sr.chunk_id.line_start,
+            sr.chunk_id.line_end,
+        )
+        .await;
         base_chunks.push(MergeChunk {
             file: sr.chunk_id.file.clone(),
             line_start: sr.chunk_id.line_start,
@@ -274,14 +296,33 @@ pub async fn run_query_with_filters(
     let (rerank_output, extended_pool) = match (agentic_rag, llm_client, repo_filter) {
         (true, Some(client), Some(repo)) => {
             let (out, pool) = reranker::rerank_agentic(
-                query, &merged, &numbered, &legacy_stats, min_prune_lines,
-                client, agentic_rag_max_turns, agentic_rag_max_chunk_chars,
-                repo, voyage_client, index_engine, repo_dbs, warm_wait,
-            ).await;
+                query,
+                &merged,
+                &numbered,
+                &legacy_stats,
+                min_prune_lines,
+                client,
+                agentic_rag_max_turns,
+                agentic_rag_max_chunk_chars,
+                repo,
+                voyage_client,
+                index_engine,
+                repo_dbs,
+                warm_wait,
+            )
+            .await;
             (out, Some(pool))
         }
         _ => {
-            let out = reranker::rerank(query, &merged, &numbered, &legacy_stats, min_prune_lines, llm_client).await;
+            let out = reranker::rerank(
+                query,
+                &merged,
+                &numbered,
+                &legacy_stats,
+                min_prune_lines,
+                llm_client,
+            )
+            .await;
             (out, None)
         }
     };
@@ -302,16 +343,23 @@ pub async fn run_query_with_filters(
     // numbered text — no re-read); otherwise emit the whole chunk.
     let mut results: Vec<CodeResult> = Vec::new();
     for (k, &idx) in rerank_output.reranked_indices.iter().enumerate() {
-        let Some(chunk) = res_chunks.get(idx) else { continue };
+        let Some(chunk) = res_chunks.get(idx) else {
+            continue;
+        };
         // Caller stats are computed only for the base candidate set; chunks
         // pulled in by the `query` tool (index >= merged.len()) have none.
         let stats = caller_stats.get(idx).and_then(|s| s.as_ref());
-        let (callers, caller_files) = stats.map_or((None, None), |s| (Some(s.caller_count), Some(s.caller_file_count)));
+        let (callers, caller_files) = stats.map_or((None, None), |s| {
+            (Some(s.caller_count), Some(s.caller_file_count))
+        });
         let caller_names = stats.map(|s| s.caller_names.clone()).unwrap_or_default();
         let callee_names = stats.map(|s| s.callee_names.clone()).unwrap_or_default();
         let callees = stats.map(|s| s.callee_count);
         let numbered_text = res_numbered.get(idx).and_then(|n| n.as_deref());
-        let selection = rerank_output.line_selections.get(k).and_then(|s| s.as_ref());
+        let selection = rerank_output
+            .line_selections
+            .get(k)
+            .and_then(|s| s.as_ref());
         match (numbered_text, selection) {
             (Some(text), Some(ranges)) if !ranges.is_empty() => {
                 for &(s, e) in ranges {
@@ -367,7 +415,9 @@ pub async fn run_query_with_filters(
             .and_then(|n| n.clone())
             .unwrap_or_else(|| chunk.content.clone());
         let stats = caller_stats.get(i).and_then(|s| s.as_ref());
-        let (callers, caller_files) = stats.map_or((None, None), |s| (Some(s.caller_count), Some(s.caller_file_count)));
+        let (callers, caller_files) = stats.map_or((None, None), |s| {
+            (Some(s.caller_count), Some(s.caller_file_count))
+        });
         pre_rerank_results.push(CodeResult {
             file: chunk.file.clone(),
             line_start: chunk.line_start,
@@ -417,7 +467,7 @@ pub(crate) async fn run_sub_query(
     query: &str,
     top_k: usize,
     repo_filter: &str,
-    voyage_client: &VoyageClient,
+    voyage_client: &EmbedClient,
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     warm_wait: std::time::Duration,
@@ -427,7 +477,9 @@ pub(crate) async fn run_sub_query(
         bail!("embed_query returned an empty vector");
     }
 
-    let raw_results = index_engine.vector_search(&embedding, top_k * 2, Some(repo_filter), warm_wait).await;
+    let raw_results = index_engine
+        .vector_search(&embedding, top_k * 2, Some(repo_filter), warm_wait)
+        .await;
     if raw_results.is_empty() {
         return Ok(vec![]);
     }
@@ -445,8 +497,13 @@ pub(crate) async fn run_sub_query(
 
     let mut base_chunks: Vec<MergeChunk> = Vec::with_capacity(filtered.len());
     for sr in &filtered {
-        let (content, symbol, symbol_fqn, symbol_kind) =
-            fetch_chunk_content(&db_map, &sr.chunk_id.file, sr.chunk_id.line_start, sr.chunk_id.line_end).await;
+        let (content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
+            &db_map,
+            &sr.chunk_id.file,
+            sr.chunk_id.line_start,
+            sr.chunk_id.line_end,
+        )
+        .await;
         base_chunks.push(MergeChunk {
             file: sr.chunk_id.file.clone(),
             line_start: sr.chunk_id.line_start,
@@ -519,9 +576,11 @@ fn apply_query_filters(
             if !filters.languages.is_empty() {
                 let lang = detect_language(Path::new(&chunk.file));
                 let lang_str = format!("{:?}", lang).to_lowercase();
-                if !filters.languages.iter().any(|l| {
-                    lang_str.contains(l) || lang_matches_alias(l, &lang_str)
-                }) {
+                if !filters
+                    .languages
+                    .iter()
+                    .any(|l| lang_str.contains(l) || lang_matches_alias(l, &lang_str))
+                {
                     return false;
                 }
             }
@@ -531,7 +590,11 @@ fn apply_query_filters(
                 && let Some(ref kind) = chunk.symbol_kind
             {
                 let kind_lower = kind.to_lowercase();
-                if !filters.kinds.iter().any(|k| kind_lower.contains(&k.to_lowercase())) {
+                if !filters
+                    .kinds
+                    .iter()
+                    .any(|k| kind_lower.contains(&k.to_lowercase()))
+                {
                     return false;
                 }
             }
@@ -551,7 +614,10 @@ fn apply_query_filters(
         .filter(|chunk| {
             if let Some(ref sym) = chunk.symbol {
                 let sym_lower = sym.to_lowercase();
-                filters.name_filters.iter().any(|n| sym_lower.contains(&n.to_lowercase()))
+                filters
+                    .name_filters
+                    .iter()
+                    .any(|n| sym_lower.contains(&n.to_lowercase()))
             } else {
                 // No symbol info — keep the chunk (conservative)
                 true
@@ -571,9 +637,10 @@ fn apply_query_filters(
         .filter(|chunk| {
             if let Some(ref sym) = chunk.symbol {
                 let sym_lower = sym.to_lowercase();
-                filters.name_filters.iter().any(|n| {
-                    bounded_edit_distance(&sym_lower, &n.to_lowercase(), 2) <= 2
-                })
+                filters
+                    .name_filters
+                    .iter()
+                    .any(|n| bounded_edit_distance(&sym_lower, &n.to_lowercase(), 2) <= 2)
             } else {
                 false
             }
@@ -695,12 +762,14 @@ async fn query_caller_callee_stats(
         .collect();
 
     let caller_count = caller_rows.len() as u32;
-    let distinct_caller_files: HashSet<&str> = caller_rows.iter().map(|r| r.in_file.as_str()).collect();
+    let distinct_caller_files: HashSet<&str> =
+        caller_rows.iter().map(|r| r.in_file.as_str()).collect();
     let caller_file_count = distinct_caller_files.len() as u32;
 
     // Extract and sort caller names by proximity
     let caller_names = proximity_sorted_names(
-        &caller_rows.iter()
+        &caller_rows
+            .iter()
             .filter_map(|r| r.in_name.as_ref().map(|n| (n.clone(), r.in_file.clone())))
             .collect::<Vec<_>>(),
         target_file,
@@ -733,11 +802,13 @@ async fn query_caller_callee_stats(
         .collect();
 
     let callee_count = callee_rows.len() as u32;
-    let distinct_callee_files: HashSet<&str> = callee_rows.iter().map(|r| r.out_file.as_str()).collect();
+    let distinct_callee_files: HashSet<&str> =
+        callee_rows.iter().map(|r| r.out_file.as_str()).collect();
     let callee_file_count = distinct_callee_files.len() as u32;
 
     let callee_names = proximity_sorted_names(
-        &callee_rows.iter()
+        &callee_rows
+            .iter()
             .filter_map(|r| r.out_name.as_ref().map(|n| (n.clone(), r.out_file.clone())))
             .collect::<Vec<_>>(),
         target_file,
@@ -784,7 +855,10 @@ fn proximity_sorted_names(entries: &[(String, String)], target_file: &str) -> Ve
         scored.push((priority, short));
     }
     scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-    scored.into_iter().map(|(_, name)| name.to_string()).collect()
+    scored
+        .into_iter()
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
 /// Format a caller tag string for MCP output.
@@ -797,9 +871,15 @@ pub fn format_caller_tag(stats: &CallerCalleeStats) -> String {
     let max_display = 30;
     let names = &stats.caller_names;
     let display_names: Vec<&str> = names.iter().take(max_display).map(|s| s.as_str()).collect();
-    let remaining = stats.caller_count.saturating_sub(display_names.len() as u32);
+    let remaining = stats
+        .caller_count
+        .saturating_sub(display_names.len() as u32);
     if remaining > 0 {
-        format!(" [callers: {} +{} more]", display_names.join(", "), remaining)
+        format!(
+            " [callers: {} +{} more]",
+            display_names.join(", "),
+            remaining
+        )
     } else {
         format!(" [callers: {}]", display_names.join(", "))
     }
@@ -814,7 +894,9 @@ pub fn format_callee_tag(stats: &CallerCalleeStats) -> String {
     let max_display = 30;
     let names = &stats.callee_names;
     let display_names: Vec<&str> = names.iter().take(max_display).map(|s| s.as_str()).collect();
-    let remaining = stats.callee_count.saturating_sub(display_names.len() as u32);
+    let remaining = stats
+        .callee_count
+        .saturating_sub(display_names.len() as u32);
     if remaining > 0 {
         format!(" [calls: {} +{} more]", display_names.join(", "), remaining)
     } else {
@@ -853,10 +935,12 @@ async fn fetch_chunk_content(
                 // symbol_ref is stored as "symbol:⟨fqn⟩" — extract both full FQN and short name.
                 let (symbol, fqn) = match row.symbol_ref.as_deref() {
                     Some(s) => {
-                        let full_fqn = s.strip_prefix("symbol:⟨")
+                        let full_fqn = s
+                            .strip_prefix("symbol:⟨")
                             .and_then(|s| s.strip_suffix("⟩"))
                             .map(|f| f.to_string());
-                        let short_name = full_fqn.as_deref()
+                        let short_name = full_fqn
+                            .as_deref()
                             .map(|fqn| fqn.rsplit("::").next().unwrap_or(fqn).to_string());
                         (short_name, full_fqn)
                     }
@@ -887,10 +971,8 @@ async fn fetch_symbol_kind(db: &Surreal<Db>, fqn: &str) -> Option<String> {
     struct KindRow {
         kind: Option<String>,
     }
-    let thing = surrealdb::sql::Thing::from((
-        "symbol",
-        surrealdb::sql::Id::String(fqn.to_string()),
-    ));
+    let thing =
+        surrealdb::sql::Thing::from(("symbol", surrealdb::sql::Id::String(fqn.to_string())));
     let rows: Vec<KindRow> = db
         .query("SELECT kind FROM $t")
         .bind(("t", thing))

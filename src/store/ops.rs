@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 
-use crate::parsing::symbols::{QualifiedSymbol, Symbol, SymbolKind};
 use crate::parsing::relations::EdgeKind;
+use crate::parsing::symbols::{QualifiedSymbol, Symbol, SymbolKind};
 
 // ─── Null-tolerant integer deserializer ───────────────────────────────────
 //
@@ -307,17 +307,35 @@ pub async fn delete_files_data_bulk(db: &Surreal<Db>, paths: &[String]) -> Resul
 /// Delete ALL data — used for full rebuild.
 pub async fn delete_all_data(db: &Surreal<Db>) -> Result<()> {
     // Edges first.
-    db.query("DELETE FROM calls").await.context("delete all calls")?;
-    db.query("DELETE FROM uses").await.context("delete all uses")?;
-    db.query("DELETE FROM imports").await.context("delete all imports")?;
-    db.query("DELETE FROM contains").await.context("delete all contains")?;
-    db.query("DELETE FROM implements").await.context("delete all implements")?;
+    db.query("DELETE FROM calls")
+        .await
+        .context("delete all calls")?;
+    db.query("DELETE FROM uses")
+        .await
+        .context("delete all uses")?;
+    db.query("DELETE FROM imports")
+        .await
+        .context("delete all imports")?;
+    db.query("DELETE FROM contains")
+        .await
+        .context("delete all contains")?;
+    db.query("DELETE FROM implements")
+        .await
+        .context("delete all implements")?;
     // Raw edges staging table.
-    db.query("DELETE FROM raw_edge").await.context("delete all raw_edge")?;
+    db.query("DELETE FROM raw_edge")
+        .await
+        .context("delete all raw_edge")?;
     // Then symbols, chunks, file_meta.
-    db.query("DELETE FROM symbol").await.context("delete all symbols")?;
-    db.query("DELETE FROM chunk").await.context("delete all chunks")?;
-    db.query("DELETE FROM file_meta").await.context("delete all file_meta")?;
+    db.query("DELETE FROM symbol")
+        .await
+        .context("delete all symbols")?;
+    db.query("DELETE FROM chunk")
+        .await
+        .context("delete all chunks")?;
+    db.query("DELETE FROM file_meta")
+        .await
+        .context("delete all file_meta")?;
     Ok(())
 }
 
@@ -327,9 +345,10 @@ pub async fn delete_all_data(db: &Surreal<Db>) -> Result<()> {
 pub async fn upsert_symbol(db: &Surreal<Db>, sym: &Symbol) -> Result<()> {
     let record_id = sym.qualified.record_id();
     let kind_str = kind_to_str(&sym.kind);
-    let parent_id = sym.parent_fqn.as_ref().map(|fqn| {
-        format!("symbol:⟨{}⟩", fqn)
-    });
+    let parent_id = sym
+        .parent_fqn
+        .as_ref()
+        .map(|fqn| format!("symbol:⟨{}⟩", fqn));
 
     db.query(
         "UPSERT type::thing($id) SET \
@@ -482,13 +501,11 @@ pub async fn get_meta(db: &Surreal<Db>, key: &str) -> Result<Option<String>> {
 
 /// Set an index_meta key/value.
 pub async fn set_meta(db: &Surreal<Db>, key: &str, value: &str) -> Result<()> {
-    db.query(
-        "UPSERT index_meta SET key = $key, value = $value WHERE key = $key",
-    )
-    .bind(("key", key.to_string()))
-    .bind(("value", value.to_string()))
-    .await
-    .context("set index_meta")?;
+    db.query("UPSERT index_meta SET key = $key, value = $value WHERE key = $key")
+        .bind(("key", key.to_string()))
+        .bind(("value", value.to_string()))
+        .await
+        .context("set index_meta")?;
     Ok(())
 }
 
@@ -510,10 +527,7 @@ pub async fn set_ignored_paths(db: &Surreal<Db>, paths: &[String]) -> Result<()>
 }
 
 /// Get all symbols from a given file (used for edge resolution).
-pub async fn get_symbols_for_file(
-    db: &Surreal<Db>,
-    file: &str,
-) -> Result<Vec<QualifiedSymbol>> {
+pub async fn get_symbols_for_file(db: &Surreal<Db>, file: &str) -> Result<Vec<QualifiedSymbol>> {
     #[derive(Deserialize)]
     struct Row {
         file: String,
@@ -922,7 +936,11 @@ pub async fn call_graph(
     let hub_fqns: Vec<String> = ranked.into_iter().map(|(fqn, _)| fqn).collect();
 
     if hub_fqns.is_empty() {
-        return Ok(CallGraph { nodes: vec![], edges: vec![], truncated: false });
+        return Ok(CallGraph {
+            nodes: vec![],
+            edges: vec![],
+            truncated: false,
+        });
     }
     let hub_set: std::collections::HashSet<String> = hub_fqns.iter().cloned().collect();
 
@@ -950,9 +968,7 @@ pub async fn call_graph(
         line_end: i64,
     }
     let sym_rows: Vec<SymRow> = db
-        .query(
-            "SELECT meta::id(id) AS fqn, name, kind, file, line_start, line_end FROM $ids",
-        )
+        .query("SELECT meta::id(id) AS fqn, name, kind, file, line_start, line_end FROM $ids")
         .bind(("ids", things))
         .await
         .context("call_graph: hub symbols")?
@@ -1002,7 +1018,8 @@ pub async fn call_graph(
     let total_edges = edge_rows.len();
 
     let mut edges: Vec<GraphEdge> = Vec::new();
-    let mut seen_edges: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut seen_edges: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for e in edge_rows {
         let (source, target) = match (e.in_name, e.out_name) {
             (Some(i), Some(o)) => (i, o),
@@ -1019,7 +1036,11 @@ pub async fn call_graph(
     }
 
     let truncated = total_edges >= edge_limit || hub_set.len() >= node_limit;
-    Ok(CallGraph { nodes, edges, truncated })
+    Ok(CallGraph {
+        nodes,
+        edges,
+        truncated,
+    })
 }
 
 /// Strip the stored `symbol:⟨fqn⟩` wrapper and return just the symbol name.
@@ -1084,16 +1105,19 @@ CREATE chunk SET \
 COMMIT TRANSACTION;\n";
 
         // .await must not err.
-        let resp = db.query(txn).await.expect(".await must not err after schema fix");
+        let resp = db
+            .query(txn)
+            .await
+            .expect(".await must not err after schema fix");
 
         // .check() must be Ok — no per-statement error (string is valid for option<string>).
-        resp.check().expect(".check() must be Ok after schema fix: schema now accepts string");
+        resp.check()
+            .expect(".check() must be Ok after schema fix: schema now accepts string");
 
         let chunk_count = count_chunks(&db).await.unwrap();
         println!("FIXED — chunk count with quoted symbol_ref: {chunk_count}");
         assert_eq!(
-            chunk_count,
-            1,
+            chunk_count, 1,
             "chunk must persist after schema fix (got {chunk_count})"
         );
     }
@@ -1118,7 +1142,10 @@ COMMIT TRANSACTION;\n";
         db.query(txn).await.expect("txn must not err");
         let count = count_chunks(&db).await.unwrap();
         println!("NONE symbol_ref — chunk count: {count}");
-        assert_eq!(count, 1, "chunk with NONE symbol_ref must persist (got {count})");
+        assert_eq!(
+            count, 1,
+            "chunk with NONE symbol_ref must persist (got {count})"
+        );
     }
 
     /// After the schema fix (`parent option<string>`), a quoted-string assignment
@@ -1141,19 +1168,21 @@ UPSERT symbol:`⟨/test/foo.rs::/test/foo.rs::bar⟩` SET \
   parent = 'symbol:⟨/test/foo.rs::/test/foo.rs::outer⟩';\n\
 COMMIT TRANSACTION;\n";
 
-        let resp = db.query(txn).await.expect(".await must not err after schema fix");
-        resp.check().expect(".check() must be Ok: parent is now option<string>");
+        let resp = db
+            .query(txn)
+            .await
+            .expect(".await must not err after schema fix");
+        resp.check()
+            .expect(".check() must be Ok: parent is now option<string>");
 
         let count = count_symbols(&db).await.unwrap();
         println!("FIXED — symbol count with quoted parent: {count}");
         assert_eq!(
-            count,
-            1,
+            count, 1,
             "symbol must persist after schema fix (got {count})"
         );
     }
 }
-
 
 // Null chunk_count deserialization tests
 //
@@ -1219,8 +1248,8 @@ mod null_chunk_count_deserialization {
     #[test]
     fn file_meta_real_chunk_count_decodes_correctly() {
         let json = r#"{"path":"/a.rs","mtime":100,"size":200,"repo":"/repo","chunk_count":42}"#;
-        let meta: FileMeta = serde_json::from_str(json)
-            .expect("FileMeta with real chunk_count must deserialize");
+        let meta: FileMeta =
+            serde_json::from_str(json).expect("FileMeta with real chunk_count must deserialize");
         assert_eq!(meta.chunk_count, 42);
     }
 
@@ -1269,7 +1298,10 @@ mod null_chunk_count_deserialization {
             .expect("get_all_file_meta");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].chunk_count, 42, "real chunk_count must round-trip correctly");
+        assert_eq!(
+            rows[0].chunk_count, 42,
+            "real chunk_count must round-trip correctly"
+        );
         assert_eq!(rows[0].mtime, 999);
         assert_eq!(rows[0].size, 4096);
     }
@@ -1295,10 +1327,8 @@ mod call_graph_tests {
         // backtick-bracket string interpolation in tests — that bakes literal ⟨⟩
         // into the stored id (id becomes "⟨fqn⟩"), which does not match the clean
         // ids the pipeline produces and breaks `FROM $ids` record lookup.
-        let thing = surrealdb::sql::Thing::from((
-            "symbol",
-            surrealdb::sql::Id::String(fqn.to_string()),
-        ));
+        let thing =
+            surrealdb::sql::Thing::from(("symbol", surrealdb::sql::Id::String(fqn.to_string())));
         db.query(
             "CREATE $t SET name = $n, kind = 'function', file = $f, \
              line_start = 1, line_end = 5, signature = NONE, parent = NONE",
@@ -1354,11 +1384,23 @@ mod call_graph_tests {
         // Every edge endpoint must be a node in the graph (internal consistency).
         let ids: std::collections::HashSet<&String> = graph.nodes.iter().map(|n| &n.id).collect();
         for e in &graph.edges {
-            assert!(ids.contains(&e.source), "edge source {} not in nodes", e.source);
-            assert!(ids.contains(&e.target), "edge target {} not in nodes", e.target);
+            assert!(
+                ids.contains(&e.source),
+                "edge source {} not in nodes",
+                e.source
+            );
+            assert!(
+                ids.contains(&e.target),
+                "edge target {} not in nodes",
+                e.target
+            );
         }
         // The 10 caller->hub edges must be present.
-        let hub_in_edges = graph.edges.iter().filter(|e| e.target == "/a.cpp::hub").count();
+        let hub_in_edges = graph
+            .edges
+            .iter()
+            .filter(|e| e.target == "/a.cpp::hub")
+            .count();
         assert_eq!(hub_in_edges, 10, "all 10 caller->hub edges must appear");
     }
 
@@ -1366,7 +1408,9 @@ mod call_graph_tests {
     #[tokio::test]
     async fn empty_calls_yields_empty_graph() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/call_graph_empty", 0).await.unwrap();
+        let db = open_db(home.path(), "/test/call_graph_empty", 0)
+            .await
+            .unwrap();
         let graph = call_graph(&db, 100, 50).await.expect("call_graph");
         assert!(graph.nodes.is_empty() && graph.edges.is_empty());
         assert!(!graph.truncated);
@@ -1380,7 +1424,9 @@ mod call_graph_tests {
     #[tokio::test]
     async fn duplicate_call_sites_collapse_to_one_edge() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/call_graph_dup", 0).await.unwrap();
+        let db = open_db(home.path(), "/test/call_graph_dup", 0)
+            .await
+            .unwrap();
 
         insert_symbol(&db, "/a.cpp::caller", "/a.cpp", "caller").await;
         insert_symbol(&db, "/a.cpp::callee", "/a.cpp", "callee").await;
@@ -1424,14 +1470,19 @@ mod ignored_paths_tests {
     #[tokio::test]
     async fn round_trip_ignored_paths() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/ignored", 0).await.expect("open db");
+        let db = open_db(home.path(), "/test/ignored", 0)
+            .await
+            .expect("open db");
 
         // Initially empty.
         let paths = get_ignored_paths(&db).await.unwrap();
         assert!(paths.is_empty());
 
         // Set some paths.
-        let to_set = vec!["doc/Building.md".to_string(), "src/generated.rs".to_string()];
+        let to_set = vec![
+            "doc/Building.md".to_string(),
+            "src/generated.rs".to_string(),
+        ];
         set_ignored_paths(&db, &to_set).await.unwrap();
 
         let loaded = get_ignored_paths(&db).await.unwrap();

@@ -19,13 +19,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::config::Settings;
-use crate::embedding::voyage::VoyageClient;
+use crate::embedding::voyage::EmbedClient;
 use crate::indexing::events::{IndexEvent, IndexEventBus};
 use crate::indexing::pipeline::IndexPipeline;
 use crate::indexing::tracker::FileChange;
 use crate::indexing::watcher::start_watcher;
-use crate::store::{self, RepoDbMap};
 use crate::store::ops::set_meta;
+use crate::store::{self, RepoDbMap};
 use crate::vector::{SearchResult, ShardedSearch, ShardedVectorIndex, VectorIndex};
 
 // ─── Repo indexing status ─────────────────────────────────────────────────
@@ -270,9 +270,7 @@ impl IndexEngine {
 
         // Derive the resident-byte cap from settings (MB → bytes). 0 disables the
         // cap (unbounded — not recommended; kept as an escape hatch).
-        let cap_bytes = settings
-            .vector_resident_cap_mb
-            .saturating_mul(1024 * 1024);
+        let cap_bytes = settings.vector_resident_cap_mb.saturating_mul(1024 * 1024);
 
         // Start with an empty sharded index so the server can bind immediately.
         // Shards are warmed in a background task below (bounded by the cap), and
@@ -304,7 +302,10 @@ impl IndexEngine {
         {
             let mut statuses = engine.statuses.write().await;
             for repo in &settings.repos {
-                statuses.insert(crate::store::normalize_repo_path(repo), RepoStatus::default());
+                statuses.insert(
+                    crate::store::normalize_repo_path(repo),
+                    RepoStatus::default(),
+                );
             }
         }
 
@@ -319,7 +320,14 @@ impl IndexEngine {
         {
             let statuses_bg = Arc::clone(&engine.statuses);
             tokio::spawn(async move {
-                seed_statuses_from_db(&statuses_bg, &repo_dbs_bg, &data_dir_bg, &repos_bg, &generations_bg).await;
+                seed_statuses_from_db(
+                    &statuses_bg,
+                    &repo_dbs_bg,
+                    &data_dir_bg,
+                    &repos_bg,
+                    &generations_bg,
+                )
+                .await;
             });
         }
 
@@ -464,7 +472,10 @@ impl IndexEngine {
         // clear_cancel_token, making the token still present but the run done.
         let is_indexing = {
             let statuses = self.statuses.read().await;
-            statuses.get(&repo).map(|s| s.state == IndexState::Indexing).unwrap_or(false)
+            statuses
+                .get(&repo)
+                .map(|s| s.state == IndexState::Indexing)
+                .unwrap_or(false)
         };
         if !is_indexing {
             return false;
@@ -554,7 +565,10 @@ impl IndexEngine {
             }
         };
 
-        let ShardedSearch { results, cold_repos } = {
+        let ShardedSearch {
+            results,
+            cold_repos,
+        } = {
             // READ lock — concurrent searches run in parallel. `search` bumps
             // per-shard atomic recency stamps under this shared guard.
             let index = self.vector_index.read().await;
@@ -668,7 +682,8 @@ async fn run_consumer(
 
         // Build embedding client — reject if no keys configured.
         let voyage_client = if settings_ref.embedding.api_keys.is_empty() {
-            let msg = "no embedding API keys configured — cannot index without embeddings".to_string();
+            let msg =
+                "no embedding API keys configured — cannot index without embeddings".to_string();
             error!(repo = %repo, "{}", msg);
             let mut statuses = engine_ref.statuses.write().await;
             let s = statuses.entry(repo.clone()).or_default();
@@ -681,7 +696,8 @@ async fn run_consumer(
             engine_ref.clear_cancel_token(&repo).await;
             continue;
         } else {
-            match VoyageClient::new(
+            match EmbedClient::new(
+                &settings_ref.embedding.provider,
                 settings_ref.embedding.model.clone(),
                 settings_ref.embedding.api_keys.clone(),
                 settings_ref.embedding.voyage_base_url.as_deref(),
@@ -722,7 +738,14 @@ async fn run_consumer(
         // the per-repo index lock we already hold → deadlock); the heal removes the
         // cached handle directly.
         let generation = settings_ref.repo_generation(&repo);
-        let db = match store::open_or_reset_index(&engine_ref.repo_dbs, &engine_ref.data_dir, &repo, generation).await {
+        let db = match store::open_or_reset_index(
+            &engine_ref.repo_dbs,
+            &engine_ref.data_dir,
+            &repo,
+            generation,
+        )
+        .await
+        {
             Ok((db, was_reset)) => {
                 if was_reset {
                     warn!(repo = %repo, "index directory failed to open and was reset; rebuilding from scratch");
@@ -745,9 +768,7 @@ async fn run_consumer(
         };
 
         // Read per-repo ignored paths from index_meta (fresh each run).
-        let per_repo_ignored_paths = store::ops::get_ignored_paths(&db)
-            .await
-            .unwrap_or_default();
+        let per_repo_ignored_paths = store::ops::get_ignored_paths(&db).await.unwrap_or_default();
 
         // Mask API keys for event display.
         let key_hints: Vec<String> = settings_ref
@@ -791,10 +812,15 @@ async fn run_consumer(
                 None
             };
 
-            IndexPipeline::new_with_concurrency(repo.clone(), voyage_client, embed_concurrency, embed_cache)
-                .with_extra_extensions(settings_ref.custom_extensions.clone())
-                .with_ignore_filenames(settings_ref.index_ignore_filenames.clone())
-                .with_ignore_paths(per_repo_ignored_paths)
+            IndexPipeline::new_with_concurrency(
+                repo.clone(),
+                voyage_client,
+                embed_concurrency,
+                embed_cache,
+            )
+            .with_extra_extensions(settings_ref.custom_extensions.clone())
+            .with_ignore_filenames(settings_ref.index_ignore_filenames.clone())
+            .with_ignore_paths(per_repo_ignored_paths)
         };
 
         match pipeline
@@ -825,7 +851,9 @@ async fn run_consumer(
                 let _ = set_meta(&db, "last_indexed_at", &chrono::Utc::now().to_rfc3339()).await;
                 // Clear needs_rebuild flag after successful rebuild.
                 if force_rebuild {
-                    let _ = db.query("DELETE FROM index_meta WHERE key = 'needs_rebuild'").await;
+                    let _ = db
+                        .query("DELETE FROM index_meta WHERE key = 'needs_rebuild'")
+                        .await;
                 }
                 engine_ref.event_bus.emit(IndexEvent::Completed {
                     repo: repo.clone(),
@@ -835,7 +863,8 @@ async fn run_consumer(
                 });
             }
             Err(e) => {
-                let is_cancelled = e.downcast_ref::<pipeline::PipelineAbort>()
+                let is_cancelled = e
+                    .downcast_ref::<pipeline::PipelineAbort>()
                     .is_some_and(|a| matches!(a, pipeline::PipelineAbort::Cancelled));
                 if is_cancelled {
                     info!(repo = %repo, "indexing cancelled by user");
@@ -843,9 +872,9 @@ async fn run_consumer(
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Idle;
                     s.error = None;
-                    engine_ref.event_bus.emit(IndexEvent::Cancelled {
-                        repo: repo.clone(),
-                    });
+                    engine_ref
+                        .event_bus
+                        .emit(IndexEvent::Cancelled { repo: repo.clone() });
                 } else {
                     let err_str = format!("{e:#}");
                     error!(repo = %repo, error = %err_str, "indexing failed");
@@ -877,7 +906,9 @@ mod load_repos_tests {
     /// uncached `open_db` on the same path would deadlock on the lock file —
     /// seeding through `get_or_open` keeps a single handle, mirroring real usage.
     async fn seed_repo(repo_dbs: &RepoDbMap, home: &std::path::Path, repo: &str, n: usize) {
-        let db = store::get_or_open(repo_dbs, home, repo, 0).await.expect("get_or_open");
+        let db = store::get_or_open(repo_dbs, home, repo, 0)
+            .await
+            .expect("get_or_open");
         for i in 0..n {
             let q = format!(
                 "CREATE chunk SET file = '{repo}/f{i}.rs', line_start = 1, line_end = 2, \
@@ -922,7 +953,9 @@ mod load_repos_tests {
     /// map (single cached handle per repo — see [`seed_repo`] for why RocksDB
     /// requires this).
     async fn seed_file_meta(repo_dbs: &RepoDbMap, home: &std::path::Path, repo: &str, n: usize) {
-        let db = store::get_or_open(repo_dbs, home, repo, 0).await.expect("get_or_open");
+        let db = store::get_or_open(repo_dbs, home, repo, 0)
+            .await
+            .expect("get_or_open");
         for i in 0..n {
             let path = format!("{repo}/f{i}.rs");
             db.query("CREATE file_meta SET path = $path, mtime = 0, size = 1, repo = $repo, chunk_count = 1;")
@@ -948,7 +981,9 @@ mod load_repos_tests {
         let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
         seed_file_meta(&repo_dbs, home.path(), &indexed, 5).await;
         // `empty` gets a DB (cached) but no file_meta rows.
-        let _ = store::get_or_open(&repo_dbs, home.path(), &empty, 0).await.expect("get_or_open");
+        let _ = store::get_or_open(&repo_dbs, home.path(), &empty, 0)
+            .await
+            .expect("get_or_open");
 
         let statuses: Arc<RwLock<HashMap<String, RepoStatus>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -958,12 +993,24 @@ mod load_repos_tests {
             m.insert(empty.clone(), RepoStatus::default());
         }
 
-        seed_statuses_from_db(&statuses, &repo_dbs, home.path(), &[indexed_raw, empty_raw], &HashMap::new())
-            .await;
+        seed_statuses_from_db(
+            &statuses,
+            &repo_dbs,
+            home.path(),
+            &[indexed_raw, empty_raw],
+            &HashMap::new(),
+        )
+        .await;
 
         let m = statuses.read().await;
-        assert_eq!(m[&indexed].indexed_files, 5, "indexed repo must restore its file count");
-        assert_eq!(m[&empty].indexed_files, 0, "never-indexed repo must stay at 0");
+        assert_eq!(
+            m[&indexed].indexed_files, 5,
+            "indexed repo must restore its file count"
+        );
+        assert_eq!(
+            m[&empty].indexed_files, 0,
+            "never-indexed repo must stay at 0"
+        );
     }
 
     /// A run that has already advanced a repo's status by the time the seed task
@@ -982,15 +1029,32 @@ mod load_repos_tests {
             let mut m = statuses.write().await;
             m.insert(
                 repo.clone(),
-                RepoStatus { state: IndexState::Indexing, ..Default::default() },
+                RepoStatus {
+                    state: IndexState::Indexing,
+                    ..Default::default()
+                },
             );
         }
 
-        seed_statuses_from_db(&statuses, &repo_dbs, home.path(), &[repo_raw], &HashMap::new()).await;
+        seed_statuses_from_db(
+            &statuses,
+            &repo_dbs,
+            home.path(),
+            &[repo_raw],
+            &HashMap::new(),
+        )
+        .await;
 
         let m = statuses.read().await;
-        assert_eq!(m[&repo].state, IndexState::Indexing, "in-flight run must survive the seed");
-        assert_eq!(m[&repo].indexed_files, 0, "seed must not overwrite a live run's numerator");
+        assert_eq!(
+            m[&repo].state,
+            IndexState::Indexing,
+            "in-flight run must survive the seed"
+        );
+        assert_eq!(
+            m[&repo].indexed_files, 0,
+            "seed must not overwrite a live run's numerator"
+        );
     }
 
     /// Single-flight coalescing: concurrent `warm_repo_blocking` calls for the same

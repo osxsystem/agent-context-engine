@@ -1,16 +1,16 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
+    Router,
     extract::{Json, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
     response::sse::{Event, Sse},
+    response::{IntoResponse, Response},
     routing::{any, delete, get, post, put},
-    Router,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
@@ -18,28 +18,26 @@ use serde_json::{Value, json};
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
 use tokio::sync::RwLock;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 
 type RepoMcpService = StreamableHttpService<RepoMcpHandler, LocalSessionManager>;
 
 use crate::config::{
-    ConfigError, CURRENT_VERSION, Settings, ensure_dir_and_load, write_settings_atomic,
-    config_path,
+    CURRENT_VERSION, ConfigError, Settings, config_path, ensure_dir_and_load, write_settings_atomic,
 };
 use crate::defender;
-use crate::embedding::voyage::VoyageClient;
+use crate::embedding::voyage::EmbedClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
 use crate::mcp::{McpHandler, RepoMcpHandler, run_codebase_retrieval};
 use crate::path_in_repo;
-use crate::store;
 use crate::query;
+use crate::store;
 
 // ─── IntoResponse for ConfigError ─────────────────────────────────────────
 
@@ -171,14 +169,20 @@ pub fn build_router(
         .route("/", get(serve_index))
         .route("/api/config", get(get_config))
         .route("/api/config", put(put_config))
-        .route("/api/repos/:repo_id/index", post(post_index_repo).delete(delete_repo_index))
+        .route(
+            "/api/repos/:repo_id/index",
+            post(post_index_repo).delete(delete_repo_index),
+        )
         .route("/api/repos/:repo_id/rebuild", post(post_rebuild_repo))
         .route("/api/repos/:repo_id/cancel-index", post(post_cancel_index))
         .route("/api/repos/:repo_id/status", get(get_repo_status))
         .route("/api/repos/:repo_id/index-stats", get(get_index_stats))
         .route("/api/repos/:repo_id/files", get(get_repo_files))
         .route("/api/repos/:repo_id/ignore-file", post(post_ignore_file))
-        .route("/api/repos/:repo_id/unignore-file", post(post_unignore_file))
+        .route(
+            "/api/repos/:repo_id/unignore-file",
+            post(post_unignore_file),
+        )
         .route("/api/repos/:repo_id/ignored-files", get(get_ignored_files))
         .route("/api/repos/:repo_id/graph", get(get_repo_graph))
         .route("/api/repos/:repo_id/chunks", get(get_repo_chunks))
@@ -193,7 +197,10 @@ pub fn build_router(
         .route("/api/defender-exclude", post(post_defender_exclude))
         .route("/api/plan/packages", get(plan_get_packages))
         .route("/api/plan/checkout", post(plan_post_checkout))
-        .route("/api/plan/orders/:invoice/status", get(plan_get_order_status))
+        .route(
+            "/api/plan/orders/:invoice/status",
+            get(plan_get_order_status),
+        )
         .route("/api/plan/usage", get(plan_get_usage))
         .route("/mcp-repo/:repo_id", any(handle_repo_mcp))
         .merge(Router::new().nest_service("/mcp", mcp_service))
@@ -270,10 +277,7 @@ async fn get_config(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn put_config(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> Response {
+async fn put_config(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     // Parse body as generic Value first so we can return a 400 with a clear message.
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -411,10 +415,7 @@ async fn put_config(
 }
 
 /// POST /api/repos/:repo_id/index — trigger index for one repo.
-async fn post_index_repo(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn post_index_repo(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -430,10 +431,7 @@ async fn post_index_repo(
 }
 
 /// POST /api/repos/:repo_id/rebuild — force a full rebuild for one repo.
-async fn post_rebuild_repo(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn post_rebuild_repo(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -449,10 +447,7 @@ async fn post_rebuild_repo(
 }
 
 /// POST /api/repos/:repo_id/cancel-index — cancel an in-progress index run.
-async fn post_cancel_index(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn post_cancel_index(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -579,7 +574,8 @@ async fn delete_repo_index(
     // a re-index proceed on the clean path immediately while this drains in the
     // foreground. If it outlives the retry budget, the boot-time sweep reclaims it
     // (store::sweep_stale_generations).
-    let removed = store::remove_old_generation_dir(&state.data_dir, &repo, current_generation).await;
+    let removed =
+        store::remove_old_generation_dir(&state.data_dir, &repo, current_generation).await;
 
     if removed {
         Json(json!({ "status": "ok" })).into_response()
@@ -612,10 +608,7 @@ async fn post_index_all(State(state): State<AppState>) -> Response {
 }
 
 /// GET /api/repos/:repo_id/status
-async fn get_repo_status(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn get_repo_status(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -631,10 +624,7 @@ async fn get_repo_status(
 }
 
 /// GET /api/repos/:repo_id/index-stats — summary counts + config for the explorer.
-async fn get_index_stats(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn get_index_stats(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -646,7 +636,8 @@ async fn get_index_stats(
         // from index status), and no phantom DB is created by a read.
         Ok(None) => {
             let embedding_model = state.settings.read().await.embedding.model.clone();
-            let db_dir = store::db_path(&state.data_dir, &repo, repo_generation(&state, &repo).await);
+            let db_dir =
+                store::db_path(&state.data_dir, &repo, repo_generation(&state, &repo).await);
             return Json(json!({
                 "repo": repo,
                 "files": 0,
@@ -683,7 +674,9 @@ async fn get_index_stats(
     let status = state.index_engine.repo_status(&repo).await;
     let (state_str, last_indexed_at) = match &status {
         Some(s) => (
-            serde_json::to_value(&s.state).ok().and_then(|v| v.as_str().map(str::to_string)),
+            serde_json::to_value(&s.state)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string)),
             s.last_indexed_at,
         ),
         None => (None, None),
@@ -752,7 +745,11 @@ async fn post_ignore_file(
     let file_path = match body.get("path").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
         None => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "missing 'path' field" }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'path' field" })),
+            )
+                .into_response();
         }
     };
 
@@ -763,12 +760,20 @@ async fn post_ignore_file(
         match abs.strip_prefix(root) {
             Ok(rel) => rel.to_str().unwrap_or("").replace('\\', "/"),
             Err(_) => {
-                return (StatusCode::BAD_REQUEST, Json(json!({ "error": "path is not inside repo" }))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "path is not inside repo" })),
+                )
+                    .into_response();
             }
         }
     };
     if relative.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "empty relative path" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "empty relative path" })),
+        )
+            .into_response();
     }
 
     // Acquire per-repo lock (same lock the pipeline consumer uses).
@@ -780,13 +785,22 @@ async fn post_ignore_file(
     let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo, generation).await {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e}") }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("db: {e}") })),
+            )
+                .into_response();
         }
     };
 
     // 1. Delete file data from DB (includes file_meta, chunks, symbols, edges, raw_edge).
-    if let Err(e) = store::ops::delete_files_data_bulk(&db, std::slice::from_ref(&file_path)).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("delete: {e}") }))).into_response();
+    if let Err(e) = store::ops::delete_files_data_bulk(&db, std::slice::from_ref(&file_path)).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("delete: {e}") })),
+        )
+            .into_response();
     }
 
     // 2. Evict vectors from the in-memory shard.
@@ -800,7 +814,11 @@ async fn post_ignore_file(
     if !ignored.contains(&relative) {
         ignored.push(relative.clone());
         if let Err(e) = store::ops::set_ignored_paths(&db, &ignored).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("set ignored: {e}") }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("set ignored: {e}") })),
+            )
+                .into_response();
         }
     }
 
@@ -820,7 +838,11 @@ async fn post_unignore_file(
     let relative = match body.get("path").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
         None => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "missing 'path' field" }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'path' field" })),
+            )
+                .into_response();
         }
     };
 
@@ -832,24 +854,29 @@ async fn post_unignore_file(
     let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo, generation).await {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e}") }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("db: {e}") })),
+            )
+                .into_response();
         }
     };
 
     let mut ignored = store::ops::get_ignored_paths(&db).await.unwrap_or_default();
     ignored.retain(|p| p != &relative);
     if let Err(e) = store::ops::set_ignored_paths(&db, &ignored).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("set ignored: {e}") }))).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("set ignored: {e}") })),
+        )
+            .into_response();
     }
 
     Json(json!({ "status": "ok" })).into_response()
 }
 
 /// GET /api/repos/:repo_id/ignored-files — list per-repo ignored paths.
-async fn get_ignored_files(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn get_ignored_files(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -858,7 +885,11 @@ async fn get_ignored_files(
     let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo, generation).await {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e}") }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("db: {e}") })),
+            )
+                .into_response();
         }
     };
 
@@ -867,10 +898,7 @@ async fn get_ignored_files(
 }
 
 /// GET /api/repos/:repo_id/graph — bounded call-graph node-link payload.
-async fn get_repo_graph(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn get_repo_graph(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -972,10 +1000,7 @@ fn default_rerank() -> bool {
 }
 
 /// POST /api/query — run the query pipeline and return results.
-async fn post_query(
-    State(state): State<AppState>,
-    Json(req): Json<QueryRequest>,
-) -> Response {
+async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>) -> Response {
     // Take ONE owned snapshot of settings at the top of the handler.
     // The guard is dropped as soon as `.clone()` completes — NOT held across any
     // subsequent .await calls (vector_index.read(), query::run_query, etc.).
@@ -1001,7 +1026,8 @@ async fn post_query(
     }
 
     // Build voyage client.
-    let voyage_client = match VoyageClient::new(
+    let voyage_client = match EmbedClient::new(
+        &settings.embedding.provider,
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
         settings.embedding.voyage_base_url.as_deref(),
@@ -1070,10 +1096,7 @@ struct McpToolRequest {
 /// The response JSON contains `{ "result": "<plain text>" }`. The text is
 /// byte-identical to what the MCP tool returns for the same inputs, so the
 /// "Test" sub-tab in the web UI exercises the exact same code path.
-async fn post_mcp_tool(
-    State(state): State<AppState>,
-    Json(req): Json<McpToolRequest>,
-) -> Response {
+async fn post_mcp_tool(State(state): State<AppState>, Json(req): Json<McpToolRequest>) -> Response {
     // Take an owned snapshot — guard dropped before the .await below.
     let settings = state.settings.read().await.clone();
     let result = run_codebase_retrieval(
@@ -1177,7 +1200,11 @@ async fn handle_repo_mcp(
                 Arc::new(LocalSessionManager::default()),
                 StreamableHttpServerConfig::default(),
             );
-            state.repo_mcp_services.write().await.insert(repo.clone(), new_service.clone());
+            state
+                .repo_mcp_services
+                .write()
+                .await
+                .insert(repo.clone(), new_service.clone());
             new_service
         }
     };
@@ -1195,10 +1222,7 @@ async fn handle_repo_mcp(
 ///
 /// Subscribes to the IndexEngine's broadcast channel and filters events for the
 /// requested repo. Sends a keepalive comment every 15s to prevent proxy timeouts.
-async fn get_index_events(
-    State(state): State<AppState>,
-    Path(repo_id): Path<String>,
-) -> Response {
+async fn get_index_events(State(state): State<AppState>, Path(repo_id): Path<String>) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
@@ -1209,31 +1233,39 @@ async fn get_index_events(
     let repo_filter = repo.clone();
 
     let event_stream = stream
-        .filter_map(move |result| {
-            match result {
-                Ok(event) => {
-                    let matches = match &event {
-                        crate::indexing::events::IndexEvent::Started { repo, .. } => *repo == repo_filter,
-                        crate::indexing::events::IndexEvent::FileParsed { .. } => true,
-                        crate::indexing::events::IndexEvent::FileSkipped { .. } => true,
-                        crate::indexing::events::IndexEvent::FileEmbedded { .. } => true,
-                        crate::indexing::events::IndexEvent::FileStored { .. } => true,
-                        crate::indexing::events::IndexEvent::FileIndexed { .. } => true,
-                        crate::indexing::events::IndexEvent::Phase2Start { repo } => *repo == repo_filter,
-                        crate::indexing::events::IndexEvent::Phase2Done { repo, .. } => *repo == repo_filter,
-                        crate::indexing::events::IndexEvent::Completed { repo, .. } => *repo == repo_filter,
-                        crate::indexing::events::IndexEvent::Failed { repo, .. } => *repo == repo_filter,
-                        crate::indexing::events::IndexEvent::Cancelled { repo } => *repo == repo_filter,
-                    };
-                    if matches {
-                        let data = serde_json::to_string(&event).unwrap_or_default();
-                        Some(Ok::<_, Infallible>(Event::default().data(data)))
-                    } else {
-                        None
+        .filter_map(move |result| match result {
+            Ok(event) => {
+                let matches = match &event {
+                    crate::indexing::events::IndexEvent::Started { repo, .. } => {
+                        *repo == repo_filter
                     }
+                    crate::indexing::events::IndexEvent::FileParsed { .. } => true,
+                    crate::indexing::events::IndexEvent::FileSkipped { .. } => true,
+                    crate::indexing::events::IndexEvent::FileEmbedded { .. } => true,
+                    crate::indexing::events::IndexEvent::FileStored { .. } => true,
+                    crate::indexing::events::IndexEvent::FileIndexed { .. } => true,
+                    crate::indexing::events::IndexEvent::Phase2Start { repo } => {
+                        *repo == repo_filter
+                    }
+                    crate::indexing::events::IndexEvent::Phase2Done { repo, .. } => {
+                        *repo == repo_filter
+                    }
+                    crate::indexing::events::IndexEvent::Completed { repo, .. } => {
+                        *repo == repo_filter
+                    }
+                    crate::indexing::events::IndexEvent::Failed { repo, .. } => {
+                        *repo == repo_filter
+                    }
+                    crate::indexing::events::IndexEvent::Cancelled { repo } => *repo == repo_filter,
+                };
+                if matches {
+                    let data = serde_json::to_string(&event).unwrap_or_default();
+                    Some(Ok::<_, Infallible>(Event::default().data(data)))
+                } else {
+                    None
                 }
-                Err(_) => None,
             }
+            Err(_) => None,
         })
         .map(|e| e);
 
@@ -1297,8 +1329,7 @@ async fn delete_embedding_cache(
 async fn get_defender_status(State(state): State<AppState>) -> Response {
     let data_dir = state.data_dir.to_string_lossy().to_string();
 
-    let status =
-        tokio::task::spawn_blocking(move || defender::check_status(&data_dir)).await;
+    let status = tokio::task::spawn_blocking(move || defender::check_status(&data_dir)).await;
 
     match status {
         Ok(s) => Json(json!(s)).into_response(),
@@ -1312,8 +1343,7 @@ async fn get_defender_status(State(state): State<AppState>) -> Response {
 async fn post_defender_exclude(State(state): State<AppState>) -> Response {
     let data_dir = state.data_dir.to_string_lossy().to_string();
 
-    let result =
-        tokio::task::spawn_blocking(move || defender::add_exclusions(&data_dir)).await;
+    let result = tokio::task::spawn_blocking(move || defender::add_exclusions(&data_dir)).await;
 
     match result {
         Ok(r) => {
@@ -1376,10 +1406,7 @@ async fn plan_get_packages(State(_): State<AppState>) -> Response {
         .unwrap()
 }
 
-async fn plan_post_checkout(
-    State(_): State<AppState>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn plan_post_checkout(State(_): State<AppState>, Json(body): Json<Value>) -> Response {
     let base = plan_admin_base();
     let url = format!("{base}/api/checkout");
 
@@ -1419,10 +1446,7 @@ async fn plan_post_checkout(
         .unwrap()
 }
 
-async fn plan_get_order_status(
-    State(_): State<AppState>,
-    Path(invoice): Path<String>,
-) -> Response {
+async fn plan_get_order_status(State(_): State<AppState>, Path(invoice): Path<String>) -> Response {
     let base = plan_admin_base();
     let url = format!("{base}/api/orders/{invoice}/status");
 

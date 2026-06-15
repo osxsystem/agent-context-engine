@@ -205,7 +205,11 @@ async fn main() {
     // blocking removal here can't race a live datastore. Runs synchronously before
     // IndexEngine::start so the first index never collides with a leftover. Skips
     // (doesn't error) any directory it still can't remove; the next boot retries.
-    store::sweep_stale_generations(&data_dir, &boot_settings.repos, &boot_settings.repo_generations);
+    store::sweep_stale_generations(
+        &data_dir,
+        &boot_settings.repos,
+        &boot_settings.repo_generations,
+    );
 
     // Start IndexEngine — spawns watchers for all configured repos.
     // It shares `repo_dbs` so indexer writes land in the handles the server reads.
@@ -220,12 +224,10 @@ async fn main() {
     .await;
     info!("IndexEngine started ({} repos)", repo_count);
 
-    let addr: std::net::SocketAddr = format!("{bind}:{port}")
-        .parse()
-        .unwrap_or_else(|e| {
-            eprintln!("error: invalid bind address '{bind}:{port}': {e}");
-            std::process::exit(2);
-        });
+    let addr: std::net::SocketAddr = format!("{bind}:{port}").parse().unwrap_or_else(|e| {
+        eprintln!("error: invalid bind address '{bind}:{port}': {e}");
+        std::process::exit(2);
+    });
 
     let app = server::build_router(
         home_dir,

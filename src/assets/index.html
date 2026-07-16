@@ -565,6 +565,7 @@
                          focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active">
             <option value="google">Google</option>
             <option value="openai">OpenAI</option>
+            <option value="custom">Custom</option>
           </select>
         </div>
         <div id="llm-openai-base-url-wrapper" class="mb-4 hidden">
@@ -575,8 +576,11 @@
                  class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
                         placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
-          <p data-i18n="llm.openaiBaseUrlHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+          <p id="llm-openai-base-url-help" data-i18n="llm.openaiBaseUrlHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
             Custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, Azure, vLLM, etc.). Leave blank to use api.openai.com. Accepts either the base form (…/v1) or the full /chat/completions URL.
+          </p>
+          <p id="llm-custom-endpoint-hint" data-i18n="llm.customEndpointEmptyHint" class="mt-1 text-xs text-amber-600 dark:text-amber-400 hidden">
+            Enter your endpoint URL (e.g. https://your-endpoint/v1).
           </p>
         </div>
         <div id="llm-openai-force-tool-use-wrapper" class="mb-4 hidden">
@@ -1184,6 +1188,11 @@ function applyI18n() {
   if (typeof cfg !== 'undefined' && cfg && typeof syncEmbeddingProviderUi === 'function') {
     syncEmbeddingProviderUi(cfg.embedding.provider || 'voyage');
   }
+  // Same rationale as above, for the LLM endpoint field's provider-specific
+  // label/help/placeholder ("OpenAI Base URL" vs "API endpoint" for Custom).
+  if (typeof cfg !== 'undefined' && cfg && typeof syncLlmProviderUi === 'function') {
+    syncLlmProviderUi(cfg.llm.provider || 'google');
+  }
 }
 
 // ─── Translation strings ────────────────────────────────────────────────────
@@ -1370,6 +1379,14 @@ const STR = {
   'llm.openaiForceToolUseHelp': { en: `Send tool_choice: "required" to the custom endpoint. Enable if your endpoint supports it (OpenRouter, vLLM, Together, etc.). Improves agentic RAG reliability.`,
                          vi: `Gửi tool_choice: "required" đến custom endpoint. Bật nếu endpoint hỗ trợ (OpenRouter, vLLM, Together, v.v.). Cải thiện độ tin cậy agentic RAG.`,
                          zh: `向自定义 endpoint 发送 tool_choice: "required"。如果您的 endpoint 支持（OpenRouter、vLLM、Together 等），请启用。提高 agentic RAG 可靠性。` },
+  'llm.customEndpoint': { en: `API endpoint`, vi: `API endpoint`, zh: `API endpoint` },
+  'llm.customEndpointHelp': { en: `OpenAI-compatible endpoint you control (e.g. a 9router proxy or self-hosted server). Include the /v1 path. Put the API key in the API keys list below.`,
+                         vi: `Endpoint OpenAI-compatible do bạn kiểm soát (vd: proxy 9router hoặc server tự host). Bao gồm path /v1. Đặt API key vào danh sách API keys bên dưới.`,
+                         zh: `由您控制的 OpenAI 兼容 endpoint（如 9router 代理或自托管服务器）。需包含 /v1 路径。请将 API key 填入下方的 API keys 列表。` },
+  'llm.customEndpointPlaceholder': { en: `https://your-endpoint/v1`, vi: `https://your-endpoint/v1`, zh: `https://your-endpoint/v1` },
+  'llm.customEndpointEmptyHint': { en: `Enter your endpoint URL (e.g. https://your-endpoint/v1).`,
+                         vi: `Nhập URL endpoint của bạn (vd: https://your-endpoint/v1).`,
+                         zh: `请输入您的 endpoint URL（例如 https://your-endpoint/v1）。` },
   'settings.setupHint':{ en: `Add an embedding API key below to start indexing repositories.`, vi: `Thêm embedding API key bên dưới để bắt đầu index repo.`, zh: `在下方添加嵌入 API 密钥即可开始索引仓库。` },
   'settings.mcpTools': { en: `MCP Tools`, vi: `MCP Tools`, zh: `MCP 工具` },
   'settings.mcpToolsHelp': { en: `Choose which MCP tools are exposed to clients. Disabled tools are hidden from tool lists.`, vi: `Chọn MCP tool nào được expose cho client. Tool bị tắt sẽ ẩn khỏi danh sách tool.`, zh: `选择向客户端公开哪些 MCP 工具。禁用的工具将从工具列表中隐藏。` },
@@ -2205,10 +2222,8 @@ function renderAll() {
   document.getElementById('llm-agentic-max-chunk-chars-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
   document.getElementById('llm-agentic-grep-read-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
   document.getElementById('llm-openai-base-url').value = cfg.llm.openai_base_url || '';
-  document.getElementById('llm-openai-base-url-wrapper').classList.toggle('hidden', (cfg.llm.provider || 'google') !== 'openai');
   document.getElementById('llm-openai-force-tool-use').checked = cfg.llm.openai_force_tool_use ?? false;
-  const showForceToolUse = (cfg.llm.provider || 'google') === 'openai' && !!(cfg.llm.openai_base_url || '').trim();
-  document.getElementById('llm-openai-force-tool-use-wrapper').classList.toggle('hidden', !showForceToolUse);
+  syncLlmProviderUi(cfg.llm.provider || 'google');
   renderKeyList('llm-keys-list', cfg.llm.api_keys, (idx) => {
     cfg.llm.api_keys.splice(idx, 1);
     renderAll();
@@ -3438,12 +3453,31 @@ document.getElementById('embedding-dimensions').addEventListener('input', (e) =>
     saveDebounced();
   }
 });
+// Reveal + relabel the LLM endpoint field for the selected provider. "openai"
+// shows an optional "OpenAI Base URL"; "custom" shows a required "API endpoint".
+// Called on load, on provider change, on endpoint input, and from applyI18n()
+// after a language switch overwrites the static data-i18n defaults.
+function syncLlmProviderUi(provider) {
+  const showEndpoint = provider === 'openai' || provider === 'custom';
+  const isCustom = provider === 'custom';
+  document.getElementById('llm-openai-base-url-wrapper').classList.toggle('hidden', !showEndpoint);
+  const inputEl = document.getElementById('llm-openai-base-url');
+  const labelEl = document.querySelector('label[for="llm-openai-base-url"]');
+  const helpEl = document.getElementById('llm-openai-base-url-help');
+  if (labelEl) labelEl.textContent = t(isCustom ? 'llm.customEndpoint' : 'llm.openaiBaseUrl');
+  if (helpEl) helpEl.textContent = t(isCustom ? 'llm.customEndpointHelp' : 'llm.openaiBaseUrlHelp');
+  inputEl.setAttribute('placeholder', t(isCustom ? 'llm.customEndpointPlaceholder' : 'llm.openaiBaseUrlPlaceholder'));
+  const hasEndpoint = !!(inputEl.value || '').trim();
+  // Force-tool-use only applies to the OpenAI-compatible path, and only once
+  // an endpoint is set (default api.openai.com never needs it).
+  document.getElementById('llm-openai-force-tool-use-wrapper').classList.toggle('hidden', !(showEndpoint && hasEndpoint));
+  const hintEl = document.getElementById('llm-custom-endpoint-hint');
+  if (hintEl) hintEl.classList.toggle('hidden', !(isCustom && !hasEndpoint));
+}
 document.getElementById('llm-provider').addEventListener('change', (e) => {
   if (cfg) {
     cfg.llm.provider = e.target.value;
-    document.getElementById('llm-openai-base-url-wrapper').classList.toggle('hidden', e.target.value !== 'openai');
-    const showForce = e.target.value === 'openai' && !!(cfg.llm.openai_base_url || '').trim();
-    document.getElementById('llm-openai-force-tool-use-wrapper').classList.toggle('hidden', !showForce);
+    syncLlmProviderUi(e.target.value);
     saveNow();
   }
 });
@@ -3451,8 +3485,7 @@ document.getElementById('llm-openai-base-url').addEventListener('input', (e) => 
   if (!cfg) return;
   const v = e.target.value.trim();
   cfg.llm.openai_base_url = v === '' ? null : v;
-  const showForce = (cfg.llm.provider || 'google') === 'openai' && v !== '';
-  document.getElementById('llm-openai-force-tool-use-wrapper').classList.toggle('hidden', !showForce);
+  syncLlmProviderUi(cfg.llm.provider || 'google');
   saveDebounced();
 });
 document.getElementById('llm-openai-force-tool-use').addEventListener('change', (e) => {

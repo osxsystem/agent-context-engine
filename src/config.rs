@@ -325,15 +325,17 @@ pub struct LlmConfig {
     #[serde(default = "default_agentic_rag_grep_read")]
     pub agentic_rag_grep_read: bool,
     /// Custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, Azure,
-    /// vLLM, etc.). Honored only when `provider == "openai"`. `None` / blank →
-    /// the OpenAI client falls back to `https://api.openai.com/v1/chat/completions`.
+    /// vLLM, etc.). Honored when `provider == "openai"` or `provider ==
+    /// "custom"`. `None` / blank → the OpenAI client falls back to
+    /// `https://api.openai.com/v1/chat/completions`.
     /// Accepts either the base form (`…/v1`) or the full `…/v1/chat/completions`
     /// URL — normalization is centralized in `llm::openai::chat_url`.
     #[serde(default)]
     pub openai_base_url: Option<String>,
-    /// When true, send `tool_choice: "required"` even for custom OpenAI base URLs.
-    /// Official OpenAI always gets "required"; custom endpoints default to "auto"
-    /// because some don't support it. Enable this if your custom endpoint supports
+    /// When true, send `tool_choice: "required"` even for custom OpenAI-compatible
+    /// URLs (`provider == "openai"` or `"custom"`). Official OpenAI always gets
+    /// "required"; custom endpoints default to "auto" because some don't support
+    /// it. Enable this if your custom endpoint supports
     /// forced tool use (OpenRouter, vLLM, Together, etc.). Defaults to false.
     #[serde(default)]
     pub openai_force_tool_use: bool,
@@ -1347,6 +1349,52 @@ mod tests {
             "openai_base_url must round-trip through write+load"
         );
         assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    /// `custom` provider round-trips through write + migration-aware reload
+    /// exactly like `openai` — the endpoint field intact. `custom` reuses
+    /// `openai_base_url`, mirrors the openai round-trip, only the provider
+    /// string differs.
+    #[test]
+    fn test_llm_config_round_trips_custom_provider() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let s = Settings {
+            llm: LlmConfig {
+                provider: "custom".to_owned(),
+                rerank_model: "glm-4.6".to_owned(),
+                api_keys: vec!["sk-custom".to_owned()],
+                openai_base_url: Some("http://proxy.example/v1".to_owned()),
+                ..LlmConfig::default()
+            },
+            ..Settings::default()
+        };
+        write_settings_atomic(&path, &s).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(loaded.llm.provider, "custom");
+        assert_eq!(
+            loaded.llm.openai_base_url.as_deref(),
+            Some("http://proxy.example/v1"),
+            "openai_base_url must round-trip through write+load for custom provider"
+        );
+        assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    /// `custom` provider deserializes cleanly without `openai_base_url` set,
+    /// same additive-default contract as `openai`. Mirrors
+    /// `test_llm_config_deserializes_without_openai_base_url`.
+    #[test]
+    fn test_llm_config_deserializes_custom_without_base_url() {
+        let json = r#"{"provider":"custom","rerank_model":"glm-4.6","api_keys":["k"]}"#;
+        let cfg: LlmConfig = serde_json::from_str(json).expect("deserialize old llm block");
+        assert_eq!(cfg.provider, "custom");
+        assert!(
+            cfg.openai_base_url.is_none(),
+            "openai_base_url must default to None on old files"
+        );
     }
 
     /// Backward-compat for `chat_custom_endpoints`: an `llm` block predating the

@@ -67,10 +67,11 @@ pub struct LlmClient {
     http: Client,
     key_cursor: std::sync::Arc<AtomicUsize>,
     use_structured_output: bool,
-    /// Custom OpenAI-compatible endpoint. Honored only when `provider ==
-    /// "openai"`; ignored for other providers. `None` / blank → the OpenAI
-    /// client falls back to `api.openai.com`. Normalization (base form vs
-    /// full URL) happens centrally in `openai::chat_url`.
+    /// Custom OpenAI-compatible endpoint. Honored when `provider == "openai"`
+    /// or `provider == "custom"`; ignored for other providers. `None` /
+    /// blank → the OpenAI client falls back to `api.openai.com`.
+    /// Normalization (base form vs full URL) happens centrally in
+    /// `openai::chat_url`.
     openai_base_url: Option<String>,
     /// Send `tool_choice: "required"` even for custom OpenAI endpoints.
     openai_force_tool_use: bool,
@@ -78,7 +79,8 @@ pub struct LlmClient {
 
 /// Whether `provider` has a native JSON output mode the reranker can request.
 fn provider_supports_structured_output(provider: &str) -> bool {
-    matches!(provider, "google" | "openai")
+    // "custom" is OpenAI-compatible endpoint alias — same native-JSON path.
+    matches!(provider, "google" | "openai" | "custom")
 }
 
 /// Detect whether an error is a rate-limit (HTTP 429) so the key can be
@@ -153,7 +155,7 @@ impl LlmClient {
                 )
                 .await
             }
-            "openai" => {
+            "openai" | "custom" => {
                 openai::complete(
                     &self.http,
                     &self.model,
@@ -269,7 +271,7 @@ impl LlmClient {
                     )),
                 }
             }
-            "openai" => {
+            "openai" | "custom" => {
                 let r = openai::complete_with_tools(
                     &self.http,
                     &self.model,
@@ -439,7 +441,7 @@ impl LlmClient {
                     )),
                 }
             }
-            "openai" => {
+            "openai" | "custom" => {
                 let r = openai::complete_with_tools_streaming(
                     &self.http,
                     &self.model,
@@ -574,5 +576,18 @@ impl LlmClient {
         }
 
         Err(last_err.unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_provider_supports_structured_output() {
+        assert!(provider_supports_structured_output("custom"));
+        assert!(provider_supports_structured_output("openai"));
+        assert!(provider_supports_structured_output("google"));
+        assert!(!provider_supports_structured_output("anthropic"));
     }
 }

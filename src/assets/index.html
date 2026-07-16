@@ -3464,15 +3464,15 @@ function syncLlmProviderUi(provider) {
   const inputEl = document.getElementById('llm-openai-base-url');
   const labelEl = document.querySelector('label[for="llm-openai-base-url"]');
   const helpEl = document.getElementById('llm-openai-base-url-help');
-  labelEl.textContent = t(isCustom ? 'llm.customEndpoint' : 'llm.openaiBaseUrl');
-  helpEl.textContent = t(isCustom ? 'llm.customEndpointHelp' : 'llm.openaiBaseUrlHelp');
+  if (labelEl) labelEl.textContent = t(isCustom ? 'llm.customEndpoint' : 'llm.openaiBaseUrl');
+  if (helpEl) helpEl.textContent = t(isCustom ? 'llm.customEndpointHelp' : 'llm.openaiBaseUrlHelp');
   inputEl.setAttribute('placeholder', t(isCustom ? 'llm.customEndpointPlaceholder' : 'llm.openaiBaseUrlPlaceholder'));
   const hasEndpoint = !!(inputEl.value || '').trim();
   // Force-tool-use only applies to the OpenAI-compatible path, and only once
   // an endpoint is set (default api.openai.com never needs it).
   document.getElementById('llm-openai-force-tool-use-wrapper').classList.toggle('hidden', !(showEndpoint && hasEndpoint));
   const hintEl = document.getElementById('llm-custom-endpoint-hint');
-  hintEl.classList.toggle('hidden', !(isCustom && !hasEndpoint));
+  if (hintEl) hintEl.classList.toggle('hidden', !(isCustom && !hasEndpoint));
 }
 document.getElementById('llm-provider').addEventListener('change', (e) => {
   if (cfg) {

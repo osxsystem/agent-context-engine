@@ -3552,7 +3552,10 @@ mod worktree_root {
     #[test]
     fn non_repo_dir_is_not_redirected() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(linked_worktree_main_root(tmp.path().to_str().unwrap()), None);
+        assert_eq!(
+            linked_worktree_main_root(tmp.path().to_str().unwrap()),
+            None
+        );
     }
 
     #[test]

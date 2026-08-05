@@ -48,6 +48,65 @@ pub fn normalize_repo_path(repo: &str) -> String {
     s.trim_end_matches(['/', '\\']).to_string()
 }
 
+/// If `repo` is a linked git worktree, return the main repository's working
+/// directory; otherwise `None`.
+///
+/// Detection is purely filesystem-based (no git subprocess): a linked worktree
+/// has a `.git` FILE containing `gitdir: <main>/.git/worktrees/<name>`, while a
+/// main checkout has a `.git` directory. Only that exact shape redirects -
+/// submodules (`gitdir: .../.git/modules/<name>`) and anything unparseable
+/// return `None`. The derived main root must exist on disk and must differ
+/// from `repo` itself.
+///
+/// Why this exists: a worktree is a near-identical copy of its repository.
+/// Registering it as its own repo duplicates the entire index (embedding
+/// spend, disk, RAM) and leaves a dead index behind once the worktree is
+/// removed after merge. Callers use this to serve worktree queries from the
+/// main repository's index instead (see `mcp::run_codebase_retrieval` and
+/// `router::mcp_proxy`).
+pub fn linked_worktree_main_root(repo: &str) -> Option<String> {
+    let repo_root = std::path::Path::new(repo);
+    let dot_git = repo_root.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = content
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+    // `gitdir` may be relative to the worktree root.
+    let gitdir_path = if std::path::Path::new(gitdir).is_absolute() {
+        std::path::PathBuf::from(gitdir)
+    } else {
+        repo_root.join(gitdir)
+    };
+    // Expect `<main>/.git/worktrees/<name>`; everything before `.git` is the
+    // main working directory.
+    let worktrees_dir = gitdir_path.parent()?;
+    let git_dir = worktrees_dir.parent()?;
+    if worktrees_dir.file_name()? != "worktrees" || git_dir.file_name()? != ".git" {
+        return None;
+    }
+    let main_root = git_dir.parent()?;
+    if !main_root.is_dir() {
+        return None;
+    }
+    // Canonicalize for a stable repo key (a relative `gitdir` leaves `..`
+    // segments in the path); fall back to the raw path if it fails.
+    let main_root = std::fs::canonicalize(main_root)
+        .unwrap_or_else(|_| main_root.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if normalize_repo_path(&main_root) == normalize_repo_path(repo) {
+        return None;
+    }
+    Some(main_root)
+}
+
 /// Sanitize a repo path to a safe directory name (max 64 chars).
 pub fn sanitize_repo_name(repo_path: &str) -> String {
     let sanitized: String = repo_path
@@ -3431,5 +3490,96 @@ mod schemaless_tests {
                 .unwrap()
                 .contains_key(&normalize_repo_path(repo))
         );
+    }
+}
+
+#[cfg(test)]
+mod worktree_root {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Lay out `<tmp>/main` (a fake main checkout with `.git/worktrees/wt`) and
+    /// `<tmp>/wt` (a linked worktree whose `.git` file points at it).
+    fn fake_worktree(gitdir_line: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), gitdir_line).unwrap();
+        (tmp, main, wt)
+    }
+
+    #[test]
+    fn absolute_gitdir_resolves_to_main_root() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        let resolved = linked_worktree_main_root(wt.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(&main).unwrap()
+        );
+    }
+
+    #[test]
+    fn relative_gitdir_resolves_to_main_root() {
+        // Claude Code worktrees under `<main>/.claude/worktrees/<name>` often
+        // carry a relative pointer; `..` segments must resolve correctly.
+        let (_tmp, main, wt) = fake_worktree("gitdir: ../main/.git/worktrees/wt\n");
+        let resolved = linked_worktree_main_root(wt.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(&main).unwrap()
+        );
+    }
+
+    #[test]
+    fn main_checkout_with_git_dir_is_not_redirected() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        assert_eq!(linked_worktree_main_root(main.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn non_repo_dir_is_not_redirected() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(linked_worktree_main_root(tmp.path().to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn submodule_git_file_is_not_redirected() {
+        // Submodules also use a `.git` FILE, but point into `.git/modules/` -
+        // they are genuinely separate repos and must NOT redirect.
+        let (_tmp, _main, wt) = fake_worktree("gitdir: ../main/.git/modules/wt\n");
+        assert_eq!(linked_worktree_main_root(wt.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn missing_main_root_is_not_redirected() {
+        let tmp = TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /nonexistent/.git/worktrees/wt\n").unwrap();
+        assert_eq!(linked_worktree_main_root(wt.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn malformed_git_file_is_not_redirected() {
+        let tmp = TempDir::new().unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "not a gitdir pointer\n").unwrap();
+        assert_eq!(linked_worktree_main_root(wt.to_str().unwrap()), None);
+        std::fs::write(wt.join(".git"), "gitdir:\n").unwrap();
+        assert_eq!(linked_worktree_main_root(wt.to_str().unwrap()), None);
     }
 }

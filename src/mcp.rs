@@ -396,9 +396,12 @@ impl McpHandler {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            rmcp::model::Implementation::new("context-engine-rs", env!("CARGO_PKG_VERSION")),
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::new(
+                "context-engine-rs",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(crate::prompts::MCP_SERVER_INSTRUCTIONS)
     }
 }
 
@@ -507,9 +510,12 @@ impl RepoMcpHandler {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RepoMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            rmcp::model::Implementation::new("context-engine-rs", env!("CARGO_PKG_VERSION")),
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::new(
+                "context-engine-rs",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(crate::prompts::MCP_SERVER_INSTRUCTIONS_REPO)
     }
 }
 
@@ -584,6 +590,60 @@ async fn do_vector_only_query(
 }
 
 pub async fn run_codebase_retrieval(
+    home_dir: &Path,
+    data_dir: &Path,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    settings: &Settings,
+    information_request: &str,
+    workspace_full_path: &str,
+) -> String {
+    // Linked-worktree guard: serve the query from the MAIN repository's index
+    // so a worktree path never auto-registers (and never embeds) a duplicate
+    // copy of the repo. See `store::linked_worktree_main_root` for the rules.
+    let requested = workspace_full_path.trim();
+    match crate::store::linked_worktree_main_root(requested) {
+        Some(main_root) => {
+            tracing::info!(worktree = %requested, main = %main_root,
+                "serving linked-worktree query from main repository index");
+            let text = run_codebase_retrieval_resolved(
+                home_dir,
+                data_dir,
+                index_engine,
+                repo_dbs,
+                settings,
+                information_request,
+                &main_root,
+            )
+            .await;
+            format!("{}{}", worktree_redirect_note(requested, &main_root), text)
+        }
+        None => {
+            run_codebase_retrieval_resolved(
+                home_dir,
+                data_dir,
+                index_engine,
+                repo_dbs,
+                settings,
+                information_request,
+                requested,
+            )
+            .await
+        }
+    }
+}
+
+/// The note prepended to tool output when a linked-worktree path was redirected,
+/// so the caller can map result paths back to its own checkout. Shared by the
+/// monolith/worker funnels here and the router proxy (`router::mcp_proxy`).
+pub fn worktree_redirect_note(worktree: &str, main_root: &str) -> String {
+    format!(
+        "(note: '{worktree}' is a linked git worktree; results come from the main \
+         repository index at '{main_root}' - file paths below are under that root)\n\n"
+    )
+}
+
+async fn run_codebase_retrieval_resolved(
     home_dir: &Path,
     data_dir: &Path,
     index_engine: &Arc<IndexEngine>,
@@ -904,6 +964,9 @@ mod tests {
         assert!(!check_usable(10, &Some(ts_days_ago(8)), THRESHOLD()));
     }
 
+    // Asserts Windows-native join semantics (drive letters, `\` separators);
+    // build_db_key normalizes to `/` on Unix, so this can only pass on Windows.
+    #[cfg(windows)]
     #[test]
     fn file_retrieval_db_key_windows_backslash_input() {
         let repo = r"D:\projects\Python\local-context-engine";
@@ -915,6 +978,9 @@ mod tests {
         );
     }
 
+    // Asserts Windows-native join semantics (drive letters, `\` separators);
+    // build_db_key normalizes to `/` on Unix, so this can only pass on Windows.
+    #[cfg(windows)]
     #[test]
     fn file_retrieval_db_key_forward_slash_input() {
         let repo = r"D:\projects\Python\local-context-engine";
@@ -926,6 +992,9 @@ mod tests {
         );
     }
 
+    // Asserts Windows-native join semantics (drive letters, `\` separators);
+    // build_db_key normalizes to `/` on Unix, so this can only pass on Windows.
+    #[cfg(windows)]
     #[test]
     fn file_retrieval_db_key_mixed_slashes() {
         let repo = r"D:\projects\Python\local-context-engine";
@@ -937,6 +1006,9 @@ mod tests {
         );
     }
 
+    // Asserts Windows-native join semantics (drive letters, `\` separators);
+    // build_db_key normalizes to `/` on Unix, so this can only pass on Windows.
+    #[cfg(windows)]
     #[test]
     fn file_retrieval_db_key_leading_slash_in_file_path() {
         let repo = r"D:\projects\Python\local-context-engine";
@@ -948,6 +1020,9 @@ mod tests {
         );
     }
 
+    // Asserts Windows-native join semantics (drive letters, `\` separators);
+    // build_db_key normalizes to `/` on Unix, so this can only pass on Windows.
+    #[cfg(windows)]
     #[test]
     fn file_retrieval_db_key_leading_backslash_in_file_path() {
         let repo = r"D:\projects\Python\local-context-engine";
@@ -959,6 +1034,9 @@ mod tests {
         );
     }
 
+    // Asserts Windows-native join semantics (drive letters, `\` separators);
+    // build_db_key normalizes to `/` on Unix, so this can only pass on Windows.
+    #[cfg(windows)]
     #[test]
     fn file_retrieval_db_key_trailing_slash_in_workspace() {
         let repo = r"D:\projects\Python\local-context-engine\";
@@ -970,6 +1048,9 @@ mod tests {
         );
     }
 
+    // Asserts Windows-native join semantics (drive letters, `\` separators);
+    // build_db_key normalizes to `/` on Unix, so this can only pass on Windows.
+    #[cfg(windows)]
     #[test]
     fn file_retrieval_db_key_both_edge_cases() {
         let repo = r"D:\projects\Python\local-context-engine/";
@@ -1720,6 +1801,50 @@ fn build_db_key(workspace: &str, file_path: &str) -> String {
 /// Single-file semantic retrieval: embed query → fetch file chunks from DB →
 /// cosine rank in-memory → return top-k snippets.
 pub async fn run_file_retrieval(
+    data_dir: &Path,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    settings: &Settings,
+    workspace_full_path: &str,
+    file_path: &str,
+    information_request: &str,
+    top_k: usize,
+) -> String {
+    // Linked-worktree guard - same rationale as `run_codebase_retrieval`. The
+    // relative `file_path` stays valid because a worktree mirrors the main
+    // repository's layout.
+    let requested = workspace_full_path.trim();
+    match crate::store::linked_worktree_main_root(requested) {
+        Some(main_root) => {
+            tracing::info!(worktree = %requested, main = %main_root,
+                "serving linked-worktree file retrieval from main repository index");
+            let text = run_file_retrieval_resolved(
+                data_dir,
+                repo_dbs,
+                settings,
+                &main_root,
+                file_path,
+                information_request,
+                top_k,
+            )
+            .await;
+            format!("{}{}", worktree_redirect_note(requested, &main_root), text)
+        }
+        None => {
+            run_file_retrieval_resolved(
+                data_dir,
+                repo_dbs,
+                settings,
+                requested,
+                file_path,
+                information_request,
+                top_k,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_file_retrieval_resolved(
     data_dir: &Path,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: &Settings,

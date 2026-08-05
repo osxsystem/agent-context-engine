@@ -93,16 +93,23 @@ impl ProxyMcpHandler {
                 "Error: workspace_full_path is required.".to_string(),
             )]));
         }
+        // Linked-worktree guard: route to the MAIN repository's worker. The
+        // worker-side funnel has the same guard, but resolving only there would
+        // be too late — repo selection happens HERE, so a worktree path would
+        // already have spawned (and indexed) a duplicate per-worktree worker.
+        let (repo, worktree_note) = resolve_worktree(repo);
         // Forward to the worker's /api/mcp-tool — the SAME funnel run_codebase_
         // retrieval the monolith MCP tool uses, so output is byte-identical.
         let body = json!({
             "information_request": args.information_request,
-            "workspace_full_path": args.workspace_full_path,
+            "workspace_full_path": repo,
         });
         let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool", body)
             .await
             .unwrap_or_else(|e| format!("Error: {e}"));
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{worktree_note}{text}"
+        ))]))
     }
 
     #[doc = include_str!("../prompts/mcp_file_retrieval.txt")]
@@ -117,8 +124,10 @@ impl ProxyMcpHandler {
                 "Error: workspace_full_path is required.".to_string(),
             )]));
         }
+        // Linked-worktree guard — same rationale as codebase_retrieval above.
+        let (repo, worktree_note) = resolve_worktree(repo);
         let body = json!({
-            "workspace_full_path": args.workspace_full_path,
+            "workspace_full_path": repo,
             "file_path": args.file_path,
             "information_request": args.information_request,
             "top_k": args.top_k,
@@ -126,16 +135,36 @@ impl ProxyMcpHandler {
         let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool/file-retrieval", body)
             .await
             .unwrap_or_else(|e| format!("Error: {e}"));
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{worktree_note}{text}"
+        ))]))
+    }
+}
+
+/// Resolve a linked-worktree repo path to its main repository, returning the
+/// (possibly redirected) repo plus the note to prepend to tool output (empty
+/// when no redirect happened). See `store::linked_worktree_main_root`.
+fn resolve_worktree(repo: String) -> (String, String) {
+    match crate::store::linked_worktree_main_root(&repo) {
+        Some(main_root) => {
+            tracing::info!(worktree = %repo, main = %main_root,
+                "routing linked-worktree MCP call to main repository worker");
+            let note = crate::mcp::worktree_redirect_note(&repo, &main_root);
+            (normalize_repo_path(&main_root), note)
+        }
+        None => (repo, String::new()),
     }
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ProxyMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
-            rmcp::model::Implementation::new("context-engine-rs", env!("CARGO_PKG_VERSION")),
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::new(
+                "context-engine-rs",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(crate::prompts::MCP_SERVER_INSTRUCTIONS)
     }
 }
 

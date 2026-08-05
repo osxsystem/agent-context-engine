@@ -47,6 +47,13 @@ pub const MCP_DEGRADE_INDEX_FAILED: &str = include_str!("mcp_degrade_index_faile
 pub const MCP_DEGRADE_INDEXING: &str = include_str!("mcp_degrade_indexing.txt");
 pub const MCP_FILE_RETRIEVAL_HINT: &str = include_str!("mcp_file_retrieval_hint.txt");
 
+// ─── MCP server-level instructions (initialize response) ─────────────────
+// Surfaced by MCP clients as system-prompt guidance (Claude Code renders them
+// under "MCP Server Instructions"), steering agents toward these tools before
+// grep/file reads. Keep them short: clients inject them verbatim every session.
+pub const MCP_SERVER_INSTRUCTIONS: &str = include_str!("mcp_server_instructions.txt");
+pub const MCP_SERVER_INSTRUCTIONS_REPO: &str = include_str!("mcp_server_instructions_repo.txt");
+
 // ─── LLM transport (llm/openai.rs) ───────────────────────────────────────
 pub const LLM_RESPOND_IN_JSON: &str = include_str!("llm_respond_in_json.txt");
 

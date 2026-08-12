@@ -209,7 +209,8 @@ pub fn build_router(
     );
 
     Router::new()
-        .route("/", get(serve_index))
+        .route("/", get(crate::assets::serve_index))
+        .route("/assets/fonts/:name", get(crate::assets::serve_font))
         .route("/api/config", get(get_config))
         .route("/api/config", put(put_config))
         .route(
@@ -309,16 +310,8 @@ fn db_error(context: &str, e: anyhow::Error) -> Response {
 }
 
 // ─── Handlers ──────────────────────────────────────────────────────────────
-
-async fn serve_index() -> impl IntoResponse {
-    let html = include_str!("assets/index.html");
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        "text/html; charset=utf-8".parse().unwrap(),
-    );
-    (headers, html)
-}
+// UI (`/`) + ADE fonts (`/assets/fonts/:name`) live in `crate::assets` so the
+// standalone server and the router front-end share one embed path.
 
 async fn get_config(State(state): State<AppState>) -> Response {
     match tokio::task::spawn_blocking(move || ensure_dir_and_load(&state.home_dir)).await {

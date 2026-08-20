@@ -14,7 +14,6 @@
 
 pub mod jobobject;
 pub mod mcp_proxy;
-pub mod plan;
 pub mod proxy;
 pub mod registry;
 pub mod sidecar;
@@ -98,25 +97,29 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<(Router, ProxyC
     let mut settings = ensure_dir_and_load(&home_dir).context("could not load settings")?;
 
     // Populate + persist `machine_id` if missing — the same first-boot seeding
-    // `boot_engine` does, but the ROUTER must do it too: in process-per-project
-    // mode the router (not a worker) is the always-on process that serves the UI
-    // and the `/api/plan/*` checkout/free-trial routes, and those read
-    // `machine_id` fresh from settings.json (per-machine dedup). A worker only
-    // boots on demand, so a fresh machine that has never indexed a repo would
-    // have an empty `machine_id` and every checkout would 500 with
-    // "machine_id not initialized" until some worker happened to boot.
+    // `boot_engine` does, mirrored here because the router (not a worker) is the
+    // always-on process in process-per-project mode and a worker only boots on
+    // demand.
+    //
+    // NOTHING READS THIS AT RUNTIME ANY MORE. The `/api/plan/*` checkout and
+    // free-trial routes that once consumed it for per-machine dedup were removed
+    // with the Buy Plan surface, and the id is no longer transmitted anywhere.
+    // It is retained deliberately, not by oversight: `machine_id` is part of the
+    // versioned settings.json schema that on-disk configs already carry, and
+    // seeding it in both boot paths keeps a router-first install's settings.json
+    // identical to an engine-first one. See docs/product/SPEC-remove-buy-plan.md,
+    // "Retained by exception". Do not delete it on the assumption that it is
+    // dead weight, and do not reintroduce a caller on the assumption that it is
+    // still wired to something.
     //
     // NON-FATAL on purpose: unlike `boot_engine` (which `?`-aborts), a failure to
     // compute/persist the id here must NOT take down the router — that would kill
-    // the whole UI for an issue that only degrades one feature. The checkout path
-    // already degrades gracefully (it surfaces the same 500 the user would see
-    // anyway), so we log and keep serving rather than failing boot harder than
-    // the feature it gates.
+    // the whole UI over a value no request path depends on.
     if let Err(e) = ensure_machine_id(&home_dir, &mut settings) {
         tracing::warn!(
             error = %e,
-            "could not initialize machine_id at router boot; checkout/free-trial will report it \
-             uninitialized until it can be persisted, but the UI stays up"
+            "could not initialize machine_id at router boot; settings.json will lack it until it \
+             can be persisted, but nothing reads it at runtime and the UI stays up"
         );
     }
 

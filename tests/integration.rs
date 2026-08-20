@@ -21,10 +21,10 @@ async fn start_server(home: &TempDir) -> SocketAddr {
         .expect("failed to bind ephemeral port");
     let addr = listener.local_addr().expect("no local addr");
     let settings = Settings {
-        // Seed a deterministic machine_id so the plan-proxy handlers (free-trial
-        // claim, checkout) have a value to forward without depending on the
-        // host's hardware uid. Production calls `ensure_machine_id` at boot to
-        // guarantee `Some(...)`; tests do the same shortcut here.
+        // Seed a deterministic machine_id so the harness never touches the host's
+        // hardware uid. Production calls `ensure_machine_id` at boot to guarantee
+        // `Some(...)`; tests take the same shortcut. No handler reads this any
+        // more — it is here to keep the seeded Settings shaped like a real one.
         machine_id: Some("test-machine-id".to_string()),
         ..Settings::default()
     };
@@ -1046,131 +1046,6 @@ async fn test_put_data_dir_persists_but_does_not_relocate() {
     );
 }
 
-// ─── Plan-proxy routes ──────────────────────────────────────────────────
-// The engine's /api/plan/* routes proxy to the admin gateway at
-// CONTEXT_ENGINE_ADMIN_URL. We boot a tiny mock gateway covering free-trial
-// AND checkout, point the env var at it once, and exercise both flows in a
-// single test — process-global env mutation cannot race a parallel test.
-#[tokio::test]
-async fn test_plan_proxy_forwards_machine_id_and_injects_base_url() {
-    use axum::{
-        Json, Router,
-        routing::{get, post},
-    };
-
-    let mock = Router::new()
-        .route(
-            "/api/free-trial",
-            get(|| async {
-                Json(serde_json::json!({
-                    "available": true,
-                    "voyage_budget": 1000,
-                    "openai_budget": 500,
-                    "duration_days": 7
-                }))
-            }),
-        )
-        .route(
-            "/api/free-trial/claim",
-            post(|Json(body): Json<serde_json::Value>| async move {
-                // Engine MUST forward a non-empty machine_id read from settings.
-                let mid = body
-                    .get("machine_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                assert_eq!(mid, "test-machine-id", "engine must forward machine_id");
-                Json(serde_json::json!({
-                    "proxy_key": "ft_test_key",
-                    "expires_at": "2099-01-01 00:00:00"
-                }))
-            }),
-        )
-        .route(
-            "/api/checkout",
-            post(|Json(body): Json<serde_json::Value>| async move {
-                // Browser only sends `package_id`; engine MUST inject machine_id
-                // before forwarding so the admin gateway can credit the right
-                // per-machine user when SePay's webhook fires.
-                let mid = body
-                    .get("machine_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                assert_eq!(mid, "test-machine-id", "engine must inject machine_id");
-                (
-                    axum::http::StatusCode::CREATED,
-                    Json(serde_json::json!({
-                        "redirect_url": "https://example.test/pay",
-                        "invoice_number": "PKG_TEST_X"
-                    })),
-                )
-            }),
-        );
-    let mock_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
-    let mock_addr = mock_listener.local_addr().expect("mock addr");
-    tokio::spawn(async move {
-        axum::serve(mock_listener, mock).await.expect("mock server");
-    });
-
-    // SAFETY: single-threaded test setup, this is the only test that reads
-    // CONTEXT_ENGINE_ADMIN_URL.
-    unsafe {
-        std::env::set_var("CONTEXT_ENGINE_ADMIN_URL", format!("http://{mock_addr}"));
-    }
-
-    let home = TempDir::new().expect("tempdir");
-    let addr = start_server(&home).await;
-    let client = Client::new();
-
-    // GET /api/plan/free-trial → forwarded availability.
-    let res = client
-        .get(format!("http://{addr}/api/plan/free-trial"))
-        .send()
-        .await
-        .expect("get free-trial");
-    assert_eq!(res.status().as_u16(), 200);
-    let info: serde_json::Value = res.json().await.expect("json");
-    assert_eq!(info["available"], true);
-    assert_eq!(info["voyage_budget"], 1000);
-    assert_eq!(info["duration_days"], 7);
-
-    // POST /api/plan/free-trial/claim → key + injected base_url. machine_id is
-    // read from persisted settings (seeded by start_server), never re-derived.
-    let res = client
-        .post(format!("http://{addr}/api/plan/free-trial/claim"))
-        .send()
-        .await
-        .expect("post claim");
-    assert_eq!(res.status().as_u16(), 200);
-    let data: serde_json::Value = res.json().await.expect("json");
-    assert_eq!(data["proxy_key"], "ft_test_key");
-    assert_eq!(
-        data["base_url"],
-        format!("http://{mock_addr}/v1"),
-        "engine must inject base_url on success"
-    );
-
-    // POST /api/plan/checkout → mock returns 201 only when machine_id was
-    // injected (assertion in mock handler enforces it).
-    let res = client
-        .post(format!("http://{addr}/api/plan/checkout"))
-        .json(&serde_json::json!({ "package_id": 42 }))
-        .send()
-        .await
-        .expect("post checkout");
-    assert_eq!(res.status().as_u16(), 201);
-    let data: serde_json::Value = res.json().await.expect("json");
-    assert_eq!(data["invoice_number"], "PKG_TEST_X");
-    assert_eq!(
-        data["base_url"],
-        format!("http://{mock_addr}/v1"),
-        "engine must inject base_url on checkout success"
-    );
-
-    unsafe {
-        std::env::remove_var("CONTEXT_ENGINE_ADMIN_URL");
-    }
-}
-
 /// Wire-level proof that prior conversation history reaches the LLM provider.
 ///
 /// Spins up a mock OpenAI chat-completions endpoint that captures the raw
@@ -1413,5 +1288,65 @@ async fn tool_context_reaches_provider_on_wire() {
     assert!(
         last_content.contains("[Current question]"),
         "augmentation framing missing from wire; got: {last_content}"
+    );
+}
+
+// ─── Buy Plan removal ────────────────────────────────────────────────────
+// The admin UI is embedded into the binary at compile time, so the body the
+// server returns for `/` IS the shipped artefact — if any fragment of the
+// storefront survived the deletion, it shows up here. One request covers the
+// whole interface removal.
+#[tokio::test]
+async fn index_page_carries_no_plan_surface() {
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+
+    let res = Client::new()
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .expect("GET /");
+    assert_eq!(res.status().as_u16(), 200);
+    let body = res.text().await.expect("body");
+
+    // Guard against the absence assertions below passing vacuously (an error
+    // page, or an empty body, contains no plan identifiers either). Anchor on
+    // markup the settings page must always carry.
+    assert!(
+        body.contains("id=\"section-embedding\"") || body.contains("data-i18n=\"embed.heading\""),
+        "GET / did not return the real settings page, so the absence checks below prove nothing"
+    );
+
+    for needle in [
+        "section-buy-plan",   // the Plans card markup
+        "btn-header-buy-plan", // the header purchase control
+        "plan.",              // any plan.* translation key
+        "/api/plan/",         // any call into the plan proxy
+    ] {
+        assert!(
+            !body.contains(needle),
+            "served index.html still contains {needle:?} — the Buy Plan surface was not fully removed"
+        );
+    }
+}
+
+// The plan routes are registered in two independent route tables (engine mode
+// here, router mode in router_integration.rs). Removing them from only one
+// leaves them live in the other, so both are asserted.
+#[tokio::test]
+async fn plan_routes_are_gone_in_engine_mode() {
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+
+    let res = Client::new()
+        .get(format!("http://{addr}/api/plan/packages"))
+        .send()
+        .await
+        .expect("GET /api/plan/packages");
+
+    assert_eq!(
+        res.status().as_u16(),
+        404,
+        "/api/plan/packages must not be routed in engine mode"
     );
 }

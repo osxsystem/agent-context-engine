@@ -554,10 +554,13 @@ async fn put_config_without_new_repo_does_not_spawn() {
 }
 
 /// Booting the router on a brand-new (empty) home dir must seed + persist
-/// `machine_id` into settings.json — so the always-on router (not just an
-/// on-demand worker) initializes the per-machine dedup id that `/api/plan/*`
-/// checkout/free-trial reads. Regression guard for the "machine_id not
-/// initialized" checkout 500 on a machine that never booted a worker.
+/// `machine_id` into settings.json — so a router-first install ends up with the
+/// same settings.json shape as an engine-first one, rather than depending on
+/// some worker happening to boot.
+///
+/// No request path reads `machine_id` any more (the `/api/plan/*` routes that
+/// did were removed with the Buy Plan surface); it is retained as part of the
+/// versioned settings schema. This test guards the seeding, not a feature.
 #[tokio::test]
 async fn router_boot_on_empty_home_persists_machine_id() {
     let home = TempDir::new().unwrap();
@@ -596,5 +599,28 @@ async fn router_boot_on_empty_home_persists_machine_id() {
     assert_eq!(
         reloaded.machine_id, mid,
         "persisted machine_id must be stable across reloads"
+    );
+}
+
+/// Router-mode half of the plan-route removal check. The router builds its own
+/// route table (`build_http_routes`), independent of engine mode's, so a
+/// removal applied to only one of the two would pass the engine-mode test and
+/// still ship live plan endpoints here.
+#[tokio::test]
+async fn plan_routes_are_gone_in_router_mode() {
+    let home = TempDir::new().unwrap();
+    seed_settings(&home, &[]);
+    let addr = start_router(&home).await;
+
+    let resp = Client::new()
+        .get(format!("http://{addr}/api/plan/packages"))
+        .send()
+        .await
+        .expect("GET /api/plan/packages");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "/api/plan/packages must not be routed in router mode"
     );
 }

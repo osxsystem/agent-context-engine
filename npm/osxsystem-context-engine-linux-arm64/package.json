@@ -1,7 +1,7 @@
 {
-  "name": "vibervn-context-engine-linux-arm64",
+  "name": "osxsystem-context-engine-linux-arm64",
   "version": "0.0.0",
-  "description": "vibervn-context-engine binary for Linux arm64",
+  "description": "osxsystem-context-engine binary for Linux arm64",
   "license": "SEE LICENSE IN LICENSE",
   "os": ["linux"],
   "cpu": ["arm64"],

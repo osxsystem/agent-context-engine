@@ -1,4 +1,4 @@
-# vibervn-context-engine
+# osxsystem-context-engine
 
 [English](README.md) · **Tiếng Việt**
 
@@ -12,7 +12,7 @@ sẽ tự động lấy đúng bản binary đã biên dịch sẵn cho nền t�
 cache cũ:
 
 ```bash
-npx vibervn-context-engine@latest
+npx osxsystem-context-engine@latest
 ```
 
 Lệnh này khởi động HTTP server ở cổng 6699 (Web UI tại
@@ -20,14 +20,14 @@ http://127.0.0.1:6699, MCP endpoint tại `/mcp`). Mọi cờ CLI đều đượ
 tiếp tới binary:
 
 ```bash
-npx vibervn-context-engine@latest --port 8080 --bind 0.0.0.0
+npx osxsystem-context-engine@latest --port 8080 --bind 0.0.0.0
 ```
 
-Hoặc cài đặt toàn cục để có lệnh `vibervn-context-engine` cố định:
+Hoặc cài đặt toàn cục để có lệnh `osxsystem-context-engine` cố định:
 
 ```bash
-npm install -g vibervn-context-engine@latest
-vibervn-context-engine --port 6699
+npm install -g osxsystem-context-engine@latest
+osxsystem-context-engine --port 6699
 ```
 
 Nền tảng được hỗ trợ: Linux x64/arm64, macOS arm64, Windows x64.

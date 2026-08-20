@@ -1,7 +1,7 @@
 {
-  "name": "vibervn-context-engine-darwin-arm64",
+  "name": "osxsystem-context-engine-darwin-arm64",
   "version": "0.0.0",
-  "description": "vibervn-context-engine binary for macOS arm64",
+  "description": "osxsystem-context-engine binary for macOS arm64",
   "license": "SEE LICENSE IN LICENSE",
   "os": ["darwin"],
   "cpu": ["arm64"],

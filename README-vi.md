@@ -1,6 +1,6 @@
 # vibervn-context-engine
 
-[English](README.md) · **Tiếng Việt** · [中文](README-zh.md)
+[English](README.md) · **Tiếng Việt**
 
 ![Web UI](screenshot-vi.png)
 

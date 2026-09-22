@@ -406,15 +406,18 @@ pub(crate) async fn run_query_with_filters_and_mode(
             (out, Some(pool))
         }
         _ => {
-            let out = reranker::rerank(
-                query,
-                &merged,
-                &numbered,
-                &legacy_stats,
-                min_prune_lines,
-                llm_client,
-            )
-            .await;
+            use reranker::Reranker as _;
+            let candidate_spans = reranker::RerankRequest::no_spans(merged.len());
+            let out = reranker::LlmReranker { client: llm_client }
+                .rerank(reranker::RerankRequest {
+                    query,
+                    chunks: &merged,
+                    numbered: &numbered,
+                    caller_stats: &legacy_stats,
+                    min_prune_lines,
+                    candidate_spans: &candidate_spans,
+                })
+                .await;
             (out, None)
         }
     };

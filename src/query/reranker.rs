@@ -45,14 +45,103 @@ pub struct ExtendedPool {
 /// chunk bounds — absorbs off-by-a-line selections.
 const RANGE_PAD: u32 = 2;
 
-pub async fn rerank(
-    query: &str,
-    chunks: &[MergeChunk],
-    numbered: &[Option<String>],
-    caller_stats: &[Option<(u32, u32)>],
-    min_prune_lines: u32,
-    llm_client: Option<&LlmClient>,
-) -> RerankOutput {
+/// A symbol span overlapping a candidate chunk: one *narrowing candidate*.
+///
+/// Carried so a reranker can narrow a chunk by **selecting** among real symbol
+/// boundaries instead of generating line numbers. Spans are resolved by the
+/// query engine and passed in — a reranker never reaches into the store for
+/// them, which is what keeps rerankers testable without a database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolSpan {
+    pub name: String,
+    pub kind: Option<String>,
+    pub line_start: u32,
+    pub line_end: u32,
+}
+
+/// One candidate set to order and, optionally, narrow.
+pub struct RerankRequest<'a> {
+    pub query: &'a str,
+    pub chunks: &'a [MergeChunk],
+    /// Disk-numbered text aligned 1:1 with `chunks` (`None` = unreadable).
+    pub numbered: &'a [Option<String>],
+    /// Per-chunk `(caller_count, caller_file_count)` aligned 1:1 with `chunks`;
+    /// `None` where the call graph was not consulted for that chunk.
+    pub caller_stats: &'a [Option<(u32, u32)>],
+    pub min_prune_lines: u32,
+    /// Narrowing candidates aligned 1:1 with `chunks`; the inner `Vec` is empty
+    /// where the engine resolved no spans. `LlmReranker` ignores this — it asks
+    /// the model for ranges instead.
+    pub candidate_spans: &'a [Vec<SymbolSpan>],
+}
+
+impl RerankRequest<'_> {
+    /// Narrowing candidates for a caller that has resolved none: one empty slot
+    /// per chunk.
+    ///
+    /// Every caller is in this position today. The spans `graph_expand` resolves
+    /// are keyed to *base* chunks, and merging reshapes those ranges (coalescing
+    /// adjacent ones, capping at 60 lines, truncating to `top_k`), so they do not
+    /// align with what a reranker sees. Honest population needs a fresh
+    /// post-merge lookup — an added DB round trip per query, which belongs with
+    /// the span-narrowing work rather than in a refactor that must change
+    /// nothing.
+    pub fn no_spans(chunk_count: usize) -> Vec<Vec<SymbolSpan>> {
+        vec![Vec::new(); chunk_count]
+    }
+}
+
+/// Orders a candidate set and optionally narrows each chunk to the lines worth
+/// showing.
+///
+/// Implementations **degrade rather than fail**: a reranker that cannot reach
+/// its model returns the input order with `skip_reason` set, so retrieval keeps
+/// working and the degradation stays visible.
+///
+/// Shaped like `AgenticBackend` below — static dispatch via RPITIT rather than
+/// `async_trait` + `dyn` — so both seams in this module are declared and
+/// consumed the same way. Runtime provider selection is a `match` over concrete
+/// implementations at the call site; it never needs a trait object.
+pub trait Reranker {
+    fn rerank(
+        &self,
+        req: RerankRequest<'_>,
+    ) -> impl std::future::Future<Output = RerankOutput> + Send;
+}
+
+/// Reranks by prompting a chat LLM for a JSON ordering plus line ranges.
+///
+/// `client` is `None` when no API key is configured; that is not an error, it
+/// degrades to the incoming similarity order.
+pub struct LlmReranker<'a> {
+    pub client: Option<&'a LlmClient>,
+}
+
+impl Reranker for LlmReranker<'_> {
+    /// Forwards to the free function that holds the body, the same way
+    /// `LiveBackend` forwards to the LLM client. Keeping the body out of line
+    /// is deliberate: it stays diff-identical to the pre-seam implementation, so
+    /// "this refactor changed no behaviour" is checkable by eye.
+    fn rerank(
+        &self,
+        req: RerankRequest<'_>,
+    ) -> impl std::future::Future<Output = RerankOutput> + Send {
+        rerank_with_llm(req, self.client)
+    }
+}
+
+async fn rerank_with_llm(req: RerankRequest<'_>, llm_client: Option<&LlmClient>) -> RerankOutput {
+    let RerankRequest {
+        query,
+        chunks,
+        numbered,
+        caller_stats,
+        min_prune_lines,
+        // Narrowing by span selection is a Jev-path concern; this reranker asks
+        // the model for ranges and has no use for them.
+        candidate_spans: _,
+    } = req;
+
     let n = chunks.len();
     let all_indices: Vec<usize> = (0..n).collect();
 

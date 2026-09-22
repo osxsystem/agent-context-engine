@@ -1111,16 +1111,21 @@ async fn run_file_retrieval_resolved(
 
     let caller_stats: Vec<Option<(u32, u32)>> = vec![None; merge_chunks.len()];
 
-    // Rerank via LLM (degrades gracefully to cosine order if no keys).
+    // Rerank (degrades gracefully to cosine order if no keys).
+    use crate::query::reranker::{LlmReranker, RerankRequest, Reranker};
     let llm_client = LlmClient::new(&settings.llm);
-    let rerank_output = crate::query::reranker::rerank(
-        information_request,
-        &merge_chunks,
-        &numbered,
-        &caller_stats,
-        settings.llm.rerank_min_prune_lines,
-        llm_client.as_ref(),
-    )
+    let candidate_spans = RerankRequest::no_spans(merge_chunks.len());
+    let rerank_output = LlmReranker {
+        client: llm_client.as_ref(),
+    }
+    .rerank(RerankRequest {
+        query: information_request,
+        chunks: &merge_chunks,
+        numbered: &numbered,
+        caller_stats: &caller_stats,
+        min_prune_lines: settings.llm.rerank_min_prune_lines,
+        candidate_spans: &candidate_spans,
+    })
     .await;
 
     // Cap to requested top_k after reranking.

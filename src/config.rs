@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 13;
+pub const CURRENT_VERSION: u32 = 14;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
@@ -29,6 +29,7 @@ pub const MIGRATIONS: &[MigrationFn] = &[
     migrate_v10_to_v11,
     migrate_v11_to_v12,
     migrate_v12_to_v13,
+    migrate_v13_to_v14,
 ];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
@@ -200,6 +201,21 @@ fn migrate_v12_to_v13(mut value: Value) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
+/// v13→v14: a rerank provider selector plus TypeSafe (Jev) keys and endpoint.
+/// `llm.rerank_provider` is left unset, which means "follow `llm.provider`", so
+/// every install — a custom OpenAI-compatible endpoint included — keeps
+/// reranking exactly as before. Stamping `jev_api_keys` and bumping the version
+/// makes an older binary refuse the file rather than drop the keys on save.
+fn migrate_v13_to_v14(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value
+        && let Some(Value::Object(llm)) = obj.get_mut("llm")
+    {
+        llm.entry("jev_api_keys".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+    }
+    Ok(value)
+}
+
 // ─── Settings ──────────────────────────────────────────────────────────────
 
 fn default_index_ignore_filenames() -> Vec<String> {
@@ -360,6 +376,30 @@ pub struct LlmConfig {
     /// untouched. Empty by default. See [`ChatCustomEndpoint`].
     #[serde(default)]
     pub chat_custom_endpoints: Vec<ChatCustomEndpoint>,
+    /// Which reranker ranks retrieval results: `"jev"` for TypeSafe's Jev, or
+    /// one of the LLM providers (`"google"`, `"openai"`, `"custom"`). `None`
+    /// follows [`Self::provider`]; read it through [`Self::rerank_provider`].
+    #[serde(default)]
+    pub rerank_provider: Option<String>,
+    /// TypeSafe API keys, held apart from [`Self::api_keys`] so a key is never
+    /// sent to the other vendor.
+    #[serde(default)]
+    pub jev_api_keys: Vec<String>,
+    /// Jev endpoint override (e.g. a local proxy). `None` / blank → TypeSafe's
+    /// public API.
+    #[serde(default)]
+    pub jev_base_url: Option<String>,
+}
+
+impl LlmConfig {
+    /// The effective rerank provider: the explicit selector, else `provider`.
+    pub fn rerank_provider(&self) -> &str {
+        self.rerank_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or(&self.provider)
+    }
 }
 
 /// One endpoint group offered to the repo-chat model picker, independent of the
@@ -414,6 +454,9 @@ impl Default for LlmConfig {
             openai_base_url: None,
             openai_force_tool_use: false,
             chat_custom_endpoints: Vec::new(),
+            rerank_provider: None,
+            jev_api_keys: Vec::new(),
+            jev_base_url: None,
         }
     }
 }
@@ -1947,6 +1990,86 @@ mod tests {
     /// v3→v4 migration injects both tools, then v12→v13 removes file-retrieval,
     /// leaving codebase-retrieval. This pins that no old version escapes the
     /// opt-in switch.
+    /// Writes a v13 settings file whose `llm` block is `llm_json` and loads it.
+    fn load_v13_with_llm(llm_json: &str) -> (TempDir, Settings) {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+        let v13 = format!(
+            r#"{{
+                "version": 13,
+                "repos": [],
+                "embedding": {{"provider":"voyage","model":"voyage-4-lite","api_keys":[]}},
+                "llm": {llm_json},
+                "enabled_mcp_tools": ["codebase-retrieval"]
+            }}"#
+        );
+        fs::write(&path, v13).expect("write v13 settings.json");
+        let loaded = ensure_dir_and_load(home.path()).expect("load v13");
+        (home, loaded)
+    }
+
+    /// v13→v14 against the configuration the owner actually runs: a custom
+    /// OpenAI-compatible endpoint. The rerank provider must stay `custom` (not
+    /// the packaged `google` default) and the endpoint must survive untouched.
+    #[test]
+    fn test_v13_to_v14_migration_carries_custom_provider_forward() {
+        let (home, loaded) = load_v13_with_llm(
+            r#"{"provider":"custom","rerank_model":"ag/gpt-oss-120b-medium",
+                "api_keys":["sk-local"],"openai_base_url":"http://127.0.0.1:20130/v1"}"#,
+        );
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert_eq!(loaded.llm.rerank_provider(), "custom");
+        assert_eq!(loaded.llm.provider, "custom");
+        assert_eq!(
+            loaded.llm.openai_base_url.as_deref(),
+            Some("http://127.0.0.1:20130/v1")
+        );
+        assert_eq!(loaded.llm.api_keys, vec!["sk-local".to_string()]);
+        assert!(loaded.llm.jev_api_keys.is_empty());
+        assert_eq!(loaded.llm.jev_base_url, None);
+
+        let raw = fs::read_to_string(config_path(home.path())).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(v["version"].as_u64(), Some(CURRENT_VERSION as u64));
+        assert_eq!(v["llm"]["jev_api_keys"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_v13_to_v14_migration_carries_packaged_default_forward() {
+        let (_home, loaded) = load_v13_with_llm(
+            r#"{"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]}"#,
+        );
+        assert_eq!(loaded.llm.rerank_provider(), "google");
+    }
+
+    /// The rerank provider follows `provider` until set explicitly, so the
+    /// settings page's existing Provider control keeps governing reranking.
+    #[test]
+    fn test_rerank_provider_follows_provider_until_set() {
+        let mut llm = LlmConfig {
+            provider: "openai".to_owned(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(llm.rerank_provider(), "openai");
+        llm.rerank_provider = Some("jev".to_owned());
+        assert_eq!(llm.rerank_provider(), "jev");
+        assert_eq!(llm.provider, "openai", "chat keeps its own provider");
+    }
+
+    #[test]
+    fn test_jev_settings_round_trip() {
+        let llm = LlmConfig {
+            rerank_provider: Some("jev".to_owned()),
+            jev_api_keys: vec!["ts-1".to_owned(), "ts-2".to_owned()],
+            jev_base_url: Some("http://127.0.0.1:9999".to_owned()),
+            ..LlmConfig::default()
+        };
+        let json = serde_json::to_string(&llm).expect("serialize");
+        let back: LlmConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, llm);
+    }
+
     #[test]
     fn test_all_prior_versions_migrate_and_drop_file_retrieval() {
         for from in 1..=12u32 {

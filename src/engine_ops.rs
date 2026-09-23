@@ -17,9 +17,9 @@ use tokio::sync::RwLock;
 use crate::config::{Settings, config_path, write_settings_atomic};
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
-use crate::llm::LlmClient;
 use crate::query::QueryResult;
 use crate::query::engine::{QueryGraphMode, run_query_with_filters_and_mode};
+use crate::query::reranker::RerankProvider;
 use crate::store::{self, RepoDbMap};
 
 /// Result of [`remove_index`]: whether the old generation's directory was fully
@@ -185,11 +185,11 @@ pub async fn run_query_op(
     )
     .context("failed to create embedding client")?;
 
-    // Build LLM client for reranking (None if no keys configured or rerank disabled).
-    let llm_client = if rerank {
-        LlmClient::new(&settings.llm)
+    // The configured reranker, or none when reranking is switched off.
+    let reranker = if rerank {
+        RerankProvider::from_settings(&settings.llm)
     } else {
-        None
+        RerankProvider::Llm(None)
     };
 
     let top_k = top_k.max(1);
@@ -205,7 +205,7 @@ pub async fn run_query_op(
         index_engine,
         repo_dbs,
         settings.llm.rerank_min_prune_lines,
-        llm_client.as_ref(),
+        &reranker,
         warm_budget,
         settings.llm.agentic_rag,
         settings.llm.agentic_rag_max_turns,

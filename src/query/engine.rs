@@ -11,7 +11,6 @@ use tracing::warn;
 use crate::embedding::identity::EmbeddingIdentity;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
-use crate::llm::LlmClient;
 use crate::path_in_repo;
 use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
@@ -64,6 +63,10 @@ pub struct RerankInfo {
     pub raw_response: String,
     pub fallback_used: bool,
     pub skip_reason: Option<String>,
+    /// The reranker's relevance probability per candidate, in the order the
+    /// candidates were handed to it (similarity order, before content
+    /// filtering). Empty when the reranker yields no probabilities.
+    pub relevance: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +115,7 @@ struct ChunkContentRow {
 /// embed → vector search → graph expand → merge → rerank → format.
 ///
 /// `repo_filter`: if Some, only return results from that repo path prefix.
-/// `llm_client`: if None, rerank step is skipped.
+/// `reranker`: `RerankProvider::Llm(None)` skips the rerank step.
 /// `warm_wait`: max time to block warming a cold single-repo shard before search.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
@@ -123,7 +126,7 @@ pub async fn run_query(
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
-    llm_client: Option<&LlmClient>,
+    reranker: &reranker::RerankProvider,
     warm_wait: std::time::Duration,
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
@@ -138,7 +141,7 @@ pub async fn run_query(
         index_engine,
         repo_dbs,
         min_prune_lines,
-        llm_client,
+        reranker,
         warm_wait,
         agentic_rag,
         agentic_rag_max_turns,
@@ -160,7 +163,7 @@ pub async fn run_query_with_filters(
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
-    llm_client: Option<&LlmClient>,
+    reranker: &reranker::RerankProvider,
     warm_wait: std::time::Duration,
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
@@ -176,7 +179,7 @@ pub async fn run_query_with_filters(
         index_engine,
         repo_dbs,
         min_prune_lines,
-        llm_client,
+        reranker,
         warm_wait,
         agentic_rag,
         agentic_rag_max_turns,
@@ -197,7 +200,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
-    llm_client: Option<&LlmClient>,
+    reranker: &reranker::RerankProvider,
     warm_wait: std::time::Duration,
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
@@ -376,7 +379,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     // the base candidates followed by any `query`-tool results, and the returned
     // indices address THAT pool. On the single-shot path it's None and indices
     // address the base `merged`/`numbered`.
-    let (rerank_output, extended_pool) = match (agentic_rag, llm_client, repo_filter) {
+    let (rerank_output, extended_pool) = match (agentic_rag, reranker.llm_client(), repo_filter) {
         (true, Some(client), Some(repo)) => {
             let (out, pool) = reranker::rerank_agentic(
                 &parsed,
@@ -400,7 +403,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
         }
         _ => {
             let out = rerank_single_shot(
-                &reranker::LlmReranker { client: llm_client },
+                reranker,
                 &parsed,
                 &merged,
                 &numbered,
@@ -533,6 +536,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
         raw_response: rerank_output.raw_response,
         fallback_used: rerank_output.fallback_used,
         skip_reason: rerank_output.skip_reason,
+        relevance: rerank_output.relevance,
     };
 
     Ok(QueryResult {
@@ -1183,6 +1187,7 @@ mod tests {
         {
             *self.0.lock().unwrap() = Some(req.query.to_owned());
             std::future::ready(crate::query::reranker::RerankOutput {
+                relevance: Vec::new(),
                 reranked_indices: vec![],
                 line_selections: vec![],
                 raw_request: String::new(),

@@ -24,9 +24,15 @@ pub fn iou(a: (u32, u32), b: (u32, u32)) -> f64 {
 /// forward slashes, so a Windows-indexed path still matches) and at least one
 /// line of overlap with the expected range.
 pub fn is_hit(exp_file_norm: &str, exp: (u32, u32), r: &QueryResultRow) -> bool {
+    is_expected_file(exp_file_norm, r) && overlaps(exp, r)
+}
+
+fn is_expected_file(exp_file_norm: &str, r: &QueryResultRow) -> bool {
     r.file.replace('\\', "/").to_lowercase() == exp_file_norm
-        && r.line_start <= exp.1
-        && r.line_end >= exp.0
+}
+
+fn overlaps(exp: (u32, u32), r: &QueryResultRow) -> bool {
+    r.line_start <= exp.1 && r.line_end >= exp.0
 }
 
 /// Recall and IoU for one ranking, scored against the eval ground truth.
@@ -85,14 +91,14 @@ impl RecallTally {
         let mut best_iou = 0.0f64;
         let mut hit_rank: Option<usize> = None;
         for (rank, r) in ranking.iter().enumerate() {
-            if r.file.replace('\\', "/").to_lowercase() != exp_file_norm {
+            if !is_expected_file(exp_file_norm, r) {
                 continue;
             }
             let i = iou((exp_start, exp_end), (r.line_start, r.line_end));
             if i > best_iou {
                 best_iou = i;
             }
-            if hit_rank.is_none() && is_hit(exp_file_norm, exp, r) {
+            if hit_rank.is_none() && overlaps(exp, r) {
                 hit_rank = Some(rank);
             }
         }

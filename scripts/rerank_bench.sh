@@ -119,7 +119,9 @@ jq --slurpfile real "${REAL_CE}/settings.json" \
    --arg note "${NOTE:-}" --arg cmd "$REPRODUCE" \
    --arg sha "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" '
   # The effective rerank provider: llm.rerank_provider, else llm.provider.
-  ($real[0].llm.rerank_provider // "" | if test("^\\s*$") then $real[0].llm.provider else . end) as $p
+  # Trimmed, as LlmConfig::rerank_provider does.
+  ($real[0].llm.rerank_provider // "" | gsub("^\\s+|\\s+$"; "")
+    | if . == "" then $real[0].llm.provider else . end) as $p
   | .reproduce_cmd = $cmd
   | .provenance = {
       configured_reranker: {

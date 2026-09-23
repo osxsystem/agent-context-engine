@@ -89,7 +89,7 @@ impl From<LlmConfigView> for RerankerDescriptor {
         let provider = Some(config.rerank_provider().to_owned()).filter(|p| !p.is_empty());
         // Jev ignores `llm.rerank_model`, which belongs to the LLM path.
         let model = match provider.as_deref() {
-            Some("jev") => Some(jev::MODEL.to_owned()),
+            Some(jev::PROVIDER) => Some(jev::MODEL.to_owned()),
             _ => l.rerank_model,
         };
         Self {
@@ -248,7 +248,7 @@ struct LlmConfigView {
 /// run is allowed. An unreadable config (`None`) is allowed — an older server
 /// must stay benchmarkable.
 fn config_refusal(d: &RerankerDescriptor) -> Option<String> {
-    (d.agentic_rag == Some(true) && d.provider.as_deref() != Some("jev")).then(|| {
+    (d.agentic_rag == Some(true) && d.provider.as_deref() != Some(jev::PROVIDER)).then(|| {
         "the server has agentic_rag ENABLED: reranking runs through a tool-calling loop, not \
          the single-shot reranker, so the numbers would not compare rerankers. Set \
          agentic_rag=false and re-run."
@@ -478,6 +478,23 @@ async fn fetch_descriptor(client: &reqwest::Client, server: &str) -> RerankerDes
     cfg.llm.map(RerankerDescriptor::from).unwrap_or_default()
 }
 
+/// How many of `a` have no counterpart in `b`, counting repeats.
+fn count_not_in<T: Ord>(a: &[T], b: &[T]) -> usize {
+    let mut left: BTreeMap<&T, usize> = BTreeMap::new();
+    for x in b {
+        *left.entry(x).or_default() += 1;
+    }
+    a.iter()
+        .filter(|x| match left.get_mut(x) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .count()
+}
+
 /// Why two runs did not score the same questions, if they did not. Recall
 /// deltas between different case sets measure the cases, not the rerankers.
 fn case_set_warning(prior: &RerankAbReport, current: &RerankAbReport) -> Option<String> {
@@ -487,18 +504,19 @@ fn case_set_warning(prior: &RerankAbReport, current: &RerankAbReport) -> Option<
                 .to_owned(),
         );
     }
-    let differing = prior
-        .cases
-        .iter()
-        .map(CaseRecord::identity)
-        .zip(current.cases.iter().map(CaseRecord::identity))
-        .filter(|(a, b)| a != b)
-        .count()
-        + prior.cases.len().abs_diff(current.cases.len());
-    (differing > 0).then(|| {
+    // Match by content, not position: a case lost to a request error in one run
+    // would otherwise shift every later case and count the whole tail.
+    let prior_ids: Vec<_> = prior.cases.iter().map(CaseRecord::identity).collect();
+    let current_ids: Vec<_> = current.cases.iter().map(CaseRecord::identity).collect();
+    let missing = count_not_in(&prior_ids, &current_ids);
+    let added = count_not_in(&current_ids, &prior_ids);
+    let cases = |n: usize| if n == 1 { "case" } else { "cases" };
+    (missing + added > 0).then(|| {
         format!(
-            "the case sets differ: {differing} of {} cases are not the same question",
-            prior.cases.len().max(current.cases.len())
+            "the case sets differ: {missing} prior {} missing from this run, {added} {} not in \
+             the prior",
+            cases(missing),
+            cases(added)
         )
     })
 }
@@ -763,7 +781,19 @@ mod tests {
         let a = report_with(vec![record("q1"), record("q2")]);
         let b = report_with(vec![record("q1"), record("q3")]);
         let w = case_set_warning(&a, &b).expect("a warning");
-        assert!(w.contains("1 of 2"), "{w}");
+        assert!(w.contains("1 prior case missing"), "{w}");
+        assert!(w.contains("1 case not in the prior"), "{w}");
+    }
+
+    /// A case lost to a request error in one run shifts every later case, so a
+    /// positional comparison would report the whole tail as different.
+    #[test]
+    fn a_case_dropped_by_one_run_counts_once() {
+        let prior = report_with(vec![record("q1"), record("q2"), record("q3"), record("q4")]);
+        let current = report_with(vec![record("q1"), record("q3"), record("q4")]);
+        let w = case_set_warning(&prior, &current).expect("a warning");
+        assert!(w.contains("1 prior case missing"), "{w}");
+        assert!(w.contains("0 cases not in the prior"), "{w}");
     }
 
     #[test]

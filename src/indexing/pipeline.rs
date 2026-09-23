@@ -315,7 +315,12 @@ pub struct IncrementalRunStats {
 }
 
 /// Key used to track whether Phase 2 (raw edge resolution) has completed.
-const EDGES_RESOLVED_KEY: &str = "edges_resolved";
+/// Set once the whole calls graph is resolved; absent means it cannot be
+/// trusted and the next run rebuilds. Versioned: indexes built before the
+/// incremental path kept this marker had their calls graph truncated by a
+/// Phase 2 replay from partial `raw_edge` rows, and lacking the `_v2` key sends
+/// each of them through one full rebuild.
+const EDGES_RESOLVED_KEY: &str = "edges_resolved_v2";
 
 /// A row fetched from `raw_edge` during Phase 2 edge resolution.
 /// Shared by both full-build and incremental Phase 2 paths.
@@ -760,68 +765,41 @@ impl IndexPipeline {
         // A missing edges_resolved marker means the calls graph cannot be trusted
         // anywhere, so recover repo-wide before any incremental work: an
         // incremental run re-resolves only its changed files' blast radius and
-        // would leave the rest unresolved.
-        let resolved = get_meta(db, EDGES_RESOLVED_KEY).await?.is_some();
-        if !resolved {
-            // Check how many raw_edges are in the DB.
-            // If raw_edge is empty but file_meta is present, this is the crash
-            // scenario for the RAM-path full rebuild: Stage 3 completed with raw_edges
-            // buffered in RAM (never written to DB), but the process died before
-            // Phase 2 completed.  We cannot replay Phase 2 from DB (no raw_edges
-            // there), so we must force a full rebuild.
-            use serde::Deserialize;
-            #[derive(Deserialize)]
-            struct CountRow {
-                count: i64,
-            }
-            let raw_edge_count: Vec<CountRow> = db
-                .query("SELECT count() AS count FROM raw_edge GROUP ALL")
-                .await
-                .context("crash-recovery: count raw_edge")?
-                .take(0)?;
-            let raw_edge_total = raw_edge_count.first().map(|r| r.count).unwrap_or(0);
-
-            if raw_edge_total == 0 && !stored_meta.is_empty() {
-                if self.voyage.is_none() && !self.allow_no_client_mutation {
-                    anyhow::bail!(
-                        "embedding client required for RAM-path full rebuild of {}",
-                        self.repo
-                    );
-                }
-                // RAM-path crash: Stage 3 completed, Phase 2 never ran, no DB raw_edges.
-                // Force a full rebuild to regenerate calls edges.
-                warn!(
-                    repo = %self.repo,
-                    "RAM-path crash detected (edges_resolved absent, raw_edge empty, file_meta present) \
-                     — forcing full rebuild to recover calls edges"
+        // would leave the rest unresolved. Recovery is always a full rebuild.
+        // Replaying Phase 2 from `raw_edge` is not safe: incremental runs leave
+        // rows there for their changed files only, and a replay deletes every
+        // calls edge before rebuilding from whatever rows it finds. The embedding
+        // cache keeps the rebuild mostly to parsing and resolution.
+        if get_meta(db, EDGES_RESOLVED_KEY).await?.is_none() {
+            if self.voyage.is_none() && !self.allow_no_client_mutation {
+                anyhow::bail!(
+                    "embedding client required to rebuild {} after unresolved edges",
+                    self.repo
                 );
-                let stage_stats = self
-                    .full_rebuild(
-                        db,
-                        vector_index,
-                        None,
-                        event_bus,
-                        key_hints,
-                        cancel_token.as_ref(),
-                        run_identity_key.as_deref(),
-                    )
-                    .await?;
-                let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
-                let total_files = stored_meta.len() as u64;
-                return Ok(IndexPipelineStats {
-                    indexed_files: indexed,
-                    total_files,
-                    phase2_ms: stage_stats.phase2_ms,
-                    ..Default::default()
-                });
-            } else {
-                // Normal Phase 2 replay: raw_edges are in DB (overflow path or incremental).
-                info!(repo = %self.repo, raw_edge_total, "edges_resolved marker absent — replaying Phase 2 from DB");
-                self.resolve_edges_phase2(db, progress.as_ref(), cancel_token.as_ref())
-                    .await
-                    .context("edges Phase 2 replay before incremental run")?;
-                // (replay path discards Phase2Stats — no aggregate stats returned here)
             }
+            warn!(
+                repo = %self.repo,
+                "edges_resolved marker absent — forcing full rebuild to recover calls edges"
+            );
+            let stage_stats = self
+                .full_rebuild(
+                    db,
+                    vector_index,
+                    None,
+                    event_bus,
+                    key_hints,
+                    cancel_token.as_ref(),
+                    run_identity_key.as_deref(),
+                )
+                .await?;
+            let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
+            let total_files = stored_meta.len() as u64;
+            return Ok(IndexPipelineStats {
+                indexed_files: indexed,
+                total_files,
+                phase2_ms: stage_stats.phase2_ms,
+                ..Default::default()
+            });
         }
 
         if file_changes.is_empty() {
@@ -5337,7 +5315,7 @@ mod incremental_phase2_tests {
     }
 
     /// Count calls rows where in_file = $file.
-    async fn count_calls_from(db: &Surreal<Db>, in_file: &str) -> usize {
+    pub(super) async fn count_calls_from(db: &Surreal<Db>, in_file: &str) -> usize {
         #[derive(Deserialize)]
         struct Row {
             count: i64,
@@ -8377,6 +8355,7 @@ mod null_byte_skip_tests {
 
 #[cfg(test)]
 mod raw_edge_batching_tests {
+    use super::incremental_phase2_tests::count_calls_from;
     use super::*;
     use crate::store::open_db;
     use crate::store::ops::get_all_file_meta;
@@ -8500,7 +8479,8 @@ mod raw_edge_batching_tests {
             .expect("simulate crash: delete alpha file_meta");
 
         // Also remove the edges_resolved marker to simulate a partial state.
-        db.query("DELETE FROM index_meta WHERE key = 'edges_resolved'")
+        db.query("DELETE FROM index_meta WHERE key = $k")
+            .bind(("k", EDGES_RESOLVED_KEY))
             .await
             .expect("delete edges_resolved");
 
@@ -8535,21 +8515,6 @@ mod raw_edge_batching_tests {
             marker.is_some(),
             "edges_resolved must be set after recovery"
         );
-    }
-
-    async fn calls_from(db: &Surreal<Db>, in_file: &str) -> i64 {
-        #[derive(serde::Deserialize)]
-        struct CountRow {
-            count: i64,
-        }
-        let rows: Vec<CountRow> = db
-            .query("SELECT count() AS count FROM calls WHERE in_file = $f GROUP ALL")
-            .bind(("f", in_file.to_owned()))
-            .await
-            .unwrap()
-            .take(0)
-            .unwrap();
-        rows.first().map_or(0, |r| r.count)
     }
 
     /// An incremental run clears `edges_resolved` while it rewrites the changed
@@ -8593,7 +8558,7 @@ mod raw_edge_batching_tests {
     /// that state must still trigger repo-wide recovery rather than stamping the
     /// marker over edges nobody resolved.
     #[tokio::test]
-    async fn a_missing_marker_with_changes_recovers_every_calls_edge() {
+    async fn a_missing_marker_with_a_distant_change_recovers_beta_calls() {
         let home = TempDir::new().unwrap();
         let repo_dir = TempDir::new().unwrap();
         let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
@@ -8610,10 +8575,14 @@ mod raw_edge_batching_tests {
             .run(&db, None, true, None, None, None, &[], None)
             .await
             .expect("full rebuild");
-        assert!(calls_from(&db, &beta_path).await > 0, "beta calls alpha");
+        assert!(
+            count_calls_from(&db, &beta_path).await > 0,
+            "beta calls alpha"
+        );
 
         // A rebuild that died before resolving edges: no calls, no marker.
-        db.query("DELETE FROM calls; DELETE FROM index_meta WHERE key = 'edges_resolved'")
+        db.query("DELETE FROM calls; DELETE FROM index_meta WHERE key = $k")
+            .bind(("k", EDGES_RESOLVED_KEY))
             .await
             .expect("simulate unresolved edges");
         // A change far from beta's call.
@@ -8625,7 +8594,7 @@ mod raw_edge_batching_tests {
             .expect("recovery run");
 
         assert!(
-            calls_from(&db, &beta_path).await > 0,
+            count_calls_from(&db, &beta_path).await > 0,
             "beta's call to alpha must be resolved again"
         );
         let marker = crate::store::ops::get_meta(&db, EDGES_RESOLVED_KEY)
@@ -8634,6 +8603,72 @@ mod raw_edge_batching_tests {
         assert!(
             marker.is_some(),
             "edges_resolved must be set after recovery"
+        );
+    }
+
+    /// Builds alpha, beta and gamma (beta and gamma call alpha), then changes
+    /// gamma incrementally, which leaves `raw_edge` rows for gamma only.
+    async fn index_with_partial_raw_edges() -> (TempDir, TempDir, Surreal<Db>, IndexPipeline, String)
+    {
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
+        std::fs::write(repo_dir.path().join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(repo_dir.path().join("beta.rs"), "fn beta() { alpha(); }\n").unwrap();
+        let file_g = repo_dir.path().join("gamma.rs");
+        std::fs::write(&file_g, "fn gamma() { alpha(); }\n").unwrap();
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
+        let pipeline = IndexPipeline::new(repo.clone(), None).allow_no_client_mutation_for_test();
+        pipeline
+            .run(&db, None, true, None, None, None, &[], None)
+            .await
+            .expect("full rebuild");
+        std::fs::write(&file_g, "fn gamma() { alpha(); let _changed = 1; }\n").unwrap();
+        pipeline
+            .run(&db, None, false, None, None, None, &[], None)
+            .await
+            .expect("incremental run");
+        let beta = format!("{repo}/beta.rs");
+        assert!(count_calls_from(&db, &beta).await > 0, "beta calls alpha");
+        (home, repo_dir, db, pipeline, beta)
+    }
+
+    /// A no-change run after an incremental one must leave the calls graph alone.
+    #[tokio::test]
+    async fn a_no_change_run_after_an_incremental_run_keeps_every_calls_edge() {
+        let (_home, _repo_dir, db, pipeline, beta) = index_with_partial_raw_edges().await;
+        pipeline
+            .run(&db, None, false, None, None, None, &[], None)
+            .await
+            .expect("no-change run");
+        assert!(
+            count_calls_from(&db, &beta).await > 0,
+            "beta's call to alpha must survive"
+        );
+    }
+
+    /// The state master leaves behind: marker cleared by an incremental run,
+    /// `raw_edge` holding only the changed files' rows. Replaying Phase 2 from
+    /// that table would rebuild the graph from those rows alone.
+    #[tokio::test]
+    async fn a_missing_marker_over_partial_raw_edges_keeps_every_calls_edge() {
+        let (_home, repo_dir, db, pipeline, beta) = index_with_partial_raw_edges().await;
+        db.query("DELETE FROM index_meta WHERE key = $k")
+            .bind(("k", EDGES_RESOLVED_KEY))
+            .await
+            .expect("clear marker");
+        std::fs::write(
+            repo_dir.path().join("alpha.rs"),
+            "fn alpha() { let _c = 2; }\n",
+        )
+        .unwrap();
+        pipeline
+            .run(&db, None, false, None, None, None, &[], None)
+            .await
+            .expect("recovery run");
+        assert!(
+            count_calls_from(&db, &beta).await > 0,
+            "beta's call to alpha must survive"
         );
     }
 

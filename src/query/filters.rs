@@ -39,6 +39,31 @@ impl QueryFilters {
     }
 }
 
+/// A query split into the text the ranking stages judge and the filters that
+/// narrow their candidates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedQuery {
+    /// Filter prefixes stripped. Both the embedder and the reranker consume
+    /// this, so neither is asked to judge filter syntax. Falls back to the raw
+    /// query when stripping leaves nothing.
+    pub text: String,
+    pub filters: QueryFilters,
+}
+
+/// Parse `query` and merge in `external` filters (structured tool params).
+pub fn parse_query(query: &str, external: Option<QueryFilters>) -> ParsedQuery {
+    let (clean, mut filters) = parse_query_filters(query);
+    if let Some(ext) = external {
+        filters.merge(ext);
+    }
+    let text = if clean.is_empty() {
+        query.to_owned()
+    } else {
+        clean
+    };
+    ParsedQuery { text, filters }
+}
+
 /// Parse a query string, extracting recognized filter prefixes.
 ///
 /// Returns `(clean_query, filters)` where `clean_query` has filter tokens removed
@@ -218,6 +243,35 @@ fn byte_offset(s: &str, char_idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- parse_query ---
+
+    #[test]
+    fn ranking_text_has_filter_prefixes_stripped() {
+        let parsed = parse_query("kind:function lang:rust how are sessions restored", None);
+        assert_eq!(parsed.text, "how are sessions restored");
+        assert_eq!(parsed.filters.kinds, vec!["function"]);
+        assert_eq!(parsed.filters.languages, vec!["rust"]);
+    }
+
+    #[test]
+    fn ranking_text_falls_back_to_raw_when_query_is_only_filters() {
+        let parsed = parse_query("name:parse_file", None);
+        assert_eq!(parsed.text, "name:parse_file");
+        assert_eq!(parsed.filters.name_filters, vec!["parse_file"]);
+    }
+
+    #[test]
+    fn external_filters_merge_without_touching_ranking_text() {
+        let external = QueryFilters {
+            path_filters: vec!["src/".to_owned()],
+            ..Default::default()
+        };
+        let parsed = parse_query("lang:rust session restore", Some(external));
+        assert_eq!(parsed.text, "session restore");
+        assert_eq!(parsed.filters.languages, vec!["rust"]);
+        assert_eq!(parsed.filters.path_filters, vec!["src/"]);
+    }
 
     // --- parse_query_filters ---
 

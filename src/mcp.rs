@@ -757,7 +757,8 @@ async fn run_codebase_retrieval_resolved(
 
 /// Build an augmented query string that prepends structured filter params as inline
 /// filter prefixes (e.g. `kind:function lang:rust path:src/ <original query>`).
-/// The `run_query` filter parser will strip these back out before embedding.
+/// The `run_query` filter parser strips these back out before embedding and
+/// reranking; values containing whitespace are quoted so they strip whole.
 fn build_augmented_query(
     information_request: &str,
     filter_kind: Option<&[String]>,
@@ -767,23 +768,34 @@ fn build_augmented_query(
     let mut prefixes = Vec::new();
     if let Some(kinds) = filter_kind {
         for k in kinds {
-            prefixes.push(format!("kind:{}", k));
+            prefixes.push(filter_token("kind", k));
         }
     }
     if let Some(langs) = filter_lang {
         for l in langs {
-            prefixes.push(format!("lang:{}", l));
+            prefixes.push(filter_token("lang", l));
         }
     }
     if let Some(path) = filter_path
         && !path.is_empty()
     {
-        prefixes.push(format!("path:{}", path));
+        prefixes.push(filter_token("path", path));
     }
     if prefixes.is_empty() {
         information_request.to_string()
     } else {
         format!("{} {}", prefixes.join(" "), information_request)
+    }
+}
+
+/// One `prefix:value` token for the query filter parser. Values containing
+/// whitespace are quoted, else the parser would end the value at the first
+/// space and leave the rest in the text the embedder and reranker judge.
+fn filter_token(prefix: &str, value: &str) -> String {
+    if value.contains(char::is_whitespace) {
+        format!("{prefix}:\"{value}\"")
+    } else {
+        format!("{prefix}:{value}")
     }
 }
 

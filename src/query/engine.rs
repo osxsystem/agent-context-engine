@@ -209,20 +209,16 @@ pub(crate) async fn run_query_with_filters_and_mode(
     let total_start = Instant::now();
 
     // ── Step 0: Parse query filters ──────────────────────────────────────────
-    let (clean_query, mut filters) = crate::query::filters::parse_query_filters(query);
-    if let Some(ext) = external_filters {
-        filters.merge(ext);
-    }
-    // Use clean query for embedding (filters stripped), or original if clean is empty
-    let embed_query = if clean_query.is_empty() {
-        query
-    } else {
-        &clean_query
-    };
+    // `query_text` has the filter prefixes stripped; the embedder and the
+    // reranker both judge it, never the raw string.
+    let crate::query::filters::ParsedQuery {
+        text: query_text,
+        filters,
+    } = crate::query::filters::parse_query(query, external_filters);
 
     // ── Step 1: Embed query ───────────────────────────────────────────────
     let embed_start = Instant::now();
-    let embedding = voyage_client.embed_query(embed_query).await?;
+    let embedding = voyage_client.embed_query(&query_text).await?;
     let embed_ms = embed_start.elapsed().as_millis() as u64;
 
     if embedding.is_empty() {
@@ -386,7 +382,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     let (rerank_output, extended_pool) = match (agentic_rag, llm_client, repo_filter) {
         (true, Some(client), Some(repo)) => {
             let (out, pool) = reranker::rerank_agentic(
-                query,
+                &query_text,
                 &merged,
                 &numbered,
                 &legacy_stats,
@@ -410,7 +406,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             let candidate_spans = reranker::RerankRequest::no_spans(merged.len());
             let out = reranker::LlmReranker { client: llm_client }
                 .rerank(reranker::RerankRequest {
-                    query,
+                    query: &query_text,
                     chunks: &merged,
                     numbered: &numbered,
                     caller_stats: &legacy_stats,

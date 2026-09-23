@@ -24,6 +24,8 @@ use crate::config::LlmConfig;
 use crate::llm::keys::{KeyRing, RateLimited};
 use crate::query::reranker::{RerankOutput, RerankRequest, Reranker, SymbolSpan};
 
+/// The `llm.rerank_provider` value that selects Jev.
+pub const PROVIDER: &str = "jev";
 /// TypeSafe's public API; overridden by `llm.jev_base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 /// The vendor's stable alias. `llm.rerank_model` is not consulted: the LLM path

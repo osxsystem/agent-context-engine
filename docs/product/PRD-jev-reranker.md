@@ -82,16 +82,29 @@ comparing Jev against the currently-configured reranker.
 
 | # | Result | Target | Baseline |
 | - | ------ | ------ | -------- |
-| KR1 | `recall_at_1` | **No regression** vs current reranker | ⚠ Unmeasured — no rerank benchmark exists. KR5 establishes it. |
-| KR2 | `recall_at_5` or `recall_at_10` | **Measurable improvement** (at least one moves up) | ⚠ Unmeasured, per KR1. |
-| KR3 | `rerank_ms`, p50 | **≤ current p50** | ⚠ Unmeasured. Emitted today by `bench_query/main.rs:418` but never recorded. |
-| KR4 | Cost per reranked query | **≤ $0.001** | $0 marginal visibility today (bundled into Gemini spend). Computed from Jev's `usage.input_tokens`. |
-| KR5 | Benchmark covering the reranked retrieval path | **Exists, one command, A/B two rerankers** | **Does not exist.** |
-| KR6 | `cargo test` | **green** | green (must not regress) |
+| KR1 | `recall_at_1` | **No regression** vs current reranker | ❌ **Regressed.** Jev 0.48 vs LLM 0.78 (−0.30). Jev is also below plain search order (0.78 → 0.48). |
+| KR2 | `recall_at_5` or `recall_at_10` | **Measurable improvement** (at least one moves up) | ❌ **Neither improved.** @5: 0.86 vs 0.92 (−0.06). @10: 0.92 vs 0.94 (−0.02). |
+| KR3 | `rerank_ms`, p50 | **≤ current p50** | ✅ Jev 857 ms vs LLM 11,677 ms (p95 1,126 vs 45,892 ms). |
+| KR4 | Cost per reranked query | **≤ $0.001** | ⚠ Not measured: neither the engine nor the benchmark captures Jev's `usage.input_tokens`. Moot while the gate fails. |
+| KR5 | Benchmark covering the reranked retrieval path | **Exists, one command, A/B two rerankers** | ✅ `scripts/rerank_bench.sh`, with `RERANK_PROVIDER=jev` for the Jev arm; artifacts record their case list so `--compare` confirms identical cases. |
+| KR6 | `cargo test` | **green** | ✅ Green apart from the inherited `file_meta_absence_triggers_reprocessing` failure (#3). |
 
 KR1 and KR2 together are the gate: Jev becomes the default only if recall@1
 holds and recall@5 or recall@10 improves. KR3 is a hard gate — a quality win
 that makes every query slower is not accepted silently.
+
+**Measured 2026-09-23** on this repo at `2acf1f0`: the same 50 doc-comment
+cases, top-k 10, agentic RAG off. Artifacts: `bench-results/rerank/jev-ab.json`
+and `bench-results/rerank/gpt-oss-ab.json`. The LLM arm ran on
+`ag/gpt-oss-120b-medium` standing in for the configured `ag/gemini-3.8-flash`,
+whose quota was exhausted until 2026-09-30. One of Jev's 50 queries fell back
+to search order after an HTTP 403.
+
+**Decision: Jev stays opt-in; the default does not change.** The gate fails on
+KR1 and KR2. Jev's highest probability lands on the expected chunk in 26 of 50
+cases, against 39 for search order, so the loss is in ranking, not in span
+narrowing (Jev's mean IoU is 0.86 against the LLM's 0.60). Jev is roughly 14× faster
+at p50, which is worth revisiting if a later Jev model ranks better.
 
 **Deadline:** none committed. This is owner-paced work with no external date.
 

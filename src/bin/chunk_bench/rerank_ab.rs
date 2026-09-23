@@ -16,8 +16,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::eval::derive_eval_set;
-use crate::scoring::{RankingScore, RecallTally, ScoreDeltas};
+use context_engine_rs::config::LlmConfig;
+use context_engine_rs::query::jev;
+
+use crate::eval::{EvalCase, derive_eval_set};
+use crate::scoring::{RankingScore, RecallTally, ScoreDeltas, is_hit};
 use crate::{QueryResultRow, warm_up};
 
 /// Nearest-rank percentiles over the per-query rerank-stage latencies.
@@ -58,16 +61,98 @@ impl LatencySummary {
 /// interpretable months later.
 ///
 /// Read best-effort from `/api/config`. That endpoint returns the whole settings
-/// object including API keys; only these three fields are declared here, with no
-/// flatten and no catch-all, so serde drops the rest and no key reaches disk.
+/// object including API keys; only the fields of `LlmConfigView` are declared,
+/// with no flatten and no catch-all, so serde drops the rest and no key reaches
+/// disk.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 pub struct RerankerDescriptor {
+    /// The effective rerank provider (`llm.rerank_provider()`), e.g. `"jev"`,
+    /// which is not necessarily the LLM provider.
     pub provider: Option<String>,
+    /// The model that provider ranks with.
     pub model: Option<String>,
     /// Agentic RAG routes reranking through a tool-calling loop instead of the
     /// single-shot reranker. A decision model cannot call tools, so an A/B taken
     /// with this `true` is not comparing alternatives.
     pub agentic_rag: Option<bool>,
+}
+
+impl From<LlmConfigView> for RerankerDescriptor {
+    fn from(l: LlmConfigView) -> Self {
+        // `LlmConfig::rerank_provider` owns the "unset or blank follows the LLM
+        // provider" rule; building a config is how to reuse it.
+        let config = LlmConfig {
+            provider: l.provider.unwrap_or_default(),
+            rerank_provider: l.rerank_provider,
+            ..LlmConfig::default()
+        };
+        let provider = Some(config.rerank_provider().to_owned()).filter(|p| !p.is_empty());
+        // Jev ignores `llm.rerank_model`, which belongs to the LLM path.
+        let model = match provider.as_deref() {
+            Some(jev::PROVIDER) => Some(jev::MODEL.to_owned()),
+            _ => l.rerank_model,
+        };
+        Self {
+            provider,
+            model,
+            agentic_rag: l.agentic_rag,
+        }
+    }
+}
+
+/// One scored case: what was asked, and every candidate the reranker was handed.
+///
+/// Two purposes. Runs meant to be compared can prove they asked the same
+/// questions (`case_set_warning`), and a reranker's per-candidate probabilities
+/// are kept next to whether that candidate was the answer, for tuning a
+/// relevance threshold later without re-running.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct CaseRecord {
+    pub query: String,
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    /// In the order the reranker received them.
+    pub candidates: Vec<CandidateRecord>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct CandidateRecord {
+    pub file: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    /// Absent when the reranker gives no probabilities (the LLM path).
+    pub relevance: Option<f64>,
+    /// Whether this candidate is the expected answer, by the scoring hit rule.
+    pub expected: bool,
+}
+
+impl CaseRecord {
+    fn new(case: &EvalCase, pre_rerank: &[QueryResultRow]) -> Self {
+        let exp_file_norm = case.file.to_lowercase();
+        let exp = (case.line_start, case.line_end);
+        Self {
+            query: case.query.clone(),
+            file: case.file.clone(),
+            line_start: case.line_start,
+            line_end: case.line_end,
+            candidates: pre_rerank
+                .iter()
+                .map(|r| CandidateRecord {
+                    file: r.file.clone(),
+                    line_start: r.line_start,
+                    line_end: r.line_end,
+                    relevance: r.relevance,
+                    expected: is_hit(&exp_file_norm, exp, r),
+                })
+                .collect(),
+        }
+    }
+
+    /// What makes two cases the same question.
+    fn identity(&self) -> (&str, &str, u32, u32) {
+        (&self.query, &self.file, self.line_start, self.line_end)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -98,6 +183,9 @@ pub struct RerankAbReport {
     /// scored (a miss is a miss), but excluded from `rerank_ms` like skips.
     #[serde(default)]
     pub rerank_not_run: u64,
+    /// The scored cases, in order. Empty in artifacts older than this field.
+    #[serde(default)]
+    pub cases: Vec<CaseRecord>,
     pub reproduce_cmd: String,
 }
 
@@ -141,6 +229,8 @@ struct LlmConfigView {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    rerank_provider: Option<String>,
+    #[serde(default)]
     rerank_model: Option<String>,
     #[serde(default)]
     agentic_rag: Option<bool>,
@@ -150,13 +240,15 @@ struct LlmConfigView {
 
 /// Why this server configuration cannot produce a meaningful A/B, if it can't.
 ///
-/// Agentic RAG routes reranking through a tool-calling loop, and a decision
-/// model cannot call tools, so a run taken with it on compares nothing. This was
-/// once a warning; a warning did not stop an artifact being written from exactly
-/// that run, so it is a refusal now. An unreadable config (`None`) is allowed —
-/// an older server must stay benchmarkable.
+/// Agentic RAG routes an LLM reranker through a tool-calling loop, and a
+/// decision model cannot call tools, so a run taken with it on compares nothing.
+/// This was once a warning; a warning did not stop an artifact being written
+/// from exactly that run, so it is a refusal now. Jev has no tool-calling loop:
+/// the engine ranks single-shot with it whatever `agentic_rag` says, so a Jev
+/// run is allowed. An unreadable config (`None`) is allowed — an older server
+/// must stay benchmarkable.
 fn config_refusal(d: &RerankerDescriptor) -> Option<String> {
-    (d.agentic_rag == Some(true)).then(|| {
+    (d.agentic_rag == Some(true) && d.provider.as_deref() != Some(jev::PROVIDER)).then(|| {
         "the server has agentic_rag ENABLED: reranking runs through a tool-calling loop, not \
          the single-shot reranker, so the numbers would not compare rerankers. Set \
          agentic_rag=false and re-run."
@@ -242,6 +334,7 @@ pub fn run(
     let mut rerank_skipped = 0u64;
     let mut rerank_not_run = 0u64;
     let mut skip_reasons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut case_records: Vec<CaseRecord> = Vec::new();
 
     let descriptor = rt.block_on(fetch_descriptor(&client, server));
     // Recall@10 is scored against the returned top-k; asked for fewer than ten,
@@ -311,6 +404,7 @@ pub fn run(
             let exp = (case.line_start, case.line_end);
             pre.observe(&exp_file_norm, exp, &parsed.pre_rerank_results);
             post.observe(&exp_file_norm, exp, &parsed.results);
+            case_records.push(CaseRecord::new(case, &parsed.pre_rerank_results));
         }
     });
 
@@ -338,6 +432,7 @@ pub fn run(
         rerank_skipped,
         skip_reasons,
         rerank_not_run,
+        cases: case_records,
         reproduce_cmd: format!(
             "cargo run --release --bin chunk_bench -- {repo} {server} {out} --rerank-ab --label {label} --top-k {top_k} --cases {case_limit}"
         ),
@@ -380,14 +475,50 @@ async fn fetch_descriptor(client: &reqwest::Client, server: &str) -> RerankerDes
     let Ok(cfg) = resp.json::<ConfigResp>().await else {
         return RerankerDescriptor::default();
     };
-    match cfg.llm {
-        Some(l) => RerankerDescriptor {
-            provider: l.provider,
-            model: l.rerank_model,
-            agentic_rag: l.agentic_rag,
-        },
-        None => RerankerDescriptor::default(),
+    cfg.llm.map(RerankerDescriptor::from).unwrap_or_default()
+}
+
+/// How many of `a` have no counterpart in `b`, counting repeats.
+fn count_not_in<T: Ord>(a: &[T], b: &[T]) -> usize {
+    let mut left: BTreeMap<&T, usize> = BTreeMap::new();
+    for x in b {
+        *left.entry(x).or_default() += 1;
     }
+    a.iter()
+        .filter(|x| match left.get_mut(x) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .count()
+}
+
+/// Why two runs did not score the same questions, if they did not. Recall
+/// deltas between different case sets measure the cases, not the rerankers.
+fn case_set_warning(prior: &RerankAbReport, current: &RerankAbReport) -> Option<String> {
+    if prior.cases.is_empty() {
+        return Some(
+            "the prior artifact records no case list, so identical cases cannot be confirmed"
+                .to_owned(),
+        );
+    }
+    // Match by content, not position: a case lost to a request error in one run
+    // would otherwise shift every later case and count the whole tail.
+    let prior_ids: Vec<_> = prior.cases.iter().map(CaseRecord::identity).collect();
+    let current_ids: Vec<_> = current.cases.iter().map(CaseRecord::identity).collect();
+    let missing = count_not_in(&prior_ids, &current_ids);
+    let added = count_not_in(&current_ids, &prior_ids);
+    let cases = |n: usize| if n == 1 { "case" } else { "cases" };
+    (missing + added > 0).then(|| {
+        format!(
+            "the case sets differ: {missing} prior {} missing from this run, {added} {} not in \
+             the prior",
+            cases(missing),
+            cases(added)
+        )
+    })
 }
 
 /// Cross-run comparison: this run's reranker row against a previously recorded
@@ -416,6 +547,7 @@ fn compare_runs(prior_path: &str, current: &RerankAbReport) -> Result<String, St
             current.queries_scored, prior.queries_scored
         ));
     }
+    warnings.extend(case_set_warning(&prior, current));
     if prior.reranker.provider == current.reranker.provider
         && prior.reranker.model == current.reranker.model
     {
@@ -480,11 +612,7 @@ mod tests {
 
     fn resp(pre: usize, rerank_ms: Option<u64>, rerank: Option<Option<&str>>) -> RerankQueryResp {
         let rows = (0..pre)
-            .map(|i| QueryResultRow {
-                file: "/r/a.rs".to_owned(),
-                line_start: i as u32 + 1,
-                line_end: i as u32 + 1,
-            })
+            .map(|i| row("/r/a.rs", (i as u32 + 1, i as u32 + 1), None))
             .collect();
         RerankQueryResp {
             results: vec![],
@@ -524,13 +652,155 @@ mod tests {
         );
     }
 
+    fn view(provider: &str, rerank_provider: Option<&str>) -> LlmConfigView {
+        LlmConfigView {
+            provider: Some(provider.to_owned()),
+            rerank_provider: rerank_provider.map(str::to_owned),
+            rerank_model: Some("gemini-flash".to_owned()),
+            agentic_rag: Some(false),
+        }
+    }
+
     #[test]
-    fn agentic_rag_on_refuses_the_run() {
+    fn the_descriptor_names_the_rerank_provider_not_the_llm_provider() {
+        let d = RerankerDescriptor::from(view("google", Some("jev")));
+        assert_eq!(d.provider.as_deref(), Some("jev"));
+        // Jev ignores `llm.rerank_model`, so recording it would mislabel the run.
+        assert_eq!(
+            d.model.as_deref(),
+            Some(context_engine_rs::query::jev::MODEL)
+        );
+    }
+
+    #[test]
+    fn an_unset_or_blank_rerank_provider_follows_the_llm_provider() {
+        for selector in [None, Some("  ")] {
+            let d = RerankerDescriptor::from(view("google", selector));
+            assert_eq!(d.provider.as_deref(), Some("google"));
+            assert_eq!(d.model.as_deref(), Some("gemini-flash"));
+        }
+    }
+
+    #[test]
+    fn agentic_rag_on_refuses_an_llm_reranker() {
         let d = RerankerDescriptor {
+            provider: Some("google".to_owned()),
             agentic_rag: Some(true),
             ..Default::default()
         };
         assert!(config_refusal(&d).is_some());
+        // An unreadable provider is treated as an LLM one.
+        let unknown = RerankerDescriptor {
+            agentic_rag: Some(true),
+            ..Default::default()
+        };
+        assert!(config_refusal(&unknown).is_some());
+    }
+
+    #[test]
+    fn agentic_rag_on_is_allowed_with_jev_which_never_runs_the_loop() {
+        let d = RerankerDescriptor {
+            provider: Some("jev".to_owned()),
+            agentic_rag: Some(true),
+            ..Default::default()
+        };
+        assert!(config_refusal(&d).is_none());
+    }
+
+    fn row(file: &str, lines: (u32, u32), relevance: Option<f64>) -> QueryResultRow {
+        QueryResultRow {
+            file: file.to_owned(),
+            line_start: lines.0,
+            line_end: lines.1,
+            relevance,
+        }
+    }
+
+    fn case(query: &str, lines: (u32, u32)) -> EvalCase {
+        EvalCase {
+            query: query.to_owned(),
+            file: "/r/a.rs".to_owned(),
+            symbol: "thing".to_owned(),
+            line_start: lines.0,
+            line_end: lines.1,
+        }
+    }
+
+    #[test]
+    fn a_case_record_keeps_each_candidate_probability_and_marks_the_expected_one() {
+        let pre = [
+            row("/r/b.rs", (10, 20), Some(0.9)),
+            row("/R/A.rs", (18, 30), Some(0.7)),
+            row("/r/a.rs", (40, 50), None),
+        ];
+        let record = CaseRecord::new(&case("what does it do", (20, 25)), &pre);
+        assert_eq!(record.query, "what does it do");
+        let seen: Vec<_> = record
+            .candidates
+            .iter()
+            .map(|c| (c.relevance, c.expected))
+            .collect();
+        assert_eq!(seen, [(Some(0.9), false), (Some(0.7), true), (None, false)]);
+    }
+
+    fn report_with(cases: Vec<CaseRecord>) -> RerankAbReport {
+        RerankAbReport {
+            label: "run".to_owned(),
+            timestamp_unix: 0,
+            repo: "/r".to_owned(),
+            server: "http://x".to_owned(),
+            top_k: 10,
+            eval_cases: cases.len() as u64,
+            queries_scored: cases.len() as u64,
+            reranker: RerankerDescriptor::default(),
+            no_rerank: RankingScore::default(),
+            reranked: RankingScore::default(),
+            deltas: ScoreDeltas::default(),
+            rerank_ms: LatencySummary::default(),
+            rerank_skipped: 0,
+            skip_reasons: BTreeMap::new(),
+            rerank_not_run: 0,
+            cases,
+            reproduce_cmd: String::new(),
+        }
+    }
+
+    fn record(query: &str) -> CaseRecord {
+        CaseRecord::new(&case(query, (1, 9)), &[])
+    }
+
+    #[test]
+    fn identical_case_sets_raise_no_warning() {
+        let a = report_with(vec![record("q1"), record("q2")]);
+        let b = report_with(vec![record("q1"), record("q2")]);
+        assert_eq!(case_set_warning(&a, &b), None);
+    }
+
+    #[test]
+    fn a_different_case_set_is_reported() {
+        let a = report_with(vec![record("q1"), record("q2")]);
+        let b = report_with(vec![record("q1"), record("q3")]);
+        let w = case_set_warning(&a, &b).expect("a warning");
+        assert!(w.contains("1 prior case missing"), "{w}");
+        assert!(w.contains("1 case not in the prior"), "{w}");
+    }
+
+    /// A case lost to a request error in one run shifts every later case, so a
+    /// positional comparison would report the whole tail as different.
+    #[test]
+    fn a_case_dropped_by_one_run_counts_once() {
+        let prior = report_with(vec![record("q1"), record("q2"), record("q3"), record("q4")]);
+        let current = report_with(vec![record("q1"), record("q3"), record("q4")]);
+        let w = case_set_warning(&prior, &current).expect("a warning");
+        assert!(w.contains("1 prior case missing"), "{w}");
+        assert!(w.contains("0 cases not in the prior"), "{w}");
+    }
+
+    #[test]
+    fn a_prior_run_without_a_case_list_is_reported() {
+        let current = report_with(vec![record("q1")]);
+        let prior = report_with(vec![]);
+        assert!(case_set_warning(&prior, &current).is_some());
     }
 
     #[test]

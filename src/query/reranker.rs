@@ -4,7 +4,7 @@ use crate::indexing::IndexEngine;
 use crate::llm::{ChatMessage, LlmClient, ToolDef, ToolResult, ToolTurnResult};
 use crate::query::engine::{QueryGraphMode, read_lines_from_fs, run_sub_query, slice_numbered};
 use crate::query::filters::{ParsedQuery, QueryFilters};
-use crate::query::jev::JevReranker;
+use crate::query::jev::{self, JevReranker};
 use crate::query::merger::MergeChunk;
 use regex::Regex;
 use std::collections::HashMap;
@@ -131,7 +131,7 @@ impl RerankProvider {
     /// served with the LLM keys and endpoint already configured.
     pub fn from_settings(llm: &LlmConfig) -> Self {
         match llm.rerank_provider() {
-            "jev" => Self::Jev(JevReranker::new(llm)),
+            jev::PROVIDER => Self::Jev(JevReranker::new(llm)),
             provider => Self::Llm(LlmClient::new(&LlmConfig {
                 provider: provider.to_owned(),
                 ..llm.clone()

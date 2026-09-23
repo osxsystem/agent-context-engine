@@ -20,6 +20,21 @@ pub fn iou(a: (u32, u32), b: (u32, u32)) -> f64 {
     if union <= 0.0 { 0.0 } else { inter / union }
 }
 
+/// Whether `r` is the expected answer: same file (compared lowercased with
+/// forward slashes, so a Windows-indexed path still matches) and at least one
+/// line of overlap with the expected range.
+pub fn is_hit(exp_file_norm: &str, exp: (u32, u32), r: &QueryResultRow) -> bool {
+    is_expected_file(exp_file_norm, r) && overlaps(exp, r)
+}
+
+fn is_expected_file(exp_file_norm: &str, r: &QueryResultRow) -> bool {
+    r.file.replace('\\', "/").to_lowercase() == exp_file_norm
+}
+
+fn overlaps(exp: (u32, u32), r: &QueryResultRow) -> bool {
+    r.line_start <= exp.1 && r.line_end >= exp.0
+}
+
 /// Recall and IoU for one ranking, scored against the eval ground truth.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 pub struct RankingScore {
@@ -64,12 +79,9 @@ pub struct RecallTally {
 impl RecallTally {
     /// Score one ranking for one eval case.
     ///
-    /// Hit rule: a result counts only when its file path matches the expected
-    /// file (compared lowercased with forward slashes, so a Windows-indexed path
-    /// still matches) and its line range overlaps the expected range by at least
-    /// one line. The hit rank is the first such result. IoU takes the best
-    /// overlap among all same-file results, which is why a poor result ranking
-    /// above a good one costs rank but not IoU.
+    /// Hit rule: see [`is_hit`]. The hit rank is the first such result. IoU
+    /// takes the best overlap among all same-file results, which is why a poor
+    /// result ranking above a good one costs rank but not IoU.
     ///
     /// Every observed case lands in the denominator whether or not it hit, so a
     /// case dropped before this point (unresolved symbol, failed request)
@@ -79,15 +91,14 @@ impl RecallTally {
         let mut best_iou = 0.0f64;
         let mut hit_rank: Option<usize> = None;
         for (rank, r) in ranking.iter().enumerate() {
-            if r.file.replace('\\', "/").to_lowercase() != exp_file_norm {
+            if !is_expected_file(exp_file_norm, r) {
                 continue;
             }
             let i = iou((exp_start, exp_end), (r.line_start, r.line_end));
             if i > best_iou {
                 best_iou = i;
             }
-            let overlaps = r.line_start <= exp_end && r.line_end >= exp_start;
-            if overlaps && hit_rank.is_none() {
+            if hit_rank.is_none() && overlaps(exp, r) {
                 hit_rank = Some(rank);
             }
         }
@@ -132,6 +143,7 @@ mod tests {
             file: file.to_owned(),
             line_start,
             line_end,
+            relevance: None,
         }
     }
 

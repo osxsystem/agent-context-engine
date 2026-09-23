@@ -84,7 +84,7 @@ struct Cli {
 
 /// Overall cap on how long we wait for indexing to finish before giving up.
 /// Generous — a clean rebuild of a large repo is network-embed-bound. The bench
-/// target (notepad-ade) finishes in seconds; this only guards a wedged run.
+/// target finishes in seconds; this only guards a wedged run.
 const INDEX_WAIT_CAP: Duration = Duration::from_secs(30 * 60);
 
 /// True if an error string looks like a RocksDB exclusive-lock / open conflict —

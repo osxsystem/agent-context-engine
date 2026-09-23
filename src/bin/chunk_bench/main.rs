@@ -7,27 +7,31 @@
 //!      linkage heuristic: largest-overlap vs deepest-enclosing)
 //!   3. window-over-symbol win-rate = % of top-k retrieval results whose line
 //!      range straddles a symbol boundary (the cut-through defect; ~0 wanted)
-//!   4. retrieval Recall@k + IoU against a fixed eval set of
-//!      (query -> expected file:symbol) pairs derived from notepad-ade.
+//!   4. retrieval Recall@k + IoU against an eval set derived from the repo
+//!      under test (doc comment -> the symbol it documents).
 //!
 //! Metrics (1)+(2) are computed IN-PROCESS from the *currently compiled*
 //! chunker via `parse_file` — so the same binary, rebuilt, measures whichever
 //! chunker is in the tree. Metrics (3)+(4) drive queries through the LIVE
 //! server (`/api/query`) so they reflect the index actually on disk.
 //!
-//! The eval set is anchored on real SYMBOL NAMES and resolved to line ranges
-//! through the FROZEN symbol extraction (`parse_file`), never through chunk
-//! boundaries — so it does not favour either chunker.
+//! Eval cases are derived from the repo under test and their line ranges come
+//! from the FROZEN symbol extraction (`parse_file`), never from chunk
+//! boundaries — so they do not favour either chunker. See `eval`.
 //!
 //! Usage:
 //!   chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]
 //!   chunk_bench <repo_path> <legacy_url> <ab_out.json> --ab --new-server <new_url>
+//!   chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--top-k N] [--cases N] [--compare prior.json]
+//!
+//! `--rerank-ab` needs a server with agentic RAG off; `scripts/rerank_bench.sh`
+//! boots one privately against the real index without touching settings.json.
 //!
 //! Example (single):
-//!   chunk_bench d:/projects/cpp/notepad-ade http://localhost:6699 baseline.json --label baseline
+//!   chunk_bench /path/to/repo http://localhost:6699 baseline.json --label baseline
 //!
 //! Example (A/B — the reproducible same-code-path comparison):
-//!   chunk_bench d:/projects/cpp/notepad-ade http://localhost:7801 ab_benchmark.json \
+//!   chunk_bench /path/to/repo http://localhost:7801 ab_benchmark.json \
 //!       --ab --new-server http://localhost:7802
 //!
 //! `--ab` mode fixes the original methodology hole: the archived baseline
@@ -36,7 +40,7 @@
 //! mode BOTH rows are produced in ONE run by the IDENTICAL harness + query path,
 //! each against a REAL fresh index built by its OWN chunker (legacy server =
 //! git-HEAD build, new server = working-tree build), with identical frozen eval
-//! set, identical chunker-independent ground-truth, and identical rerank=false.
+//! set, identical chunker-independent ground truth, and identical rerank=false.
 //! See `scripts/ab_bench.sh` for the orchestration that boots both servers on
 //! isolated temp ports + temp data dirs and cleans them up.
 
@@ -47,7 +51,15 @@ use context_engine_rs::parsing::parse_file;
 use context_engine_rs::parsing::symbols::Symbol;
 
 mod eval;
-use eval::eval_set;
+mod rerank_ab;
+mod scoring;
+use eval::derive_eval_set;
+use scoring::RecallTally;
+
+/// How many retrieval cases to derive from the repo under test. Large enough
+/// that a few unlucky queries cannot swing recall, small enough that a run
+/// against a real reranker finishes in minutes rather than hours.
+pub(crate) const EVAL_LIMIT: usize = 50;
 
 // ─── Output report shape ─────────────────────────────────────────────────
 
@@ -94,7 +106,7 @@ struct Report {
 /// reproducible and not apples-to-apples. This artifact fixes that: both rows
 /// are produced in ONE run, by the IDENTICAL harness + query path, against a
 /// REAL fresh index built by EACH chunker, with the SAME frozen eval set, SAME
-/// ground-truth resolution (`resolve_expected_range`, chunker-independent), and
+/// ground-truth derivation (`eval::derive_eval_set`, chunker-independent), and
 /// the SAME `rerank=false` setting. Anyone can re-run `reproduce_cmd` and get
 /// the same numbers.
 #[derive(serde::Serialize, Debug)]
@@ -134,7 +146,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "usage: chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]\n       chunk_bench <repo_path> <legacy_server_url> <ab_out.json> --ab --new-server <new_server_url>"
+            "usage: chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]\n       chunk_bench <repo_path> <legacy_server_url> <ab_out.json> --ab --new-server <new_server_url>\n       chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--label NAME] [--top-k N] [--cases N] [--compare prior.json]"
         );
         std::process::exit(2);
     }
@@ -145,6 +157,10 @@ fn main() {
     let mut do_retrieval = true;
     let mut legacy = false;
     let mut ab = false;
+    let mut rerank_ab = false;
+    let mut top_k: u64 = 10;
+    let mut cases = EVAL_LIMIT;
+    let mut compare: Option<String> = None;
     let mut new_server: Option<String> = None;
     let mut i = 4;
     while i < args.len() {
@@ -165,6 +181,39 @@ fn main() {
             // positional <server_url> is the LEGACY server; --new-server is the
             // cAST server. See `run_ab`.
             "--ab" => ab = true,
+            // Rerank A/B mode: score the pre- and post-rerank rankings of the
+            // SAME response against the same ground truth. See `rerank_ab`.
+            "--rerank-ab" => rerank_ab = true,
+            "--top-k" => {
+                i += 1;
+                if i < args.len() {
+                    top_k = args[i].parse().unwrap_or_else(|_| {
+                        eprintln!("[chunk_bench] --top-k expects an integer, got {}", args[i]);
+                        std::process::exit(2);
+                    });
+                }
+            }
+            // Score fewer cases than EVAL_LIMIT. Every case is one LLM rerank
+            // call, so a sample is how to spot-check a scarce-quota model.
+            // Sampling keeps the even stride, so a smaller run draws its cases
+            // from across the same repo rather than from its first files.
+            "--cases" => {
+                i += 1;
+                if i < args.len() {
+                    cases = args[i].parse().unwrap_or_else(|_| {
+                        eprintln!("[chunk_bench] --cases expects an integer, got {}", args[i]);
+                        std::process::exit(2);
+                    });
+                }
+            }
+            // Diff this run's reranker row against a previously recorded
+            // artifact — the two-reranker axis.
+            "--compare" => {
+                i += 1;
+                if i < args.len() {
+                    compare = Some(args[i].clone());
+                }
+            }
             "--new-server" => {
                 i += 1;
                 if i < args.len() {
@@ -174,6 +223,24 @@ fn main() {
             other => eprintln!("warning: ignoring unknown arg {other}"),
         }
         i += 1;
+    }
+
+    if rerank_ab {
+        if ab {
+            eprintln!("[chunk_bench] --rerank-ab and --ab are different modes; pick one");
+            std::process::exit(2);
+        }
+        eprintln!("[chunk_bench] running rerank A/B against {server} ...");
+        rerank_ab::run(
+            &repo,
+            &server,
+            &out_path,
+            &label,
+            top_k,
+            cases,
+            compare.as_deref(),
+        );
+        return;
     }
 
     if ab {
@@ -275,7 +342,7 @@ fn run_ab(repo: &str, legacy_server: &str, new_server: &str, out_path: &str) {
         new_server: new_server.to_string(),
         deltas,
         reproduce_cmd: "scripts/ab_bench.sh  (boots both servers on temp ports + temp \
-                        data dirs, rebuilds notepad-ade on each, then: chunk_bench \
+                        data dirs, rebuilds the repo on each, then: chunk_bench \
                         <repo> <legacy_url> ab_benchmark.json --ab --new-server <new_url>)"
             .to_string(),
         legacy,
@@ -467,21 +534,43 @@ struct QueryResp {
     results: Vec<QueryResultRow>,
 }
 
-/// Resolve an eval pair's expected line range by finding the named symbol in the
-/// target file via the FROZEN extraction. Returns the innermost (smallest) match
-/// so "parse" picks the function, not an enclosing class. Chunker-independent.
-fn resolve_expected_range(repo: &str, rel_file: &str, symbol: &str) -> Option<(String, u32, u32)> {
-    // Build the absolute path the index uses (same normalization the server stores).
-    let abs = format!("{}/{}", repo.trim_end_matches(['/', '\\']), rel_file);
-    let abs = abs.replace('\\', "/");
-    let source = std::fs::read_to_string(&abs).ok()?;
-    let parsed = parse_file(&abs, &source);
-    parsed
-        .symbols
-        .iter()
-        .filter(|s| s.qualified.name == symbol)
-        .min_by_key(|s| s.line_end.saturating_sub(s.line_start))
-        .map(|s| (abs.clone(), s.line_start, s.line_end))
+/// Wait until the server answers a query for `repo` with results.
+///
+/// The router spawns a per-repo worker on the first request for that repo, and
+/// a query that arrives while it is still loading comes back empty. Scored, that
+/// empty answer is indistinguishable from a miss and silently lowers recall on
+/// whichever case happens to run first. So warm up with a throwaway rerank-free
+/// query and only start scoring once one returns something.
+pub(crate) async fn warm_up(client: &reqwest::Client, server: &str, repo: &str) {
+    const ATTEMPTS: u32 = 30;
+    let body = serde_json::json!({
+        "query": "warm up",
+        "repo": repo,
+        "top_k": 1,
+        "rerank": false,
+    });
+    for _ in 0..ATTEMPTS {
+        let answered = match client
+            .post(format!("{server}/api/query"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r
+                .json::<QueryResp>()
+                .await
+                .is_ok_and(|q| !q.results.is_empty()),
+            Err(_) => false,
+        };
+        if answered {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    eprintln!(
+        "[chunk_bench] WARNING: {server} returned no results for {repo} during warm-up; is the \
+         repo indexed there? Scoring anyway."
+    );
 }
 
 /// A chunk is a window-over-symbol CUT-THROUGH when one of its boundaries falls
@@ -532,20 +621,16 @@ fn is_cut_through(start: u32, end: u32, symbols: &[Symbol]) -> bool {
 }
 
 /// IoU of two inclusive line ranges.
-fn iou(a: (u32, u32), b: (u32, u32)) -> f64 {
-    let inter_start = a.0.max(b.0);
-    let inter_end = a.1.min(b.1);
-    if inter_start > inter_end {
-        return 0.0;
-    }
-    let inter = (inter_end - inter_start + 1) as f64;
-    let union = ((a.1 - a.0 + 1) + (b.1 - b.0 + 1)) as f64 - inter;
-    if union <= 0.0 { 0.0 } else { inter / union }
-}
-
 fn run_retrieval(repo: &str, server: &str, report: &mut Report) {
-    let pairs = eval_set();
-    report.eval_pairs = pairs.len() as u64;
+    let cases = derive_eval_set(repo, EVAL_LIMIT);
+    report.eval_pairs = cases.len() as u64;
+    if cases.is_empty() {
+        eprintln!(
+            "[chunk_bench] ERROR: no retrieval cases could be derived from {repo}. The eval set \
+             needs documented functions or methods; a repo with no doc comments yields nothing to \
+             score."
+        );
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -553,25 +638,14 @@ fn run_retrieval(repo: &str, server: &str, report: &mut Report) {
         .expect("tokio runtime");
     let client = reqwest::Client::new();
 
-    let mut recall1 = 0u64;
-    let mut recall5 = 0u64;
-    let mut recall10 = 0u64;
-    let mut iou_sum = 0.0f64;
-    let mut iou_count = 0u64;
+    let mut tally = RecallTally::default();
 
     rt.block_on(async {
-        for (query, rel_file, symbol) in &pairs {
-            let expected = match resolve_expected_range(repo, rel_file, symbol) {
-                Some(e) => e,
-                None => {
-                    eprintln!(
-                        "[chunk_bench] WARN: eval symbol not found, skipping: {symbol} in {rel_file}"
-                    );
-                    continue;
-                }
-            };
-            let (exp_file, exp_start, exp_end) = expected;
-            let exp_file_norm = exp_file.replace('\\', "/").to_lowercase();
+        warm_up(&client, server, repo).await;
+        for case in &cases {
+            let query = &case.query;
+            let (exp_start, exp_end) = (case.line_start, case.line_end);
+            let exp_file_norm = case.file.to_lowercase();
 
             // rerank=false: we measure the raw retrieval ranking, not the LLM
             // rerank (which is non-deterministic and would mask chunk quality).
@@ -603,52 +677,27 @@ fn run_retrieval(repo: &str, server: &str, report: &mut Report) {
             report.queries_run += 1;
             report.topk_results_total += parsed.results.len() as u64;
 
-            // Cut-through: for each result, re-parse its file once and test the
-            // straddle condition against frozen symbols.
-            let mut best_iou = 0.0f64;
-            let mut hit_rank: Option<usize> = None;
-            for (rank, r) in parsed.results.iter().enumerate() {
-                let r_file_norm = r.file.replace('\\', "/").to_lowercase();
-                // cut-through is measured over ALL top-k results, any file.
+            // Cut-through is measured over ALL top-k results, any file — a
+            // separate question from recall, so it keeps its own pass.
+            for r in parsed.results.iter() {
                 if let Ok(src) = std::fs::read_to_string(&r.file) {
                     let p = parse_file(&r.file, &src);
                     if is_cut_through(r.line_start, r.line_end, &p.symbols) {
                         report.cut_through_results += 1;
                     }
                 }
-                // recall/IoU only count results in the expected file.
-                if r_file_norm == exp_file_norm {
-                    let i = iou((exp_start, exp_end), (r.line_start, r.line_end));
-                    if i > best_iou {
-                        best_iou = i;
-                    }
-                    let overlaps = r.line_start <= exp_end && r.line_end >= exp_start;
-                    if overlaps && hit_rank.is_none() {
-                        hit_rank = Some(rank);
-                    }
-                }
             }
-            if let Some(rank) = hit_rank {
-                if rank < 1 {
-                    recall1 += 1;
-                }
-                if rank < 5 {
-                    recall5 += 1;
-                }
-                if rank < 10 {
-                    recall10 += 1;
-                }
-            }
-            iou_sum += best_iou;
-            iou_count += 1;
+            // Recall/IoU go through the shared tally in `scoring`, the single
+            // definition of a hit — see that module for why this is not inlined.
+            tally.observe(&exp_file_norm, (exp_start, exp_end), &parsed.results);
         }
     });
 
-    let denom = iou_count.max(1) as f64;
-    report.recall_at_1 = recall1 as f64 / denom;
-    report.recall_at_5 = recall5 as f64 / denom;
-    report.recall_at_10 = recall10 as f64 / denom;
-    report.mean_iou = iou_sum / denom;
+    let score = tally.finish(&report.label);
+    report.recall_at_1 = score.recall_at_1;
+    report.recall_at_5 = score.recall_at_5;
+    report.recall_at_10 = score.recall_at_10;
+    report.mean_iou = score.mean_iou;
     report.cut_through_rate = if report.topk_results_total > 0 {
         report.cut_through_results as f64 / report.topk_results_total as f64
     } else {

@@ -1,0 +1,59 @@
+{
+  "label": "gemini-sample10",
+  "timestamp_unix": 1790132704,
+  "repo": "/Users/hugues_mini/Codes/AgentTools/agent-context-engine",
+  "server": "http://127.0.0.1:7911",
+  "top_k": 10,
+  "eval_cases": 10,
+  "queries_scored": 10,
+  "reranker": {
+    "provider": "custom",
+    "model": "ag/gemini-3.8-flash",
+    "agentic_rag": false
+  },
+  "no_rerank": {
+    "label": "no-rerank (merge order)",
+    "recall_at_1": 0.7,
+    "recall_at_5": 0.8,
+    "recall_at_10": 0.9,
+    "mean_iou": 0.2866111458281694
+  },
+  "reranked": {
+    "label": "gemini-sample10",
+    "recall_at_1": 0.8,
+    "recall_at_5": 0.9,
+    "recall_at_10": 0.9,
+    "mean_iou": 0.479991602362338
+  },
+  "deltas": {
+    "recall_at_1": 0.10000000000000009,
+    "recall_at_5": 0.09999999999999998,
+    "recall_at_10": 0.0,
+    "mean_iou": 0.19338045653416863
+  },
+  "rerank_ms": {
+    "samples": 5,
+    "min_ms": 6609,
+    "p50_ms": 23698,
+    "p95_ms": 81712,
+    "max_ms": 81712
+  },
+  "rerank_skipped": 4,
+  "skip_reasons": {
+    "failed to parse structured response": 4
+  },
+  "rerank_not_run": 1,
+  "reproduce_cmd": "CASES=10 scripts/rerank_bench.sh gemini-sample10 /Users/hugues_mini/Codes/AgentTools/agent-context-engine",
+  "provenance": {
+    "configured_reranker": {
+      "provider": "custom",
+      "model": "ag/gemini-3.8-flash",
+      "agentic_rag": true
+    },
+    "overrides": {
+      "agentic_rag": false
+    },
+    "corpus_commit": "a2f0f8fb09b537a665d587cfe3dabe36803ed729",
+    "note": "10-case sample on the configured reranker, sized to save Gemini quota. Too small to decide on recall; use it for latency and to sanity-check the direction."
+  }
+}

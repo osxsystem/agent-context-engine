@@ -1,0 +1,58 @@
+{
+  "label": "gpt-oss-sample10",
+  "timestamp_unix": 1790132492,
+  "repo": "/Users/hugues_mini/Codes/AgentTools/agent-context-engine",
+  "server": "http://127.0.0.1:7911",
+  "top_k": 10,
+  "eval_cases": 10,
+  "queries_scored": 10,
+  "reranker": {
+    "provider": "custom",
+    "model": "ag/gpt-oss-120b-medium",
+    "agentic_rag": false
+  },
+  "no_rerank": {
+    "label": "no-rerank (merge order)",
+    "recall_at_1": 0.7,
+    "recall_at_5": 0.8,
+    "recall_at_10": 0.9,
+    "mean_iou": 0.2866111458281694
+  },
+  "reranked": {
+    "label": "gpt-oss-sample10",
+    "recall_at_1": 0.9,
+    "recall_at_5": 0.9,
+    "recall_at_10": 0.9,
+    "mean_iou": 0.4430526083853005
+  },
+  "deltas": {
+    "recall_at_1": 0.20000000000000007,
+    "recall_at_5": 0.09999999999999998,
+    "recall_at_10": 0.0,
+    "mean_iou": 0.1564414625571311
+  },
+  "rerank_ms": {
+    "samples": 9,
+    "min_ms": 2661,
+    "p50_ms": 16833,
+    "p95_ms": 188986,
+    "max_ms": 188986
+  },
+  "rerank_skipped": 0,
+  "skip_reasons": {},
+  "rerank_not_run": 1,
+  "reproduce_cmd": "RERANK_MODEL=ag/gpt-oss-120b-medium CASES=10 scripts/rerank_bench.sh gpt-oss-sample10 /Users/hugues_mini/Codes/AgentTools/agent-context-engine",
+  "provenance": {
+    "configured_reranker": {
+      "provider": "custom",
+      "model": "ag/gemini-3.8-flash",
+      "agentic_rag": true
+    },
+    "overrides": {
+      "agentic_rag": false,
+      "rerank_model": "ag/gpt-oss-120b-medium"
+    },
+    "corpus_commit": "a2f0f8fb09b537a665d587cfe3dabe36803ed729",
+    "note": "10-case sample on the substitute, the same cases as gemini-sample10, so the two compare like for like."
+  }
+}

@@ -202,8 +202,9 @@ change, verifiable with no API key and no network. Today's `rerank()` becomes
 
 **Slice 2 — rerank benchmark (KR5).** Extend the `chunk_bench` harness to run
 the reranked retrieval path and A/B two rerankers on `recall_at_1/5/10` and
-`rerank_ms`, reusing the existing ground truth and delta-gate machinery
-(`src/bin/chunk_bench/main.rs:82-84`, `:253-255`). Record the Gemini baseline.
+`rerank_ms`, reusing the existing delta-gate machinery, with ground truth
+derived from doc comments in the repo under test (decided on #7). Record the
+Gemini baseline.
 
 **Slice 3 — Jev reranker.**
 

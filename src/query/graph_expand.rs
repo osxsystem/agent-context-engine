@@ -8,6 +8,7 @@ use tracing::warn;
 
 use crate::query::find_db_for_file;
 use crate::query::merger::MergeChunk;
+use crate::query::reranker::SymbolSpan;
 
 /// An expanded chunk produced by BFS graph traversal.
 pub struct ExpandedChunk {
@@ -239,6 +240,69 @@ async fn query_overlapping_symbols(
     Ok(rows)
 }
 
+/// Narrowing candidates for one merged chunk: the symbols lying wholly inside
+/// it, in line order. Straddling symbols are left out so any selected range
+/// starts and ends on a real symbol boundary, and a symbol spanning the whole
+/// chunk is left out because selecting it narrows nothing. Symbols sharing a
+/// range are offered once. A failed lookup yields no candidates, which returns
+/// the chunk whole.
+pub async fn candidate_spans(db: &Surreal<Db>, chunk: &MergeChunk) -> Vec<SymbolSpan> {
+    let rows: Vec<SymbolRow> = match async {
+        db.query(
+            "SELECT meta::id(id) AS fqn, file, name, line_start, line_end, kind FROM symbol \
+             WHERE file = $file AND line_start >= $chunk_start AND line_end <= $chunk_end \
+             ORDER BY line_start, line_end",
+        )
+        .bind(("file", chunk.file.clone()))
+        .bind(("chunk_start", chunk.line_start as i64))
+        .bind(("chunk_end", chunk.line_end as i64))
+        .await?
+        .take(0)
+    }
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            let e: surrealdb::Error = e;
+            warn!(error = %e, file = %chunk.file, "failed to query candidate symbol spans");
+            return Vec::new();
+        }
+    };
+
+    let mut spans: Vec<SymbolSpan> = Vec::new();
+    for row in rows {
+        let (line_start, line_end) = (row.line_start as u32, row.line_end as u32);
+        let whole_chunk = line_start == chunk.line_start && line_end == chunk.line_end;
+        let repeat = spans
+            .iter()
+            .any(|s| s.line_start == line_start && s.line_end == line_end);
+        if !whole_chunk && !repeat {
+            spans.push(SymbolSpan {
+                name: row.name,
+                kind: row.kind,
+                line_start,
+                line_end,
+            });
+        }
+    }
+    spans
+}
+
+/// [`candidate_spans`] for every chunk, each looked up in the index its file
+/// belongs to; aligned 1:1 with `chunks`.
+pub async fn candidate_spans_for(
+    chunks: &[MergeChunk],
+    db_map: &HashMap<String, Surreal<Db>>,
+) -> Vec<Vec<SymbolSpan>> {
+    futures::future::join_all(chunks.iter().map(|chunk| async move {
+        match find_db_for_file(db_map, &chunk.file) {
+            Some(db) => candidate_spans(db, chunk).await,
+            None => Vec::new(),
+        }
+    }))
+    .await
+}
+
 /// Query callers of the symbol identified by `fqn`.
 ///
 /// Uses indexed `in_name`/`out_name` columns which now store full FQNs.
@@ -431,6 +495,58 @@ mod tests {
             .bind(("c", content.to_string()))
             .await
             .expect("insert chunk");
+    }
+
+    fn merged_chunk(file: &str, line_start: u32, line_end: u32) -> MergeChunk {
+        MergeChunk {
+            file: file.to_owned(),
+            line_start,
+            line_end,
+            score: 0.5,
+            content: String::new(),
+            symbol: None,
+            symbol_fqn: None,
+            symbol_kind: None,
+        }
+    }
+
+    /// Only symbols lying wholly inside the chunk are narrowing candidates, so
+    /// every range a reranker selects starts and ends on a symbol boundary. A
+    /// symbol covering the whole chunk would select nothing narrower.
+    #[tokio::test]
+    async fn candidate_spans_are_the_symbols_wholly_inside_the_chunk() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/candidate_spans", 0)
+            .await
+            .unwrap();
+        let file = "src/lib.rs";
+        insert_symbol(&db, "src/lib.rs::Outer", file, "Outer", 1, 200).await;
+        insert_symbol(&db, "src/lib.rs::whole", file, "whole", 10, 60).await;
+        insert_symbol(&db, "src/lib.rs::before", file, "before", 2, 15).await;
+        insert_symbol(&db, "src/lib.rs::helper", file, "helper", 30, 40).await;
+        insert_symbol(&db, "src/lib.rs::parse", file, "parse", 12, 20).await;
+        insert_symbol(&db, "src/lib.rs::after", file, "after", 55, 90).await;
+        insert_symbol(&db, "other.rs::parse", "other.rs", "parse", 12, 20).await;
+
+        let spans = candidate_spans(&db, &merged_chunk(file, 10, 60)).await;
+
+        assert_eq!(
+            spans,
+            vec![
+                SymbolSpan {
+                    name: "parse".to_owned(),
+                    kind: Some("method".to_owned()),
+                    line_start: 12,
+                    line_end: 20,
+                },
+                SymbolSpan {
+                    name: "helper".to_owned(),
+                    kind: Some("method".to_owned()),
+                    line_start: 30,
+                    line_end: 40,
+                },
+            ]
+        );
     }
 
     /// Locks the fix: `fetch_chunk_for_fqn` must resolve a symbol whose id is a

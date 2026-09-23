@@ -511,27 +511,58 @@ async fn jev_second_pass_skips_keys_that_reported_a_limit() {
 
 #[tokio::test]
 async fn jev_with_every_key_rate_limited_keeps_similarity_order_and_says_why() {
-    let mock = MockJev::answering(&[("a.rs", 0.1), ("b.rs", 0.9)])
-        .with_key_statuses("k1", &ALWAYS_LIMITED)
-        .with_key_statuses("k2", &ALWAYS_LIMITED);
+    let mock = MockJev::answering(&[("a.rs", 0.9)])
+        .with_key_statuses("spent-1", &ALWAYS_LIMITED)
+        .with_key_statuses("spent-2", &ALWAYS_LIMITED);
     let base = mock.serve().await;
-    let reranker = jev_with_keys(base, &["k1", "k2"]);
+    let reranker = jev_with_keys(base, &["spent-1", "spent-2"]);
 
-    let out = rerank(
-        &reranker,
-        "q",
-        &[chunk("a.rs", "alpha"), chunk("b.rs", "beta")],
-    )
-    .await;
+    let out = rerank(&reranker, "q", &[chunk("a.rs", "alpha")]).await;
 
-    assert_eq!(out.reranked_indices, vec![0, 1]);
+    assert_eq!(out.reranked_indices, vec![0]);
     assert!(out.fallback_used);
     assert!(out.relevance.is_empty());
     let reason = out.skip_reason.expect("skip reason");
-    assert!(reason.contains("rate-limited"), "{reason}");
-    let used = mock.keys_used();
-    assert!(
-        used.len() <= 4,
-        "no second pass on limited keys, got {used:?}"
+    assert!(reason.contains("rate-limited on 2 of 2"), "{reason}");
+    assert_eq!(
+        mock.keys_used(),
+        ["spent-1", "spent-2"],
+        "no retry pass once every key reported a limit"
     );
+}
+
+/// One key limited, the other failing otherwise: the reason still names the
+/// rate limit, alongside the error that came last.
+#[tokio::test]
+async fn jev_with_some_keys_rate_limited_names_the_limit_in_its_reason() {
+    let mock = MockJev::answering(&[("a.rs", 0.9)])
+        .with_key_statuses("capped", &ALWAYS_LIMITED)
+        .with_key_statuses("broken", &[StatusCode::BAD_GATEWAY; 2]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["capped", "broken"]);
+
+    let out = rerank(&reranker, "q", &[chunk("a.rs", "alpha")]).await;
+
+    assert!(out.fallback_used);
+    let reason = out.skip_reason.expect("skip reason");
+    assert!(
+        reason.contains("rate-limited on 1 of 2") && reason.contains("502"),
+        "{reason}"
+    );
+    assert_eq!(mock.keys_used(), ["capped", "broken", "broken"]);
+}
+
+/// Settings build a fresh reranker for every query; rotation still carries on
+/// from where the previous query left it.
+#[tokio::test]
+async fn jev_rotation_carries_on_across_queries() {
+    let mock = MockJev::answering(&[]);
+    let base = mock.serve().await;
+
+    for _ in 0..2 {
+        let reranker = jev_with_keys(base.clone(), &["query-1", "query-2"]);
+        rerank(&reranker, "q", &[chunk("a.rs", "alpha")]).await;
+    }
+
+    assert_eq!(mock.keys_used(), ["query-1", "query-2"]);
 }

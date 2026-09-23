@@ -17,7 +17,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 
 use crate::config::LlmConfig;
-use crate::llm::keys::{KeyRing, is_rate_limited};
+use crate::llm::keys::{KeyRing, RateLimited};
 use crate::query::reranker::{RerankOutput, RerankRequest, Reranker};
 
 /// TypeSafe's public API; overridden by `llm.jev_base_url`.
@@ -62,7 +62,8 @@ impl JevReranker {
             http,
             url: systemone_url(config.jev_base_url.as_deref()),
             deadline: RERANK_DEADLINE,
-            keys: KeyRing::new(
+            // Rebuilt for every query, so rotation state must outlive it.
+            keys: KeyRing::shared(
                 config
                     .jev_api_keys
                     .iter()
@@ -113,7 +114,7 @@ impl JevReranker {
     async fn ask(&self, body: &Value) -> Result<(f64, Value)> {
         self.keys
             .send("Jev request", |key| async move {
-                Ok(self.ask_with_key(&key, body).await?)
+                self.ask_with_key(&key, body).await
             })
             .await
     }
@@ -194,15 +195,15 @@ impl Reranker for JevReranker {
             .try_collect::<Vec<(f64, Value)>>();
         let answers = match tokio::time::timeout(self.deadline, fan_out).await {
             Ok(Ok(a)) => a,
-            Ok(Err(e)) if is_rate_limited(&e) => {
-                return similarity_order(
-                    format!("Jev reranking was rate-limited on every TypeSafe key: {e:#}"),
-                    true,
-                    raw_request,
-                );
-            }
             Ok(Err(e)) => {
-                return similarity_order(format!("Jev request failed: {e:#}"), true, raw_request);
+                let reason = match e.downcast_ref::<RateLimited>() {
+                    Some(r) => format!(
+                        "Jev reranking was rate-limited on {} of {} TypeSafe keys; last error: {:#}",
+                        r.limited, r.keys, r.last
+                    ),
+                    None => format!("Jev request failed: {e:#}"),
+                };
+                return similarity_order(reason, true, raw_request);
             }
             Err(_) => {
                 return similarity_order(

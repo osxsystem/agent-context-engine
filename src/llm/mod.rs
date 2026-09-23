@@ -172,9 +172,8 @@ impl LlmClient {
     ) -> Result<String> {
         self.keys
             .send("LLM call", |key| async move {
-                Ok(self
-                    .call_provider(system, user, temperature, structured, &key)
-                    .await?)
+                self.call_provider(system, user, temperature, structured, &key)
+                    .await
             })
             .await
     }
@@ -276,17 +275,16 @@ impl LlmClient {
     ) -> Result<ToolTurnResult> {
         self.keys
             .send("LLM tool-call", |key| async move {
-                Ok(self
-                    .call_provider_with_tools(
-                        system,
-                        contents,
-                        tools,
-                        temperature,
-                        force_tool_use,
-                        &key,
-                        prompt_cache_key,
-                    )
-                    .await?)
+                self.call_provider_with_tools(
+                    system,
+                    contents,
+                    tools,
+                    temperature,
+                    force_tool_use,
+                    &key,
+                    prompt_cache_key,
+                )
+                .await
             })
             .await
     }

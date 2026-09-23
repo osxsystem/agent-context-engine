@@ -243,8 +243,11 @@ placeholder and the speed hint become provider-aware, with translations in all
 three shipped languages.
 
 **Benchmark.** The existing chunk benchmark is extended to run the reranked
-retrieval path and to A/B two rerankers, reusing its ground truth, its
-recall-at-k metrics, and its delta-gate machinery. The query benchmark already
+retrieval path and to A/B two rerankers, reusing its recall-at-k metrics and
+its delta-gate machinery. Its ground truth is derived from the repo under test
+(a doc comment is the query, the symbol it documents the expected answer)
+rather than the old hand-written C++ cases, which needed a checkout nobody here
+has; decided on #7. The query benchmark already
 emits per-stage timing including the rerank stage; those figures are recorded
 rather than discarded.
 

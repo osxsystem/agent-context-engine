@@ -1418,7 +1418,7 @@ fn add_one_chunk(
         None => None,
         Some(arr) if arr.is_empty() => None,
         Some(arr) => {
-            if chunk.line_end.saturating_sub(chunk.line_start) < min_prune_lines {
+            if chunk.is_under_prune_floor(min_prune_lines) {
                 None
             } else {
                 sanitize_ranges(arr, chunk.line_start, chunk.line_end)
@@ -1773,7 +1773,7 @@ fn parse_rerank_response(
             Some(arr) if arr.is_empty() => None,
             Some(arr) => {
                 // Small chunks are never line-pruned (1C policy).
-                if chunk.line_end.saturating_sub(chunk.line_start) < min_prune_lines {
+                if chunk.is_under_prune_floor(min_prune_lines) {
                     None
                 } else {
                     sanitize_ranges(arr, chunk.line_start, chunk.line_end)

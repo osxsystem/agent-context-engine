@@ -374,9 +374,13 @@ pub(crate) async fn run_query_with_filters_and_mode(
         .collect();
 
     // ── Step 5.6: Narrowing candidates (span-narrowing rerankers only) ──────
-    // Same gate as caller stats: symbols belong to the graph phase.
-    let candidate_spans = if reranker.narrows_by_span() && schema_version.is_some() {
-        crate::query::graph_expand::candidate_spans_for(&merged, &db_map).await
+    // Unlike `calls`, symbols and their file index are committed in Stage 3
+    // with the chunks, so this lookup is safe on vector-only results too.
+    let candidate_spans = if reranker.narrows_by_span() {
+        crate::query::graph_expand::candidate_spans_for(&merged, |file| {
+            find_db_for_file(&db_map, file)
+        })
+        .await
     } else {
         reranker::RerankRequest::no_spans(merged.len())
     };

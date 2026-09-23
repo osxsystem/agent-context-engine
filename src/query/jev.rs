@@ -98,19 +98,13 @@ impl JevReranker {
 
     /// The request body for one candidate: the relevance question plus one
     /// question per span in `spans`, all over the same state.
-    fn request_body(
-        &self,
-        query: &str,
-        req: &RerankRequest<'_>,
-        i: usize,
-        spans: &[SymbolSpan],
-    ) -> Value {
+    fn request_body(&self, req: &RerankRequest<'_>, i: usize, spans: &[SymbolSpan]) -> Value {
         let chunk = &req.chunks[i];
         let code = req.numbered[i].as_deref().unwrap_or(&chunk.content);
         let mut body = json!({
             "model": MODEL,
             "state": {
-                "query": query,
+                "query": req.query,
                 "file_path": chunk.file,
                 "symbol_name": chunk.symbol,
                 "symbol_kind": chunk.symbol_kind,
@@ -213,7 +207,7 @@ impl Reranker for JevReranker {
 
         let spans: Vec<&[SymbolSpan]> = (0..n).map(|i| narrowing_spans(&req, i)).collect();
         let bodies: Vec<Value> = (0..n)
-            .map(|i| self.request_body(req.query, &req, i, spans[i]))
+            .map(|i| self.request_body(&req, i, spans[i]))
             .collect();
         let raw_request = Value::Array(bodies.clone()).to_string();
         // `buffered` keeps results in candidate order and caps how many
@@ -269,8 +263,7 @@ impl Reranker for JevReranker {
 /// The spans to ask about for chunk `i`: none when the chunk is under the
 /// prune floor, since it is short enough to show whole.
 fn narrowing_spans<'a>(req: &'a RerankRequest<'_>, i: usize) -> &'a [SymbolSpan] {
-    let chunk = &req.chunks[i];
-    if chunk.line_end.saturating_sub(chunk.line_start) < req.min_prune_lines {
+    if req.chunks[i].is_under_prune_floor(req.min_prune_lines) {
         return &[];
     }
     req.candidate_spans.get(i).map_or(&[], Vec::as_slice)

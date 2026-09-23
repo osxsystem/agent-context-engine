@@ -1120,12 +1120,7 @@ async fn run_file_retrieval_resolved(
     use crate::query::reranker::{RerankRequest, Reranker};
     let reranker = RerankProvider::from_settings(&settings.llm);
     let candidate_spans = if reranker.narrows_by_span() {
-        futures::future::join_all(
-            merge_chunks
-                .iter()
-                .map(|c| crate::query::graph_expand::candidate_spans(&db, c)),
-        )
-        .await
+        crate::query::graph_expand::candidate_spans_for(&merge_chunks, |_| Some(&db)).await
     } else {
         RerankRequest::no_spans(merge_chunks.len())
     };

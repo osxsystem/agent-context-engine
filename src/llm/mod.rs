@@ -1,12 +1,12 @@
 pub mod google;
+pub mod keys;
 pub mod openai;
 
 use crate::config::LlmConfig;
 use anyhow::{Result, bail};
+use keys::{Failure, KeyRing};
 use reqwest::Client;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tracing::warn;
 
 // ─── Shared types for tool-calling ───────────────────────────────────────
 
@@ -63,9 +63,8 @@ pub enum ToolTurnResult {
 pub struct LlmClient {
     provider: String,
     model: String,
-    api_keys: Vec<String>,
+    keys: KeyRing,
     http: Client,
-    key_cursor: std::sync::Arc<AtomicUsize>,
     use_structured_output: bool,
     /// Custom OpenAI-compatible endpoint. Honored when `provider == "openai"`
     /// or `provider == "custom"`; ignored for other providers. `None` /
@@ -83,17 +82,6 @@ fn provider_supports_structured_output(provider: &str) -> bool {
     matches!(provider, "google" | "openai" | "custom")
 }
 
-/// Detect whether an error is a rate-limit (HTTP 429) so the key can be
-/// excluded from retries — waiting won't help within the same request.
-fn is_rate_limited(err: &anyhow::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("429")
-        && (msg.contains("Too Many Requests")
-            || msg.contains("RESOURCE_EXHAUSTED")
-            || msg.contains("rate")
-            || msg.contains("quota"))
-}
-
 impl LlmClient {
     /// Create a new client. Returns None if api_keys is empty.
     pub fn new(config: &LlmConfig) -> Option<Self> {
@@ -107,9 +95,8 @@ impl LlmClient {
         Some(Self {
             provider: config.provider.clone(),
             model: config.rerank_model.clone(),
-            api_keys: config.api_keys.clone(),
+            keys: KeyRing::new(config.api_keys.clone()),
             http,
-            key_cursor: std::sync::Arc::new(AtomicUsize::new(0)),
             use_structured_output: config.use_structured_output,
             openai_base_url: config.openai_base_url.clone(),
             openai_force_tool_use: config.openai_force_tool_use,
@@ -183,52 +170,12 @@ impl LlmClient {
         temperature: f32,
         structured: bool,
     ) -> Result<String> {
-        let n_keys = self.api_keys.len();
-        let start_cursor = self.key_cursor.fetch_add(1, Ordering::Relaxed) % n_keys;
-
-        let mut last_err = None;
-        let mut rate_limited: Vec<bool> = vec![false; n_keys];
-
-        // First pass — try each key once.
-        for offset in 0..n_keys {
-            let key_idx = (start_cursor + offset) % n_keys;
-            let key = &self.api_keys[key_idx];
-            match self
-                .call_provider(system, user, temperature, structured, key)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    if is_rate_limited(&e) {
-                        rate_limited[key_idx] = true;
-                    }
-                    warn!(key_index = key_idx, error = %e, "LLM call failed — trying next key");
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        // All keys failed — backoff 2s and retry non-rate-limited keys.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        for offset in 0..n_keys {
-            let key_idx = (start_cursor + offset) % n_keys;
-            if rate_limited[key_idx] {
-                continue;
-            }
-            let key = &self.api_keys[key_idx];
-            match self
-                .call_provider(system, user, temperature, structured, key)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap())
+        self.keys
+            .send("LLM call", |key| async move {
+                self.call_provider(system, user, temperature, structured, &key)
+                    .await
+            })
+            .await
     }
 
     /// Dispatch to the provider-specific tool-calling function.
@@ -326,66 +273,20 @@ impl LlmClient {
         force_tool_use: bool,
         prompt_cache_key: Option<&str>,
     ) -> Result<ToolTurnResult> {
-        let n_keys = self.api_keys.len();
-        let start_cursor = self.key_cursor.fetch_add(1, Ordering::Relaxed) % n_keys;
-
-        let mut last_err = None;
-        let mut rate_limited: Vec<bool> = vec![false; n_keys];
-
-        for offset in 0..n_keys {
-            let key_idx = (start_cursor + offset) % n_keys;
-            let key = &self.api_keys[key_idx];
-            match self
-                .call_provider_with_tools(
+        self.keys
+            .send("LLM tool-call", |key| async move {
+                self.call_provider_with_tools(
                     system,
                     contents,
                     tools,
                     temperature,
                     force_tool_use,
-                    key,
+                    &key,
                     prompt_cache_key,
                 )
                 .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    if is_rate_limited(&e) {
-                        rate_limited[key_idx] = true;
-                    }
-                    warn!(key_index = key_idx, error = %e, "LLM tool-call failed — trying next key");
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        for offset in 0..n_keys {
-            let key_idx = (start_cursor + offset) % n_keys;
-            if rate_limited[key_idx] {
-                continue;
-            }
-            let key = &self.api_keys[key_idx];
-            match self
-                .call_provider_with_tools(
-                    system,
-                    contents,
-                    tools,
-                    temperature,
-                    force_tool_use,
-                    key,
-                    prompt_cache_key,
-                )
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap())
+            })
+            .await
     }
 }
 
@@ -502,80 +403,32 @@ impl LlmClient {
         on_token: &TokenSink<'_>,
     ) -> Result<ToolTurnResult> {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let n_keys = self.api_keys.len();
-        let start_cursor = self.key_cursor.fetch_add(1, Ordering::Relaxed) % n_keys;
-
-        let mut last_err = None;
-        let mut rate_limited: Vec<bool> = vec![false; n_keys];
-
-        for offset in 0..n_keys {
-            let key_idx = (start_cursor + offset) % n_keys;
-            let key = &self.api_keys[key_idx];
-            let started = AtomicBool::new(false);
-            match self
-                .call_provider_with_tools_streaming(
+        self.keys
+            .send("LLM streaming tool-call", |key| async move {
+                let started = AtomicBool::new(false);
+                self.call_provider_with_tools_streaming(
                     system,
                     contents,
                     tools,
                     temperature,
                     force_tool_use,
-                    key,
+                    &key,
                     prompt_cache_key,
                     on_token,
                     &started,
                 )
                 .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    // Tokens already emitted on this key — cannot retry without
-                    // duplicating output. Surface the error to the caller.
+                .map_err(|e| {
+                    // Tokens already emitted on this key: retrying would
+                    // duplicate output, so the error goes to the caller.
                     if started.load(Ordering::Relaxed) {
-                        return Err(e);
+                        Failure::Stop(e)
+                    } else {
+                        Failure::Retry(e)
                     }
-                    if is_rate_limited(&e) {
-                        rate_limited[key_idx] = true;
-                    }
-                    warn!(key_index = key_idx, error = %e, "LLM streaming tool-call failed pre-stream — trying next key");
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        for offset in 0..n_keys {
-            let key_idx = (start_cursor + offset) % n_keys;
-            if rate_limited[key_idx] {
-                continue;
-            }
-            let key = &self.api_keys[key_idx];
-            let started = AtomicBool::new(false);
-            match self
-                .call_provider_with_tools_streaming(
-                    system,
-                    contents,
-                    tools,
-                    temperature,
-                    force_tool_use,
-                    key,
-                    prompt_cache_key,
-                    on_token,
-                    &started,
-                )
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(e) => {
-                    if started.load(Ordering::Relaxed) {
-                        return Err(e);
-                    }
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap())
+                })
+            })
+            .await
     }
 }
 

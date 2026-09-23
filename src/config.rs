@@ -1983,13 +1983,6 @@ mod tests {
         );
     }
 
-    /// Blast-radius guard: a config from EVERY prior schema version (1..=12)
-    /// must run the full migration chain — including the terminal v12→v13 —
-    /// so `file-retrieval` is stripped no matter which build the user upgraded
-    /// from. v3 was the last version before `enabled_mcp_tools` existed; the
-    /// v3→v4 migration injects both tools, then v12→v13 removes file-retrieval,
-    /// leaving codebase-retrieval. This pins that no old version escapes the
-    /// opt-in switch.
     /// Writes a v13 settings file whose `llm` block is `llm_json` and loads it.
     fn load_v13_with_llm(llm_json: &str) -> (TempDir, Settings) {
         let home = TempDir::new().expect("tempdir");
@@ -2070,6 +2063,13 @@ mod tests {
         assert_eq!(back, llm);
     }
 
+    /// Blast-radius guard: a config from EVERY prior schema version (1..=12)
+    /// must run the full migration chain — including the terminal v12→v13 —
+    /// so `file-retrieval` is stripped no matter which build the user upgraded
+    /// from. v3 was the last version before `enabled_mcp_tools` existed; the
+    /// v3→v4 migration injects both tools, then v12→v13 removes file-retrieval,
+    /// leaving codebase-retrieval. This pins that no old version escapes the
+    /// opt-in switch.
     #[test]
     fn test_all_prior_versions_migrate_and_drop_file_retrieval() {
         for from in 1..=12u32 {

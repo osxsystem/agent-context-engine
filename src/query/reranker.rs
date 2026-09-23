@@ -1,8 +1,10 @@
+use crate::config::LlmConfig;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::{ChatMessage, LlmClient, ToolDef, ToolResult, ToolTurnResult};
 use crate::query::engine::{QueryGraphMode, read_lines_from_fs, run_sub_query, slice_numbered};
 use crate::query::filters::{ParsedQuery, QueryFilters};
+use crate::query::jev::JevReranker;
 use crate::query::merger::MergeChunk;
 use regex::Regex;
 use std::collections::HashMap;
@@ -121,19 +123,21 @@ pub trait Reranker {
 /// and fails, results come back in similarity order with a skip reason, never
 /// reranked by the LLM provider instead.
 pub enum RerankProvider {
-    /// An LLM provider (`google`/`openai`/`custom`). `None` when it has no key
-    /// or reranking is switched off; that degrades to similarity order.
+    /// Reranking was not requested: similarity order, saying so.
+    Off,
+    /// An LLM provider (`google`/`openai`/`custom`). `None` when it has no key;
+    /// that degrades to similarity order.
     Llm(Option<LlmClient>),
-    Jev(crate::query::jev::JevReranker),
+    Jev(JevReranker),
 }
 
 impl RerankProvider {
     /// The provider `llm.rerank_provider()` names. An LLM rerank provider is
     /// served with the LLM keys and endpoint already configured.
-    pub fn from_settings(llm: &crate::config::LlmConfig) -> Self {
+    pub fn from_settings(llm: &LlmConfig) -> Self {
         match llm.rerank_provider() {
-            "jev" => Self::Jev(crate::query::jev::JevReranker::new(llm)),
-            provider => Self::Llm(LlmClient::new(&crate::config::LlmConfig {
+            "jev" => Self::Jev(JevReranker::new(llm)),
+            provider => Self::Llm(LlmClient::new(&LlmConfig {
                 provider: provider.to_owned(),
                 ..llm.clone()
             })),
@@ -145,7 +149,7 @@ impl RerankProvider {
     pub fn llm_client(&self) -> Option<&LlmClient> {
         match self {
             Self::Llm(client) => client.as_ref(),
-            Self::Jev(_) => None,
+            Self::Off | Self::Jev(_) => None,
         }
     }
 }
@@ -153,6 +157,19 @@ impl RerankProvider {
 impl Reranker for RerankProvider {
     async fn rerank(&self, req: RerankRequest<'_>) -> RerankOutput {
         match self {
+            Self::Off => {
+                let n = req.chunks.len();
+                RerankOutput {
+                    reranked_indices: (0..n).collect(),
+                    line_selections: vec![None; n],
+                    raw_request: String::new(),
+                    raw_response: String::new(),
+                    elapsed_ms: 0,
+                    fallback_used: false,
+                    skip_reason: Some("reranking was not requested".to_owned()),
+                    relevance: Vec::new(),
+                }
+            }
             Self::Llm(client) => {
                 LlmReranker {
                     client: client.as_ref(),
@@ -1898,6 +1915,30 @@ mod tests {
             symbol_fqn: None,
             symbol_kind: None,
         }
+    }
+
+    // ── RerankProvider::Off ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn off_keeps_similarity_order_and_says_reranking_was_not_requested() {
+        let chunks = [chunk(1, 5), chunk(6, 9)];
+        let spans = RerankRequest::no_spans(chunks.len());
+        let out = RerankProvider::Off
+            .rerank(RerankRequest {
+                query: "q",
+                chunks: &chunks,
+                numbered: &[None, None],
+                caller_stats: &[None, None],
+                min_prune_lines: 16,
+                candidate_spans: &spans,
+            })
+            .await;
+        assert_eq!(out.reranked_indices, vec![0, 1]);
+        assert!(!out.fallback_used);
+        assert_eq!(
+            out.skip_reason.as_deref(),
+            Some("reranking was not requested")
+        );
     }
 
     // ── sanitize_ranges ──────────────────────────────────────────────────

@@ -45,6 +45,10 @@ pub struct CodeResult {
     /// Number of callees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callees: Option<u32>,
+    /// The reranker's relevance probability for the candidate this result
+    /// came from. Absent when the reranker yields no probabilities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -63,10 +67,6 @@ pub struct RerankInfo {
     pub raw_response: String,
     pub fallback_used: bool,
     pub skip_reason: Option<String>,
-    /// The reranker's relevance probability per candidate, in the order the
-    /// candidates were handed to it (similarity order, before content
-    /// filtering). Empty when the reranker yields no probabilities.
-    pub relevance: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +115,7 @@ struct ChunkContentRow {
 /// embed → vector search → graph expand → merge → rerank → format.
 ///
 /// `repo_filter`: if Some, only return results from that repo path prefix.
-/// `reranker`: `RerankProvider::Llm(None)` skips the rerank step.
+/// `reranker`: `RerankProvider::Off` skips the rerank step.
 /// `warm_wait`: max time to block warming a cold single-repo shard before search.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
@@ -443,6 +443,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
         let caller_names = stats.map(|s| s.caller_names.clone()).unwrap_or_default();
         let callee_names = stats.map(|s| s.callee_names.clone()).unwrap_or_default();
         let callees = stats.map(|s| s.callee_count);
+        let relevance = rerank_output.relevance.get(idx).copied();
         let numbered_text = res_numbered.get(idx).and_then(|n| n.as_deref());
         let selection = rerank_output
             .line_selections
@@ -463,6 +464,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                         caller_names: caller_names.clone(),
                         callee_names: callee_names.clone(),
                         callees,
+                        relevance,
                     });
                 }
             }
@@ -478,6 +480,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 caller_names: caller_names.clone(),
                 callee_names: callee_names.clone(),
                 callees,
+                relevance,
             }),
             (None, _) => results.push(CodeResult {
                 file: chunk.file.clone(),
@@ -491,6 +494,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 caller_names: caller_names.clone(),
                 callee_names: callee_names.clone(),
                 callees,
+                relevance,
             }),
         }
     }
@@ -524,6 +528,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             caller_names: stats.map(|s| s.caller_names.clone()).unwrap_or_default(),
             callee_names: stats.map(|s| s.callee_names.clone()).unwrap_or_default(),
             callees: stats.map(|s| s.callee_count),
+            relevance: rerank_output.relevance.get(i).copied(),
         });
     }
 
@@ -536,7 +541,6 @@ pub(crate) async fn run_query_with_filters_and_mode(
         raw_response: rerank_output.raw_response,
         fallback_used: rerank_output.fallback_used,
         skip_reason: rerank_output.skip_reason,
-        relevance: rerank_output.relevance,
     };
 
     Ok(QueryResult {

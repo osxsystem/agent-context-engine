@@ -189,7 +189,7 @@ pub async fn run_query_op(
     let reranker = if rerank {
         RerankProvider::from_settings(&settings.llm)
     } else {
-        RerankProvider::Llm(None)
+        RerankProvider::Off
     };
 
     let top_k = top_k.max(1);

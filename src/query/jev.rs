@@ -21,14 +21,19 @@ use crate::query::reranker::{RerankOutput, RerankRequest, Reranker};
 
 /// TypeSafe's public API; overridden by `llm.jev_base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
-/// The vendor's stable alias, used unless `llm.rerank_model` names a Jev model.
-pub const DEFAULT_MODEL: &str = "jev-latest";
+/// The vendor's stable alias. `llm.rerank_model` is not consulted: the LLM path
+/// and chat share it, so a Jev name there would break them.
+pub const MODEL: &str = "jev-latest";
 /// Requests in flight at once for one rerank. A query fans out one request per
 /// candidate (~30), so this is what keeps a single query from bursting through
 /// the per-minute quota.
 pub const MAX_CONCURRENT_REQUESTS: usize = 8;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole fan-out must finish within this, or the query degrades to
+/// similarity order. It also bounds a client that failed to build with its
+/// per-request timeouts.
+pub const RERANK_DEADLINE: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const RELEVANCE_INSTRUCTIONS: &str = "Does this code implement or define what the query asks for?";
@@ -40,7 +45,7 @@ const RELEVANCE_FALSE: &str = "The code is unrelated to the query, or only menti
 pub struct JevReranker {
     http: reqwest::Client,
     url: String,
-    model: String,
+    deadline: Duration,
     /// Empty when no TypeSafe key is configured; reranking then degrades.
     api_keys: Vec<String>,
 }
@@ -52,15 +57,10 @@ impl JevReranker {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .unwrap_or_default();
-        let model = if config.rerank_model.trim().starts_with("jev-") {
-            config.rerank_model.trim().to_owned()
-        } else {
-            DEFAULT_MODEL.to_owned()
-        };
         Self {
             http,
             url: systemone_url(config.jev_base_url.as_deref()),
-            model,
+            deadline: RERANK_DEADLINE,
             api_keys: config
                 .jev_api_keys
                 .iter()
@@ -70,12 +70,18 @@ impl JevReranker {
         }
     }
 
+    /// Replaces [`RERANK_DEADLINE`] for this reranker.
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     /// The request body for one candidate.
     fn request_body(&self, query: &str, req: &RerankRequest<'_>, i: usize) -> Value {
         let chunk = &req.chunks[i];
         let code = req.numbered[i].as_deref().unwrap_or(&chunk.content);
         json!({
-            "model": self.model,
+            "model": MODEL,
             "state": {
                 "query": query,
                 "file_path": chunk.file,
@@ -135,6 +141,19 @@ impl Reranker for JevReranker {
                 relevance: Vec::new(),
             };
 
+        if n == 0 {
+            return RerankOutput {
+                reranked_indices: Vec::new(),
+                line_selections: Vec::new(),
+                raw_request: String::new(),
+                raw_response: String::new(),
+                elapsed_ms: 0,
+                fallback_used: false,
+                skip_reason: None,
+                relevance: Vec::new(),
+            };
+        }
+
         // Rotation across keys and 429 retry are not implemented yet; the
         // first key serves every request.
         let Some(key) = self.api_keys.first() else {
@@ -153,14 +172,20 @@ impl Reranker for JevReranker {
         // requests are in flight; the first failure stops the rest.
         // Futures are lazy: building them all up front sends nothing.
         let requests: Vec<_> = bodies.iter().map(|body| self.ask(key, body)).collect();
-        let answers: Result<Vec<(f64, Value)>> = futures::stream::iter(requests)
+        let fan_out = futures::stream::iter(requests)
             .buffered(MAX_CONCURRENT_REQUESTS)
-            .try_collect()
-            .await;
-        let answers = match answers {
-            Ok(a) => a,
-            Err(e) => {
+            .try_collect::<Vec<(f64, Value)>>();
+        let answers = match tokio::time::timeout(self.deadline, fan_out).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
                 return similarity_order(format!("Jev request failed: {e:#}"), true, raw_request);
+            }
+            Err(_) => {
+                return similarity_order(
+                    format!("Jev reranking missed its {:?} deadline", self.deadline),
+                    true,
+                    raw_request,
+                );
             }
         };
 

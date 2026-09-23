@@ -204,8 +204,10 @@ async fn jev_orders_by_relevance_probability_and_serializes_the_request() {
     );
 }
 
+/// `rerank_model` belongs to the LLM path (chat uses it too), so whatever it
+/// holds, Jev asks for the vendor's stable alias.
 #[tokio::test]
-async fn jev_sends_a_configured_jev_model_name() {
+async fn jev_sends_the_stable_alias_whatever_rerank_model_holds() {
     let mock = MockJev::answering(&[]);
     let base = mock.serve().await;
     let config = LlmConfig {
@@ -221,7 +223,7 @@ async fn jev_sends_a_configured_jev_model_name() {
         1,
         "base URL given as …/v1/ still reaches the endpoint"
     );
-    assert_eq!(requests[0].body["model"], "jev-preview");
+    assert_eq!(requests[0].body["model"], "jev-latest");
 }
 
 #[tokio::test]
@@ -373,4 +375,51 @@ async fn jev_selected_without_a_key_never_substitutes_the_llm_provider() {
             .expect("skip reason")
             .contains("TypeSafe API key")
     );
+}
+
+/// One deadline bounds the whole fan-out: a stalled endpoint degrades the
+/// query promptly instead of holding it for every request's own timeout.
+#[tokio::test]
+async fn jev_past_its_deadline_keeps_similarity_order_and_says_why() {
+    let mock = MockJev {
+        delay: Duration::from_secs(5),
+        ..MockJev::answering(&[("a.rs", 0.1), ("b.rs", 0.9)])
+    };
+    let base = mock.serve().await;
+    let reranker = JevReranker::new(&jev_config(Some(base), &["ts-key"]))
+        .with_deadline(Duration::from_millis(200));
+
+    let started = std::time::Instant::now();
+    let out = rerank(
+        &reranker,
+        "q",
+        &[chunk("a.rs", "alpha"), chunk("b.rs", "beta")],
+    )
+    .await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(out.reranked_indices, vec![0, 1]);
+    assert!(out.fallback_used);
+    let reason = out.skip_reason.expect("skip reason");
+    assert!(
+        reason.contains("Jev") && reason.contains("deadline"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn jev_with_no_candidates_sends_nothing() {
+    let mock = MockJev::answering(&[]);
+    let base = mock.serve().await;
+    let reranker = JevReranker::new(&jev_config(Some(base), &["ts-key"]));
+
+    let out = rerank(&reranker, "q", &[]).await;
+
+    assert!(out.reranked_indices.is_empty());
+    assert_eq!(out.skip_reason, None);
+    assert!(mock.captured().is_empty());
 }

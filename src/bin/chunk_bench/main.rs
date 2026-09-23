@@ -24,8 +24,9 @@
 //!   chunk_bench <repo_path> <legacy_url> <ab_out.json> --ab --new-server <new_url>
 //!   chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--top-k N] [--cases N] [--compare prior.json]
 //!
-//! `--rerank-ab` needs a server with agentic RAG off; `scripts/rerank_bench.sh`
-//! boots one privately against the real index without touching settings.json.
+//! `--rerank-ab` needs a server with agentic RAG off unless Jev is the rerank
+//! provider; `scripts/rerank_bench.sh` boots one privately against the real
+//! index without touching settings.json.
 //!
 //! Example (single):
 //!   chunk_bench /path/to/repo http://localhost:6699 baseline.json --label baseline
@@ -526,6 +527,9 @@ struct QueryResultRow {
     line_start: u32,
     line_end: u32,
     file: String,
+    /// The reranker's probability for this candidate, when it gives one (Jev).
+    #[serde(default)]
+    relevance: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]

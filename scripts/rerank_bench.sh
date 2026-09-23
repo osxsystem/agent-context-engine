@@ -14,6 +14,9 @@
 #   scripts/rerank_bench.sh <label> [repo_path]
 # Env:
 #   RERANK_MODEL  override llm.rerank_model for this run only
+#   RERANK_PROVIDER override llm.rerank_provider for this run only (e.g. jev)
+#   JEV_API_KEYS  comma-separated TypeSafe keys for this run only; written to the
+#                 temp settings copy, never to an artifact
 #   COMPARE       path to a prior artifact; prints cross-run deltas (the A/B axis)
 #   TOP_K         default 10
 #   CASES         default 50; each case is one rerank LLM call, so sample scarce-quota models
@@ -68,9 +71,12 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "${TMP_HOME}/.vibervn/context-engine"
-jq --arg d "$REAL_CE" --arg repo "$REPO" --arg model "${RERANK_MODEL:-}" '
+jq --arg d "$REAL_CE" --arg repo "$REPO" --arg model "${RERANK_MODEL:-}" \
+   --arg provider "${RERANK_PROVIDER:-}" --arg jev_keys "${JEV_API_KEYS:-}" '
   .llm.agentic_rag = false
   | (if $model != "" then .llm.rerank_model = $model else . end)
+  | (if $provider != "" then .llm.rerank_provider = $provider else . end)
+  | (if $jev_keys != "" then .llm.jev_api_keys = ($jev_keys | split(",") | map(select(. != ""))) else . end)
   | .data_dir = (.data_dir // $d)
   | .embeddings_dir = (.embeddings_dir // ($d + "/embeddings"))
   | .repos = [$repo]
@@ -88,7 +94,7 @@ if curl -sS -m 2 -o /dev/null "${URL}/" 2>/dev/null; then
   exit 1
 fi
 
-echo "[rerank_bench] booting private server on ${URL} (agentic_rag=false${RERANK_MODEL:+, model=$RERANK_MODEL}) ..."
+echo "[rerank_bench] booting private server on ${URL} (agentic_rag=false${RERANK_PROVIDER:+, provider=$RERANK_PROVIDER}${RERANK_MODEL:+, model=$RERANK_MODEL}) ..."
 "${CRATE_DIR}/target/release/context-engine-rs" --port "$PORT" --home-dir "$TMP_HOME" \
   > "${TMP_HOME}/server.log" 2>&1 &
 SERVER_PID=$!
@@ -107,18 +113,24 @@ ARGS=("$REPO" "$URL" "$OUT_JSON" --rerank-ab --label "$LABEL" --top-k "$TOP_K" -
 REPRODUCE="scripts/rerank_bench.sh ${LABEL} ${REPO}"
 [ -n "${CASES:-}" ] && REPRODUCE="CASES=${CASES} ${REPRODUCE}"
 [ -n "${RERANK_MODEL:-}" ] && REPRODUCE="RERANK_MODEL=${RERANK_MODEL} ${REPRODUCE}"
+[ -n "${RERANK_PROVIDER:-}" ] && REPRODUCE="RERANK_PROVIDER=${RERANK_PROVIDER} ${REPRODUCE}"
 jq --slurpfile real "${REAL_CE}/settings.json" \
-   --arg model "${RERANK_MODEL:-}" --arg note "${NOTE:-}" --arg cmd "$REPRODUCE" \
+   --arg model "${RERANK_MODEL:-}" --arg provider "${RERANK_PROVIDER:-}" \
+   --arg note "${NOTE:-}" --arg cmd "$REPRODUCE" \
    --arg sha "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" '
-  .reproduce_cmd = $cmd
+  # The effective rerank provider: llm.rerank_provider, else llm.provider.
+  ($real[0].llm.rerank_provider // "" | if test("^\\s*$") then $real[0].llm.provider else . end) as $p
+  | .reproduce_cmd = $cmd
   | .provenance = {
       configured_reranker: {
-        provider: $real[0].llm.provider,
-        model: $real[0].llm.rerank_model,
+        provider: $p,
+        # Jev ignores llm.rerank_model; .reranker in the artifact names its model.
+        model: (if $p == "jev" then null else $real[0].llm.rerank_model end),
         agentic_rag: $real[0].llm.agentic_rag
       },
       overrides: ({agentic_rag: false}
-        + (if $model != "" then {rerank_model: $model} else {} end)),
+        + (if $model != "" then {rerank_model: $model} else {} end)
+        + (if $provider != "" then {rerank_provider: $provider} else {} end)),
       corpus_commit: $sha,
       note: (if $note != "" then $note else null end)
     }

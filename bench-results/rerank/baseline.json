@@ -1,0 +1,58 @@
+{
+  "label": "baseline",
+  "timestamp_unix": 1790130802,
+  "repo": "/Users/hugues_mini/Codes/AgentTools/agent-context-engine",
+  "server": "http://127.0.0.1:7911",
+  "top_k": 10,
+  "eval_cases": 50,
+  "queries_scored": 50,
+  "reranker": {
+    "provider": "custom",
+    "model": "ag/gpt-oss-120b-medium",
+    "agentic_rag": false
+  },
+  "no_rerank": {
+    "label": "no-rerank (merge order)",
+    "recall_at_1": 0.66,
+    "recall_at_5": 0.94,
+    "recall_at_10": 0.96,
+    "mean_iou": 0.4171468017674283
+  },
+  "reranked": {
+    "label": "baseline",
+    "recall_at_1": 0.8,
+    "recall_at_5": 0.96,
+    "recall_at_10": 0.96,
+    "mean_iou": 0.5830158707828996
+  },
+  "deltas": {
+    "recall_at_1": 0.14,
+    "recall_at_5": 0.020000000000000018,
+    "recall_at_10": 0.0,
+    "mean_iou": 0.16586906901547133
+  },
+  "rerank_ms": {
+    "samples": 49,
+    "min_ms": 2349,
+    "p50_ms": 10067,
+    "p95_ms": 23532,
+    "max_ms": 23655
+  },
+  "rerank_skipped": 0,
+  "skip_reasons": {},
+  "rerank_not_run": 1,
+  "reproduce_cmd": "RERANK_MODEL=ag/gpt-oss-120b-medium scripts/rerank_bench.sh baseline /Users/hugues_mini/Codes/AgentTools/agent-context-engine",
+  "provenance": {
+    "configured_reranker": {
+      "provider": "custom",
+      "model": "ag/gemini-3.8-flash",
+      "agentic_rag": true
+    },
+    "overrides": {
+      "agentic_rag": false,
+      "rerank_model": "ag/gpt-oss-120b-medium"
+    },
+    "corpus_commit": "a2f0f8fb09b537a665d587cfe3dabe36803ed729",
+    "note": "Substitute baseline: the configured ag/gemini-3.8-flash (and ag/gemini-3-flash) returned 429 QUOTA_EXHAUSTED until 2026-09-28; the owner chose ag/gpt-oss-120b-medium. agentic_rag forced off because an agentic loop cannot be compared against a single-shot reranker."
+  }
+}

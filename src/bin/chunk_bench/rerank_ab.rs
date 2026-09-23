@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::eval::derive_eval_set;
 use crate::scoring::{RankingScore, RecallTally, ScoreDeltas};
-use crate::{EVAL_LIMIT, QueryResultRow};
+use crate::{EVAL_LIMIT, QueryResultRow, warm_up};
 
 /// Nearest-rank percentiles over the per-query rerank-stage latencies.
 ///
@@ -83,9 +83,9 @@ pub struct RerankAbReport {
     pub queries_scored: u64,
     pub reranker: RerankerDescriptor,
     /// Ranking as the reranker received it — the no-rerank control.
-    pub baseline: RankingScore,
+    pub no_rerank: RankingScore,
     /// Ranking as the reranker returned it.
-    pub candidate: RankingScore,
+    pub reranked: RankingScore,
     pub deltas: ScoreDeltas,
     /// Latency of the rerank stage, over queries where it actually ran.
     pub rerank_ms: LatencySummary,
@@ -94,6 +94,10 @@ pub struct RerankAbReport {
     /// counting it would drag p50 down and make a broken reranker look fast.
     pub rerank_skipped: u64,
     pub skip_reasons: BTreeMap<String, u64>,
+    /// Queries with no candidates to rank, so the rerank stage never ran. Still
+    /// scored (a miss is a miss), but excluded from `rerank_ms` like skips.
+    #[serde(default)]
+    pub rerank_not_run: u64,
     pub reproduce_cmd: String,
 }
 
@@ -142,6 +146,71 @@ struct LlmConfigView {
     agentic_rag: Option<bool>,
 }
 
+// ─── Guards ─────────────────────────────────────────────────────────────────
+
+/// Why this server configuration cannot produce a meaningful A/B, if it can't.
+///
+/// Agentic RAG routes reranking through a tool-calling loop, and a decision
+/// model cannot call tools, so a run taken with it on compares nothing. This was
+/// once a warning; a warning did not stop an artifact being written from exactly
+/// that run, so it is a refusal now. An unreadable config (`None`) is allowed —
+/// an older server must stay benchmarkable.
+fn config_refusal(d: &RerankerDescriptor) -> Option<String> {
+    (d.agentic_rag == Some(true)).then(|| {
+        "the server has agentic_rag ENABLED: reranking runs through a tool-calling loop, not \
+         the single-shot reranker, so the numbers would not compare rerankers. Set \
+         agentic_rag=false and re-run."
+            .to_owned()
+    })
+}
+
+/// What the rerank stage did for one query.
+#[derive(Debug, PartialEq)]
+enum RerankOutcome<'a> {
+    /// Ranked real candidates. The only case that yields a latency sample; the
+    /// sample itself stays optional, see `Timing::rerank_ms`.
+    Ran(Option<u64>),
+    /// Degraded to merge order, with the reason.
+    Skipped(&'a str),
+    /// Had nothing to rank. Both the engine (empty vector search) and the
+    /// reranker (empty candidate list) return early at ~0 ms with no skip
+    /// reason, so without this case they would pass for instant reranks.
+    NotRun,
+}
+
+fn rerank_outcome(resp: &RerankQueryResp) -> RerankOutcome<'_> {
+    if resp.pre_rerank_results.is_empty() {
+        return RerankOutcome::NotRun;
+    }
+    match resp.rerank.as_ref() {
+        None => RerankOutcome::NotRun,
+        Some(RerankInfoRow {
+            skip_reason: Some(reason),
+        }) => RerankOutcome::Skipped(reason),
+        Some(_) => RerankOutcome::Ran(resp.timing.rerank_ms),
+    }
+}
+
+/// Longest skip-reason prefix kept as a `skip_reasons` key.
+const SKIP_BUCKET_CHARS: usize = 120;
+
+/// Collapse a skip reason to a stable, readable bucket key.
+///
+/// Transport failures carry the upstream error body verbatim, including quota
+/// countdowns and request ids, so keying on the raw string gives every failure
+/// its own bucket and a report full of kilobyte-long JSON keys. The first line,
+/// whitespace-collapsed and cut at `SKIP_BUCKET_CHARS`, names the failure kind.
+fn skip_bucket(reason: &str) -> String {
+    let first_line = reason.lines().next().unwrap_or("");
+    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= SKIP_BUCKET_CHARS {
+        return collapsed;
+    }
+    let mut cut: String = collapsed.chars().take(SKIP_BUCKET_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────────
 
 pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare: Option<&str>) {
@@ -163,19 +232,23 @@ pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare
     let mut post = RecallTally::default();
     let mut rerank_samples: Vec<u64> = Vec::new();
     let mut rerank_skipped = 0u64;
+    let mut rerank_not_run = 0u64;
     let mut skip_reasons: BTreeMap<String, u64> = BTreeMap::new();
 
     let descriptor = rt.block_on(fetch_descriptor(&client, server));
-    if descriptor.agentic_rag == Some(true) {
-        eprintln!(
-            "[chunk_bench] WARNING: the server has agentic_rag ENABLED. Reranking is routed \
-             through a tool-calling loop, not the single-shot reranker. A decision model cannot \
-             call tools, so these numbers are NOT a fair baseline for a single-shot reranker \
-             comparison. Set agentic_rag=false and re-run."
-        );
+    // Recall@10 is scored against the returned top-k; asked for fewer than ten,
+    // it would silently equal recall@top_k while still being labelled @10.
+    if top_k < 10 {
+        eprintln!("[chunk_bench] ERROR: --top-k must be at least 10 for recall@10 to mean anything");
+        std::process::exit(2);
+    }
+    if let Some(why) = config_refusal(&descriptor) {
+        eprintln!("[chunk_bench] ERROR: refusing to run: {why}");
+        std::process::exit(2);
     }
 
     rt.block_on(async {
+        warm_up(&client, server, repo).await;
         for case in &cases {
             let exp_file_norm = case.file.to_lowercase();
             let body = serde_json::json!({
@@ -204,18 +277,25 @@ pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare
                 }
             };
 
-            let skipped = parsed.rerank.as_ref().and_then(|r| r.skip_reason.clone());
-            match skipped {
-                Some(reason) => {
+            match rerank_outcome(&parsed) {
+                // A reranker that cannot serve the first query is almost always
+                // down for the whole run (quota, key, endpoint), and each failed
+                // attempt can cost the full retry budget. Stop before spending
+                // minutes on an artifact that measures an absent reranker.
+                RerankOutcome::Skipped(reason) if post.observed() == 0 => {
+                    eprintln!(
+                        "[chunk_bench] ERROR: the reranker skipped the first scored query; nothing \
+                         written. Reason: {reason}"
+                    );
+                    std::process::exit(3);
+                }
+                RerankOutcome::Skipped(reason) => {
                     rerank_skipped += 1;
-                    *skip_reasons.entry(reason).or_insert(0) += 1;
+                    *skip_reasons.entry(skip_bucket(reason)).or_insert(0) += 1;
                 }
                 // Only time reranks that actually happened.
-                None => {
-                    if let Some(ms) = parsed.timing.rerank_ms {
-                        rerank_samples.push(ms);
-                    }
-                }
+                RerankOutcome::Ran(ms) => rerank_samples.extend(ms),
+                RerankOutcome::NotRun => rerank_not_run += 1,
             }
 
             let exp = (case.line_start, case.line_end);
@@ -224,9 +304,9 @@ pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare
         }
     });
 
-    let baseline = pre.finish("no-rerank (merge order)");
-    let candidate = post.finish(label);
-    let deltas = ScoreDeltas::between(&candidate, &baseline);
+    let no_rerank = pre.finish("no-rerank (merge order)");
+    let reranked = post.finish(label);
+    let deltas = ScoreDeltas::between(&reranked, &no_rerank);
     let queries_scored = post.observed();
 
     let report = RerankAbReport {
@@ -241,12 +321,13 @@ pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare
         eval_cases: cases.len() as u64,
         queries_scored,
         reranker: descriptor,
-        baseline,
-        candidate,
+        no_rerank,
+        reranked,
         deltas,
         rerank_ms: LatencySummary::from_samples(rerank_samples),
         rerank_skipped,
         skip_reasons,
+        rerank_not_run,
         reproduce_cmd: format!(
             "cargo run --release --bin chunk_bench -- {repo} {server} {out} --rerank-ab --label {label} --top-k {top_k}"
         ),
@@ -257,9 +338,16 @@ pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare
     }
     if report.rerank_skipped > 0 {
         eprintln!(
-            "[chunk_bench] WARNING: the reranker degraded on {}/{} scored queries ({:?}). The \
-             deltas measure an absent reranker, not a bad one.",
+            "[chunk_bench] WARNING: the reranker degraded on {}/{} scored queries ({:?}). On \
+             those queries the deltas measure an absent reranker, not a bad one.",
             report.rerank_skipped, report.queries_scored, report.skip_reasons
+        );
+    }
+    if report.rerank_not_run > 0 {
+        eprintln!(
+            "[chunk_bench] WARNING: {}/{} scored queries had no candidates, so the reranker \
+             never ran on them.",
+            report.rerank_not_run, report.queries_scored
         );
     }
 
@@ -324,7 +412,7 @@ fn compare_runs(prior_path: &str, current: &RerankAbReport) -> Result<String, St
         ));
     }
 
-    let d = ScoreDeltas::between(&current.candidate, &prior.candidate);
+    let d = ScoreDeltas::between(&current.reranked, &prior.reranked);
     let mut out = format!(
         "=== cross-run deltas: {} (current) − {} (prior) ===\n\
          recall@1   {:+.4}   ({:.4} vs {:.4})\n\
@@ -335,17 +423,17 @@ fn compare_runs(prior_path: &str, current: &RerankAbReport) -> Result<String, St
         current.label,
         prior.label,
         d.recall_at_1,
-        current.candidate.recall_at_1,
-        prior.candidate.recall_at_1,
+        current.reranked.recall_at_1,
+        prior.reranked.recall_at_1,
         d.recall_at_5,
-        current.candidate.recall_at_5,
-        prior.candidate.recall_at_5,
+        current.reranked.recall_at_5,
+        prior.reranked.recall_at_5,
         d.recall_at_10,
-        current.candidate.recall_at_10,
-        prior.candidate.recall_at_10,
+        current.reranked.recall_at_10,
+        prior.reranked.recall_at_10,
         d.mean_iou,
-        current.candidate.mean_iou,
-        prior.candidate.mean_iou,
+        current.reranked.mean_iou,
+        prior.reranked.mean_iou,
         current.rerank_ms.p50_ms as i64 - prior.rerank_ms.p50_ms as i64,
         current.rerank_ms.p50_ms,
         prior.rerank_ms.p50_ms,
@@ -375,6 +463,87 @@ mod tests {
         assert_eq!((s.min_ms, s.p50_ms, s.max_ms), (10, 50, 90));
         let one = LatencySummary::from_samples(vec![42]);
         assert_eq!((one.samples, one.p50_ms, one.p95_ms), (1, 42, 42));
+    }
+
+    fn resp(pre: usize, rerank_ms: Option<u64>, rerank: Option<Option<&str>>) -> RerankQueryResp {
+        let rows = (0..pre)
+            .map(|i| QueryResultRow {
+                file: "/r/a.rs".to_owned(),
+                line_start: i as u32 + 1,
+                line_end: i as u32 + 1,
+            })
+            .collect();
+        RerankQueryResp {
+            results: vec![],
+            pre_rerank_results: rows,
+            timing: Timing { rerank_ms },
+            rerank: rerank.map(|r| RerankInfoRow {
+                skip_reason: r.map(str::to_owned),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_rerank_over_candidates_is_a_latency_sample() {
+        let r = resp(10, Some(900), Some(None));
+        assert_eq!(rerank_outcome(&r), RerankOutcome::Ran(Some(900)));
+    }
+
+    #[test]
+    fn a_skip_reason_is_a_skip() {
+        let r = resp(10, Some(18_000), Some(Some("quota")));
+        assert_eq!(rerank_outcome(&r), RerankOutcome::Skipped("quota"));
+    }
+
+    #[test]
+    fn no_candidates_means_the_reranker_never_ran() {
+        // The engine returns early with `rerank: None` and 0 ms when vector
+        // search finds nothing; counted as a sample, that 0 ms drags p50 down.
+        assert_eq!(rerank_outcome(&resp(0, Some(0), None)), RerankOutcome::NotRun);
+        // The reranker itself also returns early, without a skip reason, when
+        // handed an empty candidate list.
+        assert_eq!(rerank_outcome(&resp(0, Some(0), Some(None))), RerankOutcome::NotRun);
+    }
+
+    #[test]
+    fn agentic_rag_on_refuses_the_run() {
+        let d = RerankerDescriptor {
+            agentic_rag: Some(true),
+            ..Default::default()
+        };
+        assert!(config_refusal(&d).is_some());
+    }
+
+    #[test]
+    fn agentic_rag_off_or_unknown_is_allowed() {
+        let off = RerankerDescriptor {
+            agentic_rag: Some(false),
+            ..Default::default()
+        };
+        assert!(config_refusal(&off).is_none());
+        // An unreadable /api/config must not block a run against an older server.
+        assert!(config_refusal(&RerankerDescriptor::default()).is_none());
+    }
+
+    #[test]
+    fn skip_bucket_keeps_short_reasons_verbatim() {
+        assert_eq!(
+            skip_bucket("TypeSafe key missing"),
+            "TypeSafe key missing"
+        );
+    }
+
+    #[test]
+    fn skip_bucket_groups_errors_that_differ_only_in_their_tail() {
+        // Upstream error bodies embed countdowns and request ids, so two
+        // failures of the same kind must land in the same bucket.
+        let prefix = "LLM request failed: OpenAI API returned HTTP 503 Service Unavailable: \
+                      {\"error\":{\"message\":\"[antigravity/gemini-3-flash] [429]";
+        let a = format!("{prefix}\n  Resets in 119h56m45s");
+        let b = format!("{prefix}\n  Resets in 119h12m03s");
+        assert_eq!(skip_bucket(&a), skip_bucket(&b));
+        assert!(skip_bucket(&a).chars().count() <= SKIP_BUCKET_CHARS + 1);
+        assert!(!skip_bucket(&a).contains('\n'));
     }
 
     #[test]

@@ -24,6 +24,9 @@
 //!   chunk_bench <repo_path> <legacy_url> <ab_out.json> --ab --new-server <new_url>
 //!   chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--top-k N] [--compare prior.json]
 //!
+//! `--rerank-ab` needs a server with agentic RAG off; `scripts/rerank_bench.sh`
+//! boots one privately against the real index without touching settings.json.
+//!
 //! Example (single):
 //!   chunk_bench /path/to/repo http://localhost:6699 baseline.json --label baseline
 //!
@@ -509,6 +512,42 @@ struct QueryResp {
     results: Vec<QueryResultRow>,
 }
 
+/// Wait until the server answers a query for `repo` with results.
+///
+/// The router spawns a per-repo worker on the first request for that repo, and
+/// a query that arrives while it is still loading comes back empty. Scored, that
+/// empty answer is indistinguishable from a miss and silently lowers recall on
+/// whichever case happens to run first. So warm up with a throwaway rerank-free
+/// query and only start scoring once one returns something.
+pub(crate) async fn warm_up(client: &reqwest::Client, server: &str, repo: &str) {
+    const ATTEMPTS: u32 = 30;
+    let body = serde_json::json!({
+        "query": "warm up",
+        "repo": repo,
+        "top_k": 1,
+        "rerank": false,
+    });
+    for _ in 0..ATTEMPTS {
+        let answered = match client
+            .post(format!("{server}/api/query"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r.json::<QueryResp>().await.is_ok_and(|q| !q.results.is_empty()),
+            Err(_) => false,
+        };
+        if answered {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    eprintln!(
+        "[chunk_bench] WARNING: {server} returned no results for {repo} during warm-up; is the \
+         repo indexed there? Scoring anyway."
+    );
+}
+
 /// A chunk is a window-over-symbol CUT-THROUGH when one of its boundaries falls
 /// INSIDE a CALLABLE body (Function/Method) — i.e. some callable `S` overlaps
 /// the chunk but neither fully contains the chunk nor is fully contained by it.
@@ -577,6 +616,7 @@ fn run_retrieval(repo: &str, server: &str, report: &mut Report) {
     let mut tally = RecallTally::default();
 
     rt.block_on(async {
+        warm_up(&client, server, repo).await;
         for case in &cases {
             let query = &case.query;
             let (exp_start, exp_end) = (case.line_start, case.line_end);

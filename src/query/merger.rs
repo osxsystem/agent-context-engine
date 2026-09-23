@@ -17,6 +17,14 @@ pub struct MergeChunk {
     pub symbol_kind: Option<String>,
 }
 
+impl MergeChunk {
+    /// Whether the chunk is short enough to always show whole: rerankers never
+    /// narrow it to line ranges.
+    pub fn is_under_prune_floor(&self, min_prune_lines: u32) -> bool {
+        self.line_end.saturating_sub(self.line_start) < min_prune_lines
+    }
+}
+
 /// Dedup + merge adjacent chunks, then cap to `top_k`.
 ///
 /// Steps (as specified):

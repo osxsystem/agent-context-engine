@@ -8,7 +8,11 @@
 //! `{model, state, questions: {relevance: {type: "noul", ...}}}` answered by
 //! `{answers: {relevance: {type: "noul", noul: <0..1>}}, usage: {...}}`.
 //!
-//! Narrowing is not done here yet: every chunk comes back whole.
+//! The same request narrows the chunk: one `span_<n>` question per symbol span
+//! the engine found inside it. Spans clearing [`SPAN_THRESHOLD`] become the
+//! chunk's line ranges; with none, the chunk comes back whole. Spans are real
+//! symbol boundaries, so the LLM path's range padding and sanitising do not
+//! apply here.
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::config::LlmConfig;
 use crate::llm::keys::{KeyRing, RateLimited};
-use crate::query::reranker::{RerankOutput, RerankRequest, Reranker};
+use crate::query::reranker::{RerankOutput, RerankRequest, Reranker, SymbolSpan};
 
 /// TypeSafe's public API; overridden by `llm.jev_base_url`.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -37,11 +41,17 @@ pub const RERANK_DEADLINE: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A span whose probability reaches this is selected.
+pub const SPAN_THRESHOLD: f64 = 0.5;
+
 const RELEVANCE_INSTRUCTIONS: &str = "Does this code implement or define what the query asks for?";
 const RELEVANCE_TRUE: &str =
     "The code implements, defines, or directly answers what the query asks for.";
 const RELEVANCE_FALSE: &str = "The code is unrelated to the query, or only mentions, calls, \
                                or tests the thing asked for without being it.";
+const SPAN_TRUE: &str = "This symbol is where the code answering the query lives.";
+const SPAN_FALSE: &str = "This symbol is not needed to answer the query; the answer is \
+                          elsewhere in the code or not in it at all.";
 
 pub struct JevReranker {
     http: reqwest::Client,
@@ -86,14 +96,15 @@ impl JevReranker {
         self
     }
 
-    /// The request body for one candidate.
-    fn request_body(&self, query: &str, req: &RerankRequest<'_>, i: usize) -> Value {
+    /// The request body for one candidate: the relevance question plus one
+    /// question per span in `spans`, all over the same state.
+    fn request_body(&self, req: &RerankRequest<'_>, i: usize, spans: &[SymbolSpan]) -> Value {
         let chunk = &req.chunks[i];
         let code = req.numbered[i].as_deref().unwrap_or(&chunk.content);
-        json!({
+        let mut body = json!({
             "model": MODEL,
             "state": {
-                "query": query,
+                "query": req.query,
                 "file_path": chunk.file,
                 "symbol_name": chunk.symbol,
                 "symbol_kind": chunk.symbol_kind,
@@ -106,7 +117,19 @@ impl JevReranker {
                     "criteria": { "true": RELEVANCE_TRUE, "false": RELEVANCE_FALSE },
                 },
             },
-        })
+        });
+        for (j, span) in spans.iter().enumerate() {
+            let kind = span.kind.as_deref().unwrap_or("symbol");
+            body["questions"][span_key(j)] = json!({
+                "type": "noul",
+                "instructions": format!(
+                    "Is the {kind} `{}` (lines {}-{}) part of what the query asks for?",
+                    span.name, span.line_start, span.line_end
+                ),
+                "criteria": { "true": SPAN_TRUE, "false": SPAN_FALSE },
+            });
+        }
+        body
     }
 
     /// Sends one candidate's request, starting on the next key round-robin and
@@ -182,8 +205,9 @@ impl Reranker for JevReranker {
             );
         }
 
+        let spans: Vec<&[SymbolSpan]> = (0..n).map(|i| narrowing_spans(&req, i)).collect();
         let bodies: Vec<Value> = (0..n)
-            .map(|i| self.request_body(req.query, &req, i))
+            .map(|i| self.request_body(&req, i, spans[i]))
             .collect();
         let raw_request = Value::Array(bodies.clone()).to_string();
         // `buffered` keeps results in candidate order and caps how many
@@ -218,9 +242,14 @@ impl Reranker for JevReranker {
         let mut reranked_indices: Vec<usize> = (0..n).collect();
         // Stable: equal probabilities keep their similarity order.
         reranked_indices.sort_by(|&a, &b| relevance[b].total_cmp(&relevance[a]));
+        // Selections align with the ranked order, as the engine reads them.
+        let line_selections = reranked_indices
+            .iter()
+            .map(|&i| selected_ranges(spans[i], &replies[i]))
+            .collect();
         RerankOutput {
             reranked_indices,
-            line_selections: vec![None; n],
+            line_selections,
             raw_request,
             raw_response: Value::Array(replies).to_string(),
             elapsed_ms: start.elapsed().as_millis() as u64,
@@ -229,6 +258,44 @@ impl Reranker for JevReranker {
             relevance,
         }
     }
+}
+
+/// The spans to ask about for chunk `i`: none when the chunk is under the
+/// prune floor, since it is short enough to show whole.
+fn narrowing_spans<'a>(req: &'a RerankRequest<'_>, i: usize) -> &'a [SymbolSpan] {
+    if req.chunks[i].is_under_prune_floor(req.min_prune_lines) {
+        return &[];
+    }
+    req.candidate_spans.get(i).map_or(&[], Vec::as_slice)
+}
+
+fn span_key(j: usize) -> String {
+    format!("span_{j}")
+}
+
+/// The line ranges of the spans whose answer clears [`SPAN_THRESHOLD`], a
+/// span nested in another selected one folded into it; `None` returns the
+/// chunk whole. A missing answer counts as not selected.
+fn selected_ranges(spans: &[SymbolSpan], reply: &Value) -> Option<Vec<(u32, u32)>> {
+    let mut picked: Vec<(u32, u32)> = spans
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| {
+            reply["answers"][span_key(*j)]["noul"]
+                .as_f64()
+                .is_some_and(|p| p >= SPAN_THRESHOLD)
+        })
+        .map(|(_, s)| (s.line_start, s.line_end))
+        .collect();
+    picked.sort_unstable();
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in picked {
+        match ranges.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => ranges.push((start, end)),
+        }
+    }
+    (!ranges.is_empty()).then_some(ranges)
 }
 
 /// `…/v1/systemone` from a base URL given bare, as `…/v1`, or in full.

@@ -172,11 +172,14 @@ therefore unmodified, and that invariance is the justification for the seam
 sitting where it does.
 
 **Candidate symbol spans are passed in, not looked up.** The query engine
-already resolves overlapping symbols for each base chunk during graph expansion
-and currently discards the spans, keeping only identifiers. It will retain them
-and pass them to the reranker. The Jev reranker therefore has no storage
-dependency, which keeps its tests to a single seam. The existing LLM reranker
-ignores the parameter.
+resolves the symbols overlapping each *merged* chunk and passes them to the
+reranker. (Graph expansion resolves symbols for base chunks, but merging
+reshapes those ranges, so the lookup runs again after the merge; it runs only
+when the selected reranker narrows by span.) Each span is clipped to the chunk,
+so its edges are symbol boundaries or the chunk's own edges, and a symbol
+covering the whole chunk is not offered. The Jev reranker therefore has no
+storage dependency, which keeps its tests to a single seam. The existing LLM
+reranker ignores the parameter.
 
 **One request per candidate chunk.** Requests fan out concurrently under a
 bounded semaphore. Batching all candidates into one request costs identical
@@ -211,8 +214,10 @@ The response returns one answer per question key, each carrying a probability,
 plus input and output token counts.
 
 **Ranking and narrowing.** Candidates sort by descending relevance probability.
-Spans whose probability clears a threshold become the chunk's line selections;
-if none clear it, the chunk is emitted whole. The existing range-padding and
+Spans whose probability reaches the threshold (0.5) become the chunk's line
+selections, a selected span nested in another folded into the outer one; if
+none reach it, or the chunk is under the prune floor, the chunk is emitted
+whole. The existing range-padding and
 range-sanitising helpers remain in service of the LLM reranker but are not used
 by the Jev path, because symbol spans are valid by construction.
 

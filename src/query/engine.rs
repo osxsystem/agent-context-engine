@@ -373,6 +373,18 @@ pub(crate) async fn run_query_with_filters_and_mode(
         .map(|s| s.as_ref().map(|cs| (cs.caller_count, cs.caller_file_count)))
         .collect();
 
+    // ── Step 5.6: Narrowing candidates (span-narrowing rerankers only) ──────
+    // Unlike `calls`, symbols and their file index are committed in Stage 3
+    // with the chunks, so this lookup is safe on vector-only results too.
+    let candidate_spans = if reranker.narrows_by_span() {
+        crate::query::graph_expand::candidate_spans_for(&merged, |file| {
+            find_db_for_file(&db_map, file)
+        })
+        .await
+    } else {
+        reranker::RerankRequest::no_spans(merged.len())
+    };
+
     // ── Step 6: Rerank ────────────────────────────────────────────────────
     let rerank_start = Instant::now();
     // `extended_pool` is Some only on the agentic path: its chunks/numbered are
@@ -409,6 +421,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 &numbered,
                 &legacy_stats,
                 min_prune_lines,
+                &candidate_spans,
             )
             .await;
             (out, None)
@@ -571,8 +584,8 @@ async fn rerank_single_shot<R: reranker::Reranker>(
     numbered: &[Option<String>],
     caller_stats: &[Option<(u32, u32)>],
     min_prune_lines: u32,
+    candidate_spans: &[Vec<reranker::SymbolSpan>],
 ) -> reranker::RerankOutput {
-    let candidate_spans = reranker::RerankRequest::no_spans(merged.len());
     reranker
         .rerank(reranker::RerankRequest {
             query: &query.text,
@@ -580,7 +593,7 @@ async fn rerank_single_shot<R: reranker::Reranker>(
             numbered,
             caller_stats,
             min_prune_lines,
-            candidate_spans: &candidate_spans,
+            candidate_spans,
         })
         .await
 }
@@ -1214,7 +1227,7 @@ mod tests {
             }),
         );
 
-        super::rerank_single_shot(&recorder, &parsed, &[], &[], &[], 0).await;
+        super::rerank_single_shot(&recorder, &parsed, &[], &[], &[], 0, &[]).await;
 
         assert_eq!(
             recorder.0.lock().unwrap().as_deref(),

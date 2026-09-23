@@ -84,15 +84,10 @@ pub struct RerankRequest<'a> {
 
 impl RerankRequest<'_> {
     /// Narrowing candidates for a caller that has resolved none: one empty slot
-    /// per chunk.
-    ///
-    /// Every caller is in this position today. The spans `graph_expand` resolves
-    /// are keyed to *base* chunks, and merging reshapes those ranges (coalescing
-    /// adjacent ones, capping at 60 lines, truncating to `top_k`), so they do not
-    /// align with what a reranker sees. Honest population needs a fresh
-    /// post-merge lookup — an added DB round trip per query, which belongs with
-    /// the span-narrowing work rather than in a refactor that must change
-    /// nothing.
+    /// per chunk. Callers resolve real spans with
+    /// [`crate::query::graph_expand::candidate_spans`] only when the provider
+    /// [narrows by span](RerankProvider::narrows_by_span), since that lookup is
+    /// a DB round trip per chunk.
     pub fn no_spans(chunk_count: usize) -> Vec<Vec<SymbolSpan>> {
         vec![Vec::new(); chunk_count]
     }
@@ -151,6 +146,13 @@ impl RerankProvider {
             Self::Llm(client) => client.as_ref(),
             Self::Off | Self::Jev(_) => None,
         }
+    }
+
+    /// Whether this provider narrows chunks by selecting among symbol spans,
+    /// so the engine should look them up for it. The LLM path asks the model
+    /// for line ranges and ignores spans.
+    pub fn narrows_by_span(&self) -> bool {
+        matches!(self, Self::Jev(_))
     }
 }
 
@@ -1416,7 +1418,7 @@ fn add_one_chunk(
         None => None,
         Some(arr) if arr.is_empty() => None,
         Some(arr) => {
-            if chunk.line_end.saturating_sub(chunk.line_start) < min_prune_lines {
+            if chunk.is_under_prune_floor(min_prune_lines) {
                 None
             } else {
                 sanitize_ranges(arr, chunk.line_start, chunk.line_end)
@@ -1771,7 +1773,7 @@ fn parse_rerank_response(
             Some(arr) if arr.is_empty() => None,
             Some(arr) => {
                 // Small chunks are never line-pruned (1C policy).
-                if chunk.line_end.saturating_sub(chunk.line_start) < min_prune_lines {
+                if chunk.is_under_prune_floor(min_prune_lines) {
                     None
                 } else {
                     sanitize_ranges(arr, chunk.line_start, chunk.line_end)
@@ -1918,6 +1920,23 @@ mod tests {
     }
 
     // ── RerankProvider::Off ──────────────────────────────────────────────
+
+    /// Only a span-narrowing provider makes the engine pay for span lookups.
+    #[test]
+    fn only_jev_narrows_by_span() {
+        let llm = LlmConfig {
+            provider: "google".to_owned(),
+            api_keys: vec!["k".to_owned()],
+            ..LlmConfig::default()
+        };
+        let jev = LlmConfig {
+            rerank_provider: Some("jev".to_owned()),
+            ..llm.clone()
+        };
+        assert!(RerankProvider::from_settings(&jev).narrows_by_span());
+        assert!(!RerankProvider::from_settings(&llm).narrows_by_span());
+        assert!(!RerankProvider::Off.narrows_by_span());
+    }
 
     #[tokio::test]
     async fn off_keeps_similarity_order_and_says_reranking_was_not_requested() {

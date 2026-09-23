@@ -1118,8 +1118,13 @@ async fn run_file_retrieval_resolved(
 
     // Rerank (degrades gracefully to cosine order if no keys).
     use crate::query::reranker::{RerankRequest, Reranker};
-    let candidate_spans = RerankRequest::no_spans(merge_chunks.len());
-    let rerank_output = RerankProvider::from_settings(&settings.llm)
+    let reranker = RerankProvider::from_settings(&settings.llm);
+    let candidate_spans = if reranker.narrows_by_span() {
+        crate::query::graph_expand::candidate_spans_for(&merge_chunks, |_| Some(&db)).await
+    } else {
+        RerankRequest::no_spans(merge_chunks.len())
+    };
+    let rerank_output = reranker
         .rerank(RerankRequest {
             query: information_request,
             chunks: &merge_chunks,

@@ -14,7 +14,7 @@ use axum::{Json, Router, routing::post};
 use context_engine_rs::config::LlmConfig;
 use context_engine_rs::query::jev::{JevReranker, MAX_CONCURRENT_REQUESTS};
 use context_engine_rs::query::merger::MergeChunk;
-use context_engine_rs::query::reranker::{RerankOutput, RerankRequest, Reranker};
+use context_engine_rs::query::reranker::{RerankOutput, RerankRequest, Reranker, SymbolSpan};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -26,11 +26,13 @@ struct Captured {
 }
 
 /// A mock `/v1/systemone`: answers `relevance` with the probability mapped to
-/// the request's `state.file_path`, optionally after a delay, and records every
-/// request plus the peak number in flight at once.
+/// the request's `state.file_path` and every other question with the
+/// probability mapped to the symbol its instructions name, optionally after a
+/// delay, and records every request plus the peak number in flight at once.
 #[derive(Clone, Default)]
 struct MockJev {
     probabilities: Arc<HashMap<String, f64>>,
+    span_probabilities: Arc<HashMap<String, f64>>,
     delay: Duration,
     status: Option<StatusCode>,
     /// Statuses a key answers with, one per request, before it succeeds.
@@ -51,6 +53,13 @@ impl MockJev {
             ),
             ..Self::default()
         }
+    }
+
+    /// Answers span questions naming `symbol` with its probability.
+    fn with_span_probabilities(mut self, spans: &[(&str, f64)]) -> Self {
+        self.span_probabilities =
+            Arc::new(spans.iter().map(|(n, p)| ((*n).to_owned(), *p)).collect());
+        self
     }
 
     /// `key` answers its next requests with `statuses`, in order.
@@ -106,10 +115,23 @@ impl MockJev {
         if let Some(status) = scripted.or(self.status) {
             return (status, Json(json!({"error": "nope"}))).into_response();
         }
-        let p = self.probabilities.get(&file).copied().unwrap_or(0.0);
+        let questions = self.captured().last().expect("just captured").body["questions"].clone();
+        let mut answers = serde_json::Map::new();
+        for (key, question) in questions.as_object().into_iter().flatten() {
+            let p = if key == "relevance" {
+                self.probabilities.get(&file).copied().unwrap_or(0.0)
+            } else {
+                let instructions = question["instructions"].as_str().unwrap_or_default();
+                self.span_probabilities
+                    .iter()
+                    .find(|(name, _)| instructions.contains(&format!("`{name}`")))
+                    .map_or(0.0, |(_, p)| *p)
+            };
+            answers.insert(key.clone(), json!({"type": "noul", "noul": p}));
+        }
         Json(json!({
             "model": "jev-1.13.0",
-            "answers": {"relevance": {"type": "noul", "noul": p}},
+            "answers": answers,
             "usage": {"input_tokens": 120, "output_tokens": 1}
         }))
         .into_response()
@@ -168,12 +190,26 @@ fn jev_config(base_url: Option<String>, keys: &[&str]) -> LlmConfig {
 }
 
 async fn rerank(reranker: &JevReranker, query: &str, chunks: &[MergeChunk]) -> RerankOutput {
+    rerank_with_spans(
+        reranker,
+        query,
+        chunks,
+        &RerankRequest::no_spans(chunks.len()),
+    )
+    .await
+}
+
+async fn rerank_with_spans(
+    reranker: &JevReranker,
+    query: &str,
+    chunks: &[MergeChunk],
+    spans: &[Vec<SymbolSpan>],
+) -> RerankOutput {
     let numbered: Vec<Option<String>> = chunks
         .iter()
         .map(|c| Some(format!("10: {}", c.content)))
         .collect();
     let caller_stats = vec![None; chunks.len()];
-    let spans = RerankRequest::no_spans(chunks.len());
     reranker
         .rerank(RerankRequest {
             query,
@@ -181,9 +217,26 @@ async fn rerank(reranker: &JevReranker, query: &str, chunks: &[MergeChunk]) -> R
             numbered: &numbered,
             caller_stats: &caller_stats,
             min_prune_lines: 16,
-            candidate_spans: &spans,
+            candidate_spans: spans,
         })
         .await
+}
+
+/// A chunk long enough to narrow: lines 10..=60, over the 16-line floor.
+fn long_chunk(file: &str) -> MergeChunk {
+    MergeChunk {
+        line_end: 60,
+        ..chunk(file, "module")
+    }
+}
+
+fn span(name: &str, line_start: u32, line_end: u32) -> SymbolSpan {
+    SymbolSpan {
+        name: name.to_owned(),
+        kind: Some("function".to_owned()),
+        line_start,
+        line_end,
+    }
 }
 
 #[tokio::test]
@@ -565,4 +618,151 @@ async fn jev_rotation_carries_on_across_queries() {
     }
 
     assert_eq!(mock.keys_used(), ["query-1", "query-2"]);
+}
+
+/// Span questions share the relevance question's request and state: still one
+/// request per candidate.
+#[tokio::test]
+async fn jev_asks_one_span_question_per_candidate_span_in_the_same_request() {
+    let mock = MockJev::answering(&[("a.rs", 0.9)]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["ts-key"]);
+
+    rerank_with_spans(
+        &reranker,
+        "q",
+        &[long_chunk("a.rs")],
+        &[vec![span("parse", 12, 20), span("helper", 30, 40)]],
+    )
+    .await;
+
+    let requests = mock.captured();
+    assert_eq!(requests.len(), 1);
+    let questions = requests[0].body["questions"]
+        .as_object()
+        .expect("questions");
+    let mut keys: Vec<&String> = questions.keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["relevance", "span_0", "span_1"]);
+    let parse = &questions["span_0"];
+    assert_eq!(parse["type"], "noul");
+    let instructions = parse["instructions"].as_str().expect("instructions");
+    assert!(
+        instructions.contains("`parse`")
+            && instructions.contains("12")
+            && instructions.contains("20"),
+        "{instructions}"
+    );
+    assert!(
+        parse["criteria"]["true"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert!(
+        parse["criteria"]["false"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+}
+
+/// Selected spans come back as the chunk's line ranges, exactly on the symbol
+/// boundaries, aligned with the ranked order.
+#[tokio::test]
+async fn jev_returns_spans_clearing_the_threshold_as_line_ranges() {
+    let mock = MockJev::answering(&[("a.rs", 0.3), ("b.rs", 0.9)]).with_span_probabilities(&[
+        ("parse", 0.9),
+        ("helper", 0.7),
+        ("unused", 0.2),
+    ]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["ts-key"]);
+
+    let out = rerank_with_spans(
+        &reranker,
+        "q",
+        &[long_chunk("a.rs"), long_chunk("b.rs")],
+        &[
+            vec![span("unused", 50, 55)],
+            vec![
+                span("parse", 12, 20),
+                span("unused", 22, 28),
+                span("helper", 30, 40),
+            ],
+        ],
+    )
+    .await;
+
+    assert_eq!(out.skip_reason, None);
+    assert_eq!(out.reranked_indices, vec![1, 0]);
+    assert_eq!(
+        out.line_selections,
+        vec![Some(vec![(12, 20), (30, 40)]), None],
+        "b.rs ranks first and is narrowed; a.rs has no span over the threshold"
+    );
+}
+
+/// A selected symbol nested inside another selected symbol is covered by it,
+/// so the outer boundary is returned once.
+#[tokio::test]
+async fn jev_folds_a_selected_span_nested_in_another_into_the_outer_one() {
+    let mock = MockJev::answering(&[("a.rs", 0.9)])
+        .with_span_probabilities(&[("Parser", 0.8), ("parse", 0.9)]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["ts-key"]);
+
+    let out = rerank_with_spans(
+        &reranker,
+        "q",
+        &[long_chunk("a.rs")],
+        &[vec![span("Parser", 12, 40), span("parse", 20, 30)]],
+    )
+    .await;
+
+    assert_eq!(out.line_selections, vec![Some(vec![(12, 40)])]);
+}
+
+/// Narrowing never hides code: with no span over the threshold, or no spans at
+/// all, the chunk comes back whole.
+#[tokio::test]
+async fn jev_returns_the_chunk_whole_when_no_span_clears_the_threshold() {
+    let mock = MockJev::answering(&[("a.rs", 0.9), ("b.rs", 0.8)])
+        .with_span_probabilities(&[("parse", 0.4)]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["ts-key"]);
+
+    let out = rerank_with_spans(
+        &reranker,
+        "q",
+        &[long_chunk("a.rs"), long_chunk("b.rs")],
+        &[vec![span("parse", 12, 20)], vec![]],
+    )
+    .await;
+
+    assert_eq!(out.skip_reason, None);
+    assert_eq!(out.line_selections, vec![None, None]);
+    let b = mock
+        .captured()
+        .into_iter()
+        .find(|r| r.body["state"]["file_path"] == "b.rs")
+        .expect("request for b.rs");
+    assert_eq!(b.body["questions"].as_object().map(|q| q.len()), Some(1));
+}
+
+/// Chunks under the prune floor are short enough to show whole, so no span
+/// questions are asked for them.
+#[tokio::test]
+async fn jev_asks_no_span_questions_for_chunks_under_the_prune_floor() {
+    let mock = MockJev::answering(&[("a.rs", 0.9)]).with_span_probabilities(&[("parse", 0.9)]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["ts-key"]);
+    let short = MergeChunk {
+        line_end: 20,
+        ..chunk("a.rs", "module")
+    };
+
+    let out = rerank_with_spans(&reranker, "q", &[short], &[vec![span("parse", 12, 18)]]).await;
+
+    assert_eq!(out.line_selections, vec![None]);
+    let questions = mock.captured()[0].body["questions"].clone();
+    assert_eq!(questions.as_object().map(|q| q.len()), Some(1));
 }

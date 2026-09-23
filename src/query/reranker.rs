@@ -2,6 +2,7 @@ use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::{ChatMessage, LlmClient, ToolDef, ToolResult, ToolTurnResult};
 use crate::query::engine::{QueryGraphMode, read_lines_from_fs, run_sub_query, slice_numbered};
+use crate::query::filters::{ParsedQuery, QueryFilters};
 use crate::query::merger::MergeChunk;
 use regex::Regex;
 use std::collections::HashMap;
@@ -537,6 +538,9 @@ struct LiveBackend<'a> {
     llm_client: &'a LlmClient,
     prompt_cache_key: Option<String>,
     repo_filter: &'a str,
+    /// The owner's kind/lang/path/name filters, applied to `query`-tool results
+    /// exactly as to the base candidates.
+    filters: &'a QueryFilters,
     voyage_client: &'a VoyageClient,
     index_engine: &'a Arc<IndexEngine>,
     repo_dbs: &'a Arc<RwLock<HashMap<String, Surreal<Db>>>>,
@@ -570,6 +574,7 @@ impl AgenticBackend for LiveBackend<'_> {
             information_request,
             30,
             self.repo_filter,
+            self.filters,
             self.voyage_client,
             self.index_engine,
             self.repo_dbs,
@@ -597,7 +602,7 @@ impl AgenticBackend for LiveBackend<'_> {
 /// drive it with a mock backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn rerank_agentic(
-    query: &str,
+    query: &ParsedQuery,
     chunks: &[MergeChunk],
     numbered: &[Option<String>],
     caller_stats: &[Option<(u32, u32)>],
@@ -617,7 +622,7 @@ pub async fn rerank_agentic(
     use std::hash::{Hash, Hasher};
     let cache_key = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        query.hash(&mut hasher);
+        query.text.hash(&mut hasher);
         repo_filter.hash(&mut hasher);
         format!("agentic-rerank-{:x}", hasher.finish())
     };
@@ -625,6 +630,7 @@ pub async fn rerank_agentic(
         llm_client,
         prompt_cache_key: Some(cache_key),
         repo_filter,
+        filters: &query.filters,
         voyage_client,
         index_engine,
         repo_dbs,
@@ -633,7 +639,7 @@ pub async fn rerank_agentic(
     };
     run_agentic_loop(
         &backend,
-        query,
+        &query.text,
         chunks,
         numbered,
         caller_stats,

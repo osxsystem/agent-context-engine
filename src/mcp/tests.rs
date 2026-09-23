@@ -657,3 +657,23 @@ fn genuine_empty_resident_shard_keeps_existing_wording() {
         "genuine empty must not mention warming"
     );
 }
+
+// --- MCP filter params → structured QueryFilters ---
+
+#[test]
+fn mcp_filter_params_become_structured_filters() {
+    let kinds = vec!["Function".to_owned()];
+    let langs = vec!["Rust".to_owned()];
+    let filters = mcp_query_filters(Some(&kinds), Some(&langs), Some("docs/product notes/"))
+        .expect("filters were given");
+    assert_eq!(filters.kinds, vec!["function"]);
+    assert_eq!(filters.languages, vec!["rust"]);
+    assert_eq!(filters.path_filters, vec!["docs/product notes/"]);
+    assert!(filters.name_filters.is_empty());
+}
+
+#[test]
+fn absent_or_empty_mcp_filter_params_yield_no_filters() {
+    assert_eq!(mcp_query_filters(None, None, None), None);
+    assert_eq!(mcp_query_filters(Some(&[]), Some(&[]), Some("")), None);
+}

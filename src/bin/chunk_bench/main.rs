@@ -22,7 +22,7 @@
 //! Usage:
 //!   chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]
 //!   chunk_bench <repo_path> <legacy_url> <ab_out.json> --ab --new-server <new_url>
-//!   chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--top-k N] [--compare prior.json]
+//!   chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--top-k N] [--cases N] [--compare prior.json]
 //!
 //! `--rerank-ab` needs a server with agentic RAG off; `scripts/rerank_bench.sh`
 //! boots one privately against the real index without touching settings.json.
@@ -146,7 +146,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "usage: chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]\n       chunk_bench <repo_path> <legacy_server_url> <ab_out.json> --ab --new-server <new_server_url>\n       chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--label NAME] [--top-k N] [--compare prior.json]"
+            "usage: chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]\n       chunk_bench <repo_path> <legacy_server_url> <ab_out.json> --ab --new-server <new_server_url>\n       chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--label NAME] [--top-k N] [--cases N] [--compare prior.json]"
         );
         std::process::exit(2);
     }
@@ -159,6 +159,7 @@ fn main() {
     let mut ab = false;
     let mut rerank_ab = false;
     let mut top_k: u64 = 10;
+    let mut cases = EVAL_LIMIT;
     let mut compare: Option<String> = None;
     let mut new_server: Option<String> = None;
     let mut i = 4;
@@ -192,6 +193,19 @@ fn main() {
                     });
                 }
             }
+            // Score fewer cases than EVAL_LIMIT. Every case is one LLM rerank
+            // call, so a sample is how to spot-check a scarce-quota model.
+            // Sampling keeps the even stride, so a smaller run draws its cases
+            // from across the same repo rather than from its first files.
+            "--cases" => {
+                i += 1;
+                if i < args.len() {
+                    cases = args[i].parse().unwrap_or_else(|_| {
+                        eprintln!("[chunk_bench] --cases expects an integer, got {}", args[i]);
+                        std::process::exit(2);
+                    });
+                }
+            }
             // Diff this run's reranker row against a previously recorded
             // artifact — the two-reranker axis.
             "--compare" => {
@@ -217,7 +231,15 @@ fn main() {
             std::process::exit(2);
         }
         eprintln!("[chunk_bench] running rerank A/B against {server} ...");
-        rerank_ab::run(&repo, &server, &out_path, &label, top_k, compare.as_deref());
+        rerank_ab::run(
+            &repo,
+            &server,
+            &out_path,
+            &label,
+            top_k,
+            cases,
+            compare.as_deref(),
+        );
         return;
     }
 
@@ -534,7 +556,10 @@ pub(crate) async fn warm_up(client: &reqwest::Client, server: &str, repo: &str) 
             .send()
             .await
         {
-            Ok(r) => r.json::<QueryResp>().await.is_ok_and(|q| !q.results.is_empty()),
+            Ok(r) => r
+                .json::<QueryResp>()
+                .await
+                .is_ok_and(|q| !q.results.is_empty()),
             Err(_) => false,
         };
         if answered {

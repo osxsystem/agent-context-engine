@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::eval::derive_eval_set;
 use crate::scoring::{RankingScore, RecallTally, ScoreDeltas};
-use crate::{EVAL_LIMIT, QueryResultRow, warm_up};
+use crate::{QueryResultRow, warm_up};
 
 /// Nearest-rank percentiles over the per-query rerank-stage latencies.
 ///
@@ -213,8 +213,16 @@ fn skip_bucket(reason: &str) -> String {
 
 // ─── Run ────────────────────────────────────────────────────────────────────
 
-pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare: Option<&str>) {
-    let cases = derive_eval_set(repo, EVAL_LIMIT);
+pub fn run(
+    repo: &str,
+    server: &str,
+    out: &str,
+    label: &str,
+    top_k: u64,
+    case_limit: usize,
+    compare: Option<&str>,
+) {
+    let cases = derive_eval_set(repo, case_limit);
     if cases.is_empty() {
         eprintln!(
             "[chunk_bench] ERROR: no retrieval cases could be derived from {repo}. The eval set \
@@ -239,7 +247,9 @@ pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare
     // Recall@10 is scored against the returned top-k; asked for fewer than ten,
     // it would silently equal recall@top_k while still being labelled @10.
     if top_k < 10 {
-        eprintln!("[chunk_bench] ERROR: --top-k must be at least 10 for recall@10 to mean anything");
+        eprintln!(
+            "[chunk_bench] ERROR: --top-k must be at least 10 for recall@10 to mean anything"
+        );
         std::process::exit(2);
     }
     if let Some(why) = config_refusal(&descriptor) {
@@ -329,7 +339,7 @@ pub fn run(repo: &str, server: &str, out: &str, label: &str, top_k: u64, compare
         skip_reasons,
         rerank_not_run,
         reproduce_cmd: format!(
-            "cargo run --release --bin chunk_bench -- {repo} {server} {out} --rerank-ab --label {label} --top-k {top_k}"
+            "cargo run --release --bin chunk_bench -- {repo} {server} {out} --rerank-ab --label {label} --top-k {top_k} --cases {case_limit}"
         ),
     };
 
@@ -395,7 +405,10 @@ fn compare_runs(prior_path: &str, current: &RerankAbReport) -> Result<String, St
         warnings.push(format!("repo differs: {} vs {}", current.repo, prior.repo));
     }
     if prior.top_k != current.top_k {
-        warnings.push(format!("top_k differs: {} vs {}", current.top_k, prior.top_k));
+        warnings.push(format!(
+            "top_k differs: {} vs {}",
+            current.top_k, prior.top_k
+        ));
     }
     if prior.queries_scored != current.queries_scored {
         warnings.push(format!(
@@ -499,10 +512,16 @@ mod tests {
     fn no_candidates_means_the_reranker_never_ran() {
         // The engine returns early with `rerank: None` and 0 ms when vector
         // search finds nothing; counted as a sample, that 0 ms drags p50 down.
-        assert_eq!(rerank_outcome(&resp(0, Some(0), None)), RerankOutcome::NotRun);
+        assert_eq!(
+            rerank_outcome(&resp(0, Some(0), None)),
+            RerankOutcome::NotRun
+        );
         // The reranker itself also returns early, without a skip reason, when
         // handed an empty candidate list.
-        assert_eq!(rerank_outcome(&resp(0, Some(0), Some(None))), RerankOutcome::NotRun);
+        assert_eq!(
+            rerank_outcome(&resp(0, Some(0), Some(None))),
+            RerankOutcome::NotRun
+        );
     }
 
     #[test]
@@ -527,10 +546,7 @@ mod tests {
 
     #[test]
     fn skip_bucket_keeps_short_reasons_verbatim() {
-        assert_eq!(
-            skip_bucket("TypeSafe key missing"),
-            "TypeSafe key missing"
-        );
+        assert_eq!(skip_bucket("TypeSafe key missing"), "TypeSafe key missing");
     }
 
     #[test]

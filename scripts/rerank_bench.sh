@@ -16,6 +16,7 @@
 #   RERANK_MODEL  override llm.rerank_model for this run only
 #   COMPARE       path to a prior artifact; prints cross-run deltas (the A/B axis)
 #   TOP_K         default 10
+#   CASES         default 50; each case is one rerank LLM call, so sample scarce-quota models
 #   PORT          default 7911
 #   SETTINGS_HOME default $HOME (reads $SETTINGS_HOME/.vibervn/context-engine/settings.json)
 #   NOTE          free text stamped into the artifact (e.g. why a model was substituted)
@@ -99,11 +100,12 @@ for _ in $(seq 1 30); do
 done
 [ -n "$ready" ] || { echo "ERROR: server did not come up" >&2; exit 1; }
 
-ARGS=("$REPO" "$URL" "$OUT_JSON" --rerank-ab --label "$LABEL" --top-k "$TOP_K")
+ARGS=("$REPO" "$URL" "$OUT_JSON" --rerank-ab --label "$LABEL" --top-k "$TOP_K" --cases "${CASES:-50}")
 [ -n "${COMPARE:-}" ] && ARGS+=(--compare "$COMPARE")
 "${CRATE_DIR}/target/release/chunk_bench" "${ARGS[@]}"
 
 REPRODUCE="scripts/rerank_bench.sh ${LABEL} ${REPO}"
+[ -n "${CASES:-}" ] && REPRODUCE="CASES=${CASES} ${REPRODUCE}"
 [ -n "${RERANK_MODEL:-}" ] && REPRODUCE="RERANK_MODEL=${RERANK_MODEL} ${REPRODUCE}"
 jq --slurpfile real "${REAL_CE}/settings.json" \
    --arg model "${RERANK_MODEL:-}" --arg note "${NOTE:-}" --arg cmd "$REPRODUCE" \

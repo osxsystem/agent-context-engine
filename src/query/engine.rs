@@ -11,7 +11,6 @@ use tracing::warn;
 use crate::embedding::identity::EmbeddingIdentity;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
-use crate::llm::LlmClient;
 use crate::path_in_repo;
 use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
@@ -46,6 +45,10 @@ pub struct CodeResult {
     /// Number of callees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callees: Option<u32>,
+    /// The reranker's relevance probability for the candidate this result
+    /// came from. Absent when the reranker yields no probabilities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -112,7 +115,7 @@ struct ChunkContentRow {
 /// embed → vector search → graph expand → merge → rerank → format.
 ///
 /// `repo_filter`: if Some, only return results from that repo path prefix.
-/// `llm_client`: if None, rerank step is skipped.
+/// `reranker`: `RerankProvider::Off` skips the rerank step.
 /// `warm_wait`: max time to block warming a cold single-repo shard before search.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
@@ -123,7 +126,7 @@ pub async fn run_query(
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
-    llm_client: Option<&LlmClient>,
+    reranker: &reranker::RerankProvider,
     warm_wait: std::time::Duration,
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
@@ -138,7 +141,7 @@ pub async fn run_query(
         index_engine,
         repo_dbs,
         min_prune_lines,
-        llm_client,
+        reranker,
         warm_wait,
         agentic_rag,
         agentic_rag_max_turns,
@@ -160,7 +163,7 @@ pub async fn run_query_with_filters(
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
-    llm_client: Option<&LlmClient>,
+    reranker: &reranker::RerankProvider,
     warm_wait: std::time::Duration,
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
@@ -176,7 +179,7 @@ pub async fn run_query_with_filters(
         index_engine,
         repo_dbs,
         min_prune_lines,
-        llm_client,
+        reranker,
         warm_wait,
         agentic_rag,
         agentic_rag_max_turns,
@@ -197,7 +200,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     min_prune_lines: u32,
-    llm_client: Option<&LlmClient>,
+    reranker: &reranker::RerankProvider,
     warm_wait: std::time::Duration,
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
@@ -376,7 +379,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     // the base candidates followed by any `query`-tool results, and the returned
     // indices address THAT pool. On the single-shot path it's None and indices
     // address the base `merged`/`numbered`.
-    let (rerank_output, extended_pool) = match (agentic_rag, llm_client, repo_filter) {
+    let (rerank_output, extended_pool) = match (agentic_rag, reranker.llm_client(), repo_filter) {
         (true, Some(client), Some(repo)) => {
             let (out, pool) = reranker::rerank_agentic(
                 &parsed,
@@ -400,7 +403,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
         }
         _ => {
             let out = rerank_single_shot(
-                &reranker::LlmReranker { client: llm_client },
+                reranker,
                 &parsed,
                 &merged,
                 &numbered,
@@ -440,6 +443,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
         let caller_names = stats.map(|s| s.caller_names.clone()).unwrap_or_default();
         let callee_names = stats.map(|s| s.callee_names.clone()).unwrap_or_default();
         let callees = stats.map(|s| s.callee_count);
+        let relevance = rerank_output.relevance.get(idx).copied();
         let numbered_text = res_numbered.get(idx).and_then(|n| n.as_deref());
         let selection = rerank_output
             .line_selections
@@ -460,6 +464,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                         caller_names: caller_names.clone(),
                         callee_names: callee_names.clone(),
                         callees,
+                        relevance,
                     });
                 }
             }
@@ -475,6 +480,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 caller_names: caller_names.clone(),
                 callee_names: callee_names.clone(),
                 callees,
+                relevance,
             }),
             (None, _) => results.push(CodeResult {
                 file: chunk.file.clone(),
@@ -488,6 +494,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 caller_names: caller_names.clone(),
                 callee_names: callee_names.clone(),
                 callees,
+                relevance,
             }),
         }
     }
@@ -521,6 +528,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             caller_names: stats.map(|s| s.caller_names.clone()).unwrap_or_default(),
             callee_names: stats.map(|s| s.callee_names.clone()).unwrap_or_default(),
             callees: stats.map(|s| s.callee_count),
+            relevance: rerank_output.relevance.get(i).copied(),
         });
     }
 
@@ -1183,6 +1191,7 @@ mod tests {
         {
             *self.0.lock().unwrap() = Some(req.query.to_owned());
             std::future::ready(crate::query::reranker::RerankOutput {
+                relevance: Vec::new(),
                 reranked_indices: vec![],
                 line_selections: vec![],
                 raw_request: String::new(),

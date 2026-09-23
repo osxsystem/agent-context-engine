@@ -1,8 +1,10 @@
+use crate::config::LlmConfig;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::{ChatMessage, LlmClient, ToolDef, ToolResult, ToolTurnResult};
 use crate::query::engine::{QueryGraphMode, read_lines_from_fs, run_sub_query, slice_numbered};
 use crate::query::filters::{ParsedQuery, QueryFilters};
+use crate::query::jev::JevReranker;
 use crate::query::merger::MergeChunk;
 use regex::Regex;
 use std::collections::HashMap;
@@ -28,6 +30,10 @@ pub struct RerankOutput {
     pub elapsed_ms: u64,
     pub fallback_used: bool,
     pub skip_reason: Option<String>,
+    /// Per-candidate relevance probability, aligned 1:1 with the request's
+    /// `chunks` (not with `reranked_indices`). Empty when the reranker yields
+    /// no probabilities — the LLM reranker only orders.
+    pub relevance: Vec<f64>,
 }
 
 /// The agentic loop's addressable chunk pool: base candidates followed by any
@@ -110,6 +116,72 @@ pub trait Reranker {
     ) -> impl std::future::Future<Output = RerankOutput> + Send;
 }
 
+/// The reranker settings select, built once per query. Both retrieval tools
+/// rank through this, so they cannot disagree about the provider.
+///
+/// There is deliberately no fallback between the arms: when Jev is selected
+/// and fails, results come back in similarity order with a skip reason, never
+/// reranked by the LLM provider instead.
+pub enum RerankProvider {
+    /// Reranking was not requested: similarity order, saying so.
+    Off,
+    /// An LLM provider (`google`/`openai`/`custom`). `None` when it has no key;
+    /// that degrades to similarity order.
+    Llm(Option<LlmClient>),
+    Jev(JevReranker),
+}
+
+impl RerankProvider {
+    /// The provider `llm.rerank_provider()` names. An LLM rerank provider is
+    /// served with the LLM keys and endpoint already configured.
+    pub fn from_settings(llm: &LlmConfig) -> Self {
+        match llm.rerank_provider() {
+            "jev" => Self::Jev(JevReranker::new(llm)),
+            provider => Self::Llm(LlmClient::new(&LlmConfig {
+                provider: provider.to_owned(),
+                ..llm.clone()
+            })),
+        }
+    }
+
+    /// The LLM client, when an LLM provider with a key is selected. The agentic
+    /// loop needs one; without it the engine ranks single-shot.
+    pub fn llm_client(&self) -> Option<&LlmClient> {
+        match self {
+            Self::Llm(client) => client.as_ref(),
+            Self::Off | Self::Jev(_) => None,
+        }
+    }
+}
+
+impl Reranker for RerankProvider {
+    async fn rerank(&self, req: RerankRequest<'_>) -> RerankOutput {
+        match self {
+            Self::Off => {
+                let n = req.chunks.len();
+                RerankOutput {
+                    reranked_indices: (0..n).collect(),
+                    line_selections: vec![None; n],
+                    raw_request: String::new(),
+                    raw_response: String::new(),
+                    elapsed_ms: 0,
+                    fallback_used: false,
+                    skip_reason: Some("reranking was not requested".to_owned()),
+                    relevance: Vec::new(),
+                }
+            }
+            Self::Llm(client) => {
+                LlmReranker {
+                    client: client.as_ref(),
+                }
+                .rerank(req)
+                .await
+            }
+            Self::Jev(jev) => jev.rerank(req).await,
+        }
+    }
+}
+
 /// Reranks by prompting a chat LLM for a JSON ordering plus line ranges.
 ///
 /// `client` is `None` when no API key is configured; that is not an error, it
@@ -150,6 +222,7 @@ async fn rerank_with_llm(req: RerankRequest<'_>, llm_client: Option<&LlmClient>)
         Some(c) => c,
         None => {
             return RerankOutput {
+                relevance: Vec::new(),
                 reranked_indices: all_indices,
                 line_selections: vec![None; n],
                 raw_request: String::new(),
@@ -163,6 +236,7 @@ async fn rerank_with_llm(req: RerankRequest<'_>, llm_client: Option<&LlmClient>)
 
     if chunks.is_empty() {
         return RerankOutput {
+            relevance: Vec::new(),
             reranked_indices: vec![],
             line_selections: vec![],
             raw_request: String::new(),
@@ -253,6 +327,7 @@ async fn rerank_with_llm(req: RerankRequest<'_>, llm_client: Option<&LlmClient>)
         Err(e) => {
             warn!(error = %e, "LLM rerank call failed, using fallback order");
             RerankOutput {
+                relevance: Vec::new(),
                 reranked_indices: all_indices,
                 line_selections: vec![None; n],
                 raw_request,
@@ -673,6 +748,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
     if chunks.is_empty() {
         return (
             RerankOutput {
+                relevance: Vec::new(),
                 reranked_indices: vec![],
                 line_selections: vec![],
                 raw_request: String::new(),
@@ -1153,6 +1229,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
             // Agent judged nothing relevant — empty result, not fallback.
             return (
                 RerankOutput {
+                    relevance: Vec::new(),
                     reranked_indices: vec![],
                     line_selections: vec![],
                     raw_request: raw_request_log,
@@ -1178,6 +1255,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
             };
             return (
                 RerankOutput {
+                    relevance: Vec::new(),
                     reranked_indices: all_indices,
                     line_selections: vec![None; n],
                     raw_request: raw_request_log,
@@ -1210,6 +1288,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
 
     (
         RerankOutput {
+            relevance: Vec::new(),
             reranked_indices,
             line_selections,
             raw_request: raw_request_log,
@@ -1593,6 +1672,7 @@ fn parse_rerank_response(
                 _ => {
                     warn!(raw = %response, "structured rerank response missing `ranked_indices` array");
                     return RerankOutput {
+                        relevance: Vec::new(),
                         reranked_indices: all_indices,
                         line_selections: vec![None; n],
                         raw_request: String::new(),
@@ -1606,6 +1686,7 @@ fn parse_rerank_response(
             _ => {
                 warn!(raw = %response, "failed to parse structured rerank response as a JSON object");
                 return RerankOutput {
+                    relevance: Vec::new(),
                     reranked_indices: all_indices,
                     line_selections: vec![None; n],
                     raw_request: String::new(),
@@ -1642,6 +1723,7 @@ fn parse_rerank_response(
             Err(_) => {
                 warn!(raw = %response, "failed to parse rerank response as JSON array");
                 return RerankOutput {
+                    relevance: Vec::new(),
                     reranked_indices: all_indices,
                     line_selections: vec![None; n],
                     raw_request: String::new(),
@@ -1705,6 +1787,7 @@ fn parse_rerank_response(
         // LLM legitimately judged nothing relevant — honor that (empty result),
         // matching prior behavior. Not a fallback.
         return RerankOutput {
+            relevance: Vec::new(),
             reranked_indices: vec![],
             line_selections: vec![],
             raw_request: String::new(),
@@ -1716,6 +1799,7 @@ fn parse_rerank_response(
     }
 
     RerankOutput {
+        relevance: Vec::new(),
         reranked_indices,
         line_selections,
         raw_request: String::new(),
@@ -1831,6 +1915,30 @@ mod tests {
             symbol_fqn: None,
             symbol_kind: None,
         }
+    }
+
+    // ── RerankProvider::Off ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn off_keeps_similarity_order_and_says_reranking_was_not_requested() {
+        let chunks = [chunk(1, 5), chunk(6, 9)];
+        let spans = RerankRequest::no_spans(chunks.len());
+        let out = RerankProvider::Off
+            .rerank(RerankRequest {
+                query: "q",
+                chunks: &chunks,
+                numbered: &[None, None],
+                caller_stats: &[None, None],
+                min_prune_lines: 16,
+                candidate_spans: &spans,
+            })
+            .await;
+        assert_eq!(out.reranked_indices, vec![0, 1]);
+        assert!(!out.fallback_used);
+        assert_eq!(
+            out.skip_reason.as_deref(),
+            Some("reranking was not requested")
+        );
     }
 
     // ── sanitize_ranges ──────────────────────────────────────────────────

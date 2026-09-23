@@ -33,9 +33,9 @@ pub use progress::{MCP_PROGRESS_HEARTBEAT, with_progress_heartbeat};
 use crate::config::Settings;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
-use crate::llm::LlmClient;
 use crate::query::engine::QueryGraphMode;
 use crate::query::filters::QueryFilters;
+use crate::query::reranker::RerankProvider;
 use crate::store;
 
 // ─── Output budget ───────────────────────────────────────────────────────
@@ -868,7 +868,7 @@ async fn do_query(
         Err(e) => return format!("Error: failed to create embedding client: {e}"),
     };
 
-    let llm_client: Option<LlmClient> = LlmClient::new(&settings.llm);
+    let reranker = RerankProvider::from_settings(&settings.llm);
 
     match crate::query::engine::run_query_with_filters_and_mode(
         information_request,
@@ -878,7 +878,7 @@ async fn do_query(
         index_engine,
         repo_dbs,
         settings.llm.rerank_min_prune_lines,
-        llm_client.as_ref(),
+        &reranker,
         warm_wait,
         settings.llm.agentic_rag,
         settings.llm.agentic_rag_max_turns,
@@ -1117,21 +1117,18 @@ async fn run_file_retrieval_resolved(
     let caller_stats: Vec<Option<(u32, u32)>> = vec![None; merge_chunks.len()];
 
     // Rerank (degrades gracefully to cosine order if no keys).
-    use crate::query::reranker::{LlmReranker, RerankRequest, Reranker};
-    let llm_client = LlmClient::new(&settings.llm);
+    use crate::query::reranker::{RerankRequest, Reranker};
     let candidate_spans = RerankRequest::no_spans(merge_chunks.len());
-    let rerank_output = LlmReranker {
-        client: llm_client.as_ref(),
-    }
-    .rerank(RerankRequest {
-        query: information_request,
-        chunks: &merge_chunks,
-        numbered: &numbered,
-        caller_stats: &caller_stats,
-        min_prune_lines: settings.llm.rerank_min_prune_lines,
-        candidate_spans: &candidate_spans,
-    })
-    .await;
+    let rerank_output = RerankProvider::from_settings(&settings.llm)
+        .rerank(RerankRequest {
+            query: information_request,
+            chunks: &merge_chunks,
+            numbered: &numbered,
+            caller_stats: &caller_stats,
+            min_prune_lines: settings.llm.rerank_min_prune_lines,
+            candidate_spans: &candidate_spans,
+        })
+        .await;
 
     // Cap to requested top_k after reranking.
     let final_count = top_k.min(rerank_output.reranked_indices.len());

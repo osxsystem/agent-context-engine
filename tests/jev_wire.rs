@@ -3,7 +3,7 @@
 //! request construction, response parsing, ordering, concurrency bounds and
 //! degradation all run against real serialization and a real HTTP round trip.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +33,8 @@ struct MockJev {
     probabilities: Arc<HashMap<String, f64>>,
     delay: Duration,
     status: Option<StatusCode>,
+    /// Statuses a key answers with, one per request, before it succeeds.
+    key_statuses: Arc<Mutex<HashMap<String, VecDeque<StatusCode>>>>,
     captured: Arc<Mutex<Vec<Captured>>>,
     in_flight: Arc<AtomicUsize>,
     peak_in_flight: Arc<AtomicUsize>,
@@ -49,6 +51,15 @@ impl MockJev {
             ),
             ..Self::default()
         }
+    }
+
+    /// `key` answers its next requests with `statuses`, in order.
+    fn with_key_statuses(self, key: &str, statuses: &[StatusCode]) -> Self {
+        self.key_statuses
+            .lock()
+            .unwrap()
+            .insert(format!("Bearer {key}"), statuses.iter().copied().collect());
+        self
     }
 
     /// Serves the mock on an ephemeral port; returns its base URL.
@@ -77,14 +88,22 @@ impl MockJev {
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        let authorization = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let scripted = authorization.as_ref().and_then(|a| {
+            self.key_statuses
+                .lock()
+                .unwrap()
+                .get_mut(a)
+                .and_then(VecDeque::pop_front)
+        });
         self.captured.lock().unwrap().push(Captured {
-            authorization: headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
+            authorization,
             body,
         });
-        if let Some(status) = self.status {
+        if let Some(status) = scripted.or(self.status) {
             return (status, Json(json!({"error": "nope"}))).into_response();
         }
         let p = self.probabilities.get(&file).copied().unwrap_or(0.0);
@@ -99,6 +118,27 @@ impl MockJev {
     fn captured(&self) -> Vec<Captured> {
         self.captured.lock().unwrap().clone()
     }
+
+    /// The key each request carried, in arrival order.
+    fn keys_used(&self) -> Vec<String> {
+        self.captured()
+            .into_iter()
+            .map(|c| {
+                c.authorization
+                    .unwrap_or_default()
+                    .trim_start_matches("Bearer ")
+                    .to_owned()
+            })
+            .collect()
+    }
+}
+
+/// Far more rate-limit answers than any retry schedule will ask for.
+const ALWAYS_LIMITED: [StatusCode; 8] = [StatusCode::TOO_MANY_REQUESTS; 8];
+
+/// A reranker whose retry pause is short enough for tests.
+fn jev_with_keys(base: String, keys: &[&str]) -> JevReranker {
+    JevReranker::new(&jev_config(Some(base), keys)).with_retry_pause(Duration::from_millis(10))
 }
 
 fn chunk(file: &str, symbol: &str) -> MergeChunk {
@@ -280,7 +320,7 @@ async fn jev_error_status_keeps_similarity_order_and_says_why() {
         ..MockJev::answering(&[])
     };
     let base = mock.serve().await;
-    let reranker = JevReranker::new(&jev_config(Some(base), &["bad-key"]));
+    let reranker = jev_with_keys(base, &["bad-key"]);
 
     let out = rerank(
         &reranker,
@@ -301,7 +341,7 @@ async fn jev_transport_failure_keeps_similarity_order_and_says_why() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let dead = format!("http://{}", listener.local_addr().expect("addr"));
     drop(listener);
-    let reranker = JevReranker::new(&jev_config(Some(dead), &["ts-key"]));
+    let reranker = jev_with_keys(dead, &["ts-key"]);
 
     let out = rerank(
         &reranker,
@@ -422,4 +462,76 @@ async fn jev_with_no_candidates_sends_nothing() {
     assert!(out.reranked_indices.is_empty());
     assert_eq!(out.skip_reason, None);
     assert!(mock.captured().is_empty());
+}
+
+#[tokio::test]
+async fn jev_rotates_keys_round_robin_across_requests() {
+    let mock = MockJev::answering(&[]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["k1", "k2", "k3"]);
+    let chunks: Vec<MergeChunk> = (0..6).map(|i| chunk(&format!("f{i}.rs"), "s")).collect();
+
+    let out = rerank(&reranker, "q", &chunks).await;
+
+    assert_eq!(out.skip_reason, None);
+    let mut used = mock.keys_used();
+    used.sort();
+    assert_eq!(used, ["k1", "k1", "k2", "k2", "k3", "k3"]);
+}
+
+#[tokio::test]
+async fn jev_retries_a_rate_limited_request_on_a_different_key() {
+    let mock = MockJev::answering(&[("a.rs", 0.7)]).with_key_statuses("limited", &ALWAYS_LIMITED);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["limited", "fresh"]);
+
+    let out = rerank(&reranker, "q", &[chunk("a.rs", "alpha")]).await;
+
+    assert_eq!(out.skip_reason, None);
+    assert_eq!(out.relevance, vec![0.7]);
+    assert_eq!(mock.keys_used(), ["limited", "fresh"]);
+}
+
+/// Every key fails the first pass; after the pause only the key that did not
+/// report a limit is tried again.
+#[tokio::test]
+async fn jev_second_pass_skips_keys_that_reported_a_limit() {
+    let mock = MockJev::answering(&[("a.rs", 0.4)])
+        .with_key_statuses("limited", &ALWAYS_LIMITED)
+        .with_key_statuses("flaky", &[StatusCode::BAD_GATEWAY]);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["limited", "flaky"]);
+
+    let out = rerank(&reranker, "q", &[chunk("a.rs", "alpha")]).await;
+
+    assert_eq!(out.skip_reason, None);
+    assert_eq!(out.relevance, vec![0.4]);
+    assert_eq!(mock.keys_used(), ["limited", "flaky", "flaky"]);
+}
+
+#[tokio::test]
+async fn jev_with_every_key_rate_limited_keeps_similarity_order_and_says_why() {
+    let mock = MockJev::answering(&[("a.rs", 0.1), ("b.rs", 0.9)])
+        .with_key_statuses("k1", &ALWAYS_LIMITED)
+        .with_key_statuses("k2", &ALWAYS_LIMITED);
+    let base = mock.serve().await;
+    let reranker = jev_with_keys(base, &["k1", "k2"]);
+
+    let out = rerank(
+        &reranker,
+        "q",
+        &[chunk("a.rs", "alpha"), chunk("b.rs", "beta")],
+    )
+    .await;
+
+    assert_eq!(out.reranked_indices, vec![0, 1]);
+    assert!(out.fallback_used);
+    assert!(out.relevance.is_empty());
+    let reason = out.skip_reason.expect("skip reason");
+    assert!(reason.contains("rate-limited"), "{reason}");
+    let used = mock.keys_used();
+    assert!(
+        used.len() <= 4,
+        "no second pass on limited keys, got {used:?}"
+    );
 }

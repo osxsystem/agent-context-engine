@@ -209,16 +209,13 @@ pub(crate) async fn run_query_with_filters_and_mode(
     let total_start = Instant::now();
 
     // ── Step 0: Parse query filters ──────────────────────────────────────────
-    // `query_text` has the filter prefixes stripped; the embedder and the
-    // reranker both judge it, never the raw string.
-    let crate::query::filters::ParsedQuery {
-        text: query_text,
-        filters,
-    } = crate::query::filters::parse_query(query, external_filters);
+    // The embedder and both rerank paths judge `parsed.text`, never the raw
+    // string; the rerank paths take `parsed` whole so they cannot reach it.
+    let parsed = crate::query::filters::parse_query(query, external_filters);
 
     // ── Step 1: Embed query ───────────────────────────────────────────────
     let embed_start = Instant::now();
-    let embedding = voyage_client.embed_query(&query_text).await?;
+    let embedding = voyage_client.embed_query(&parsed.text).await?;
     let embed_ms = embed_start.elapsed().as_millis() as u64;
 
     if embedding.is_empty() {
@@ -306,8 +303,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
     }
 
     // ── Step 3.5: Apply query filters ────────────────────────────────────
-    if !filters.is_empty() {
-        base_chunks = apply_query_filters(base_chunks, &filters);
+    if !parsed.filters.is_empty() {
+        base_chunks = apply_query_filters(base_chunks, &parsed.filters);
     }
 
     // ── Step 4: Optional graph expansion ──────────────────────────────────
@@ -382,7 +379,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     let (rerank_output, extended_pool) = match (agentic_rag, llm_client, repo_filter) {
         (true, Some(client), Some(repo)) => {
             let (out, pool) = reranker::rerank_agentic(
-                &query_text,
+                &parsed,
                 &merged,
                 &numbered,
                 &legacy_stats,
@@ -402,18 +399,15 @@ pub(crate) async fn run_query_with_filters_and_mode(
             (out, Some(pool))
         }
         _ => {
-            use reranker::Reranker as _;
-            let candidate_spans = reranker::RerankRequest::no_spans(merged.len());
-            let out = reranker::LlmReranker { client: llm_client }
-                .rerank(reranker::RerankRequest {
-                    query: &query_text,
-                    chunks: &merged,
-                    numbered: &numbered,
-                    caller_stats: &legacy_stats,
-                    min_prune_lines,
-                    candidate_spans: &candidate_spans,
-                })
-                .await;
+            let out = rerank_single_shot(
+                &reranker::LlmReranker { client: llm_client },
+                &parsed,
+                &merged,
+                &numbered,
+                &legacy_stats,
+                min_prune_lines,
+            )
+            .await;
             (out, None)
         }
     };
@@ -560,6 +554,29 @@ pub(crate) async fn run_query_with_filters_and_mode(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
+/// Single-shot rerank of `merged`. Takes the parsed query rather than the raw
+/// string, so the reranker can only ever be shown filter-stripped text.
+async fn rerank_single_shot<R: reranker::Reranker>(
+    reranker: &R,
+    query: &crate::query::filters::ParsedQuery,
+    merged: &[MergeChunk],
+    numbered: &[Option<String>],
+    caller_stats: &[Option<(u32, u32)>],
+    min_prune_lines: u32,
+) -> reranker::RerankOutput {
+    let candidate_spans = reranker::RerankRequest::no_spans(merged.len());
+    reranker
+        .rerank(reranker::RerankRequest {
+            query: &query.text,
+            chunks: merged,
+            numbered,
+            caller_stats,
+            min_prune_lines,
+            candidate_spans: &candidate_spans,
+        })
+        .await
+}
+
 /// Sub-query: embed → vector search → optional graph expand → merge. NO rerank stage.
 /// Used exclusively by the agentic rerank loop's `query` tool. Cannot recurse
 /// into rerank because it has no `llm_client` and no rerank call.
@@ -568,6 +585,7 @@ pub(crate) async fn run_sub_query(
     query: &str,
     top_k: usize,
     repo_filter: &str,
+    filters: &crate::query::filters::QueryFilters,
     voyage_client: &VoyageClient,
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
@@ -607,7 +625,12 @@ pub(crate) async fn run_sub_query(
         guard.clone()
     };
 
-    let base_chunks = hydrate_candidates(&db_map, &filtered).await.kept;
+    let mut base_chunks = hydrate_candidates(&db_map, &filtered).await.kept;
+    // Same narrowing as the top-level query, so the agent cannot pull in
+    // candidates the owner filtered out.
+    if !filters.is_empty() {
+        base_chunks = apply_query_filters(base_chunks, filters);
+    }
 
     let schema_version = if graph_mode.uses_call_graph() {
         Some(if let Some(db) = db_map.values().next() {
@@ -1148,6 +1171,47 @@ pub(crate) fn slice_numbered(numbered: &str, chunk_start: u32, s: u32, e: u32) -
 #[cfg(test)]
 mod tests {
     use super::slice_numbered;
+
+    /// Records the query text of the one request it serves.
+    struct RecordingReranker(std::sync::Mutex<Option<String>>);
+
+    impl crate::query::reranker::Reranker for RecordingReranker {
+        fn rerank(
+            &self,
+            req: crate::query::reranker::RerankRequest<'_>,
+        ) -> impl std::future::Future<Output = crate::query::reranker::RerankOutput> + Send
+        {
+            *self.0.lock().unwrap() = Some(req.query.to_owned());
+            std::future::ready(crate::query::reranker::RerankOutput {
+                reranked_indices: vec![],
+                line_selections: vec![],
+                raw_request: String::new(),
+                raw_response: String::new(),
+                elapsed_ms: 0,
+                fallback_used: false,
+                skip_reason: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reranker_receives_filter_stripped_text() {
+        let recorder = RecordingReranker(std::sync::Mutex::new(None));
+        let parsed = crate::query::filters::parse_query(
+            "kind:function lang:rust how are sessions restored",
+            Some(crate::query::filters::QueryFilters {
+                path_filters: vec!["src/mcp/".to_owned()],
+                ..Default::default()
+            }),
+        );
+
+        super::rerank_single_shot(&recorder, &parsed, &[], &[], &[], 0).await;
+
+        assert_eq!(
+            recorder.0.lock().unwrap().as_deref(),
+            Some("how are sessions restored")
+        );
+    }
 
     #[test]
     fn vector_only_mode_does_not_use_call_graph() {

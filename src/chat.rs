@@ -515,6 +515,7 @@ async fn run_tool(
                 &deps.repo_dbs,
                 &deps.settings,
                 req,
+                None,
                 repo,
             )
             .await;

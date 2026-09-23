@@ -658,36 +658,22 @@ fn genuine_empty_resident_shard_keeps_existing_wording() {
     );
 }
 
-// --- build_augmented_query → parse_query round trip ---
+// --- MCP filter params → structured QueryFilters ---
 
 #[test]
-fn mcp_filter_params_are_stripped_from_ranking_text() {
-    let kinds = vec!["function".to_owned()];
-    let langs = vec!["rust".to_owned()];
-    let augmented = build_augmented_query(
-        "how are sessions restored",
-        Some(&kinds),
-        Some(&langs),
-        Some("src/mcp/"),
-    );
-    let parsed = crate::query::filters::parse_query(&augmented, None);
-    assert_eq!(parsed.text, "how are sessions restored");
-    assert_eq!(parsed.filters.kinds, vec!["function"]);
-    assert_eq!(parsed.filters.languages, vec!["rust"]);
-    assert_eq!(parsed.filters.path_filters, vec!["src/mcp/"]);
+fn mcp_filter_params_become_structured_filters() {
+    let kinds = vec!["Function".to_owned()];
+    let langs = vec!["Rust".to_owned()];
+    let filters = mcp_query_filters(Some(&kinds), Some(&langs), Some("docs/product notes/"))
+        .expect("filters were given");
+    assert_eq!(filters.kinds, vec!["function"]);
+    assert_eq!(filters.languages, vec!["rust"]);
+    assert_eq!(filters.path_filters, vec!["docs/product notes/"]);
+    assert!(filters.name_filters.is_empty());
 }
 
 #[test]
-fn mcp_filter_values_with_whitespace_stay_out_of_ranking_text() {
-    let kinds = vec!["async function".to_owned()];
-    let augmented = build_augmented_query(
-        "retry loop",
-        Some(&kinds),
-        None,
-        Some("docs/product notes/"),
-    );
-    let parsed = crate::query::filters::parse_query(&augmented, None);
-    assert_eq!(parsed.text, "retry loop");
-    assert_eq!(parsed.filters.kinds, vec!["async function"]);
-    assert_eq!(parsed.filters.path_filters, vec!["docs/product notes/"]);
+fn absent_or_empty_mcp_filter_params_yield_no_filters() {
+    assert_eq!(mcp_query_filters(None, None, None), None);
+    assert_eq!(mcp_query_filters(Some(&[]), Some(&[]), Some("")), None);
 }

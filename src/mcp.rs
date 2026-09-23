@@ -35,6 +35,7 @@ use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
 use crate::query::engine::QueryGraphMode;
+use crate::query::filters::QueryFilters;
 use crate::store;
 
 // ─── Output budget ───────────────────────────────────────────────────────
@@ -363,9 +364,7 @@ impl McpHandler {
     ) -> Result<CallToolResult, ErrorData> {
         // Take an owned snapshot of settings — the guard is dropped before the .await below.
         let settings = self.settings.read().await.clone();
-        // Build augmented query with structured filter params as inline prefixes
-        let augmented_query = build_augmented_query(
-            &args.information_request,
+        let filters = mcp_query_filters(
             args.filter_kind.as_deref(),
             args.filter_lang.as_deref(),
             args.filter_path.as_deref(),
@@ -381,7 +380,8 @@ impl McpHandler {
                 &self.index_engine,
                 &self.repo_dbs,
                 &settings,
-                &augmented_query,
+                &args.information_request,
+                filters,
                 &args.workspace_full_path,
             ),
         )
@@ -510,6 +510,7 @@ impl RepoMcpHandler {
                 &self.repo_dbs,
                 &settings,
                 &args.information_request,
+                None,
                 &self.repo_path,
             ),
         )
@@ -602,6 +603,7 @@ fn select_empty_or_warming_message(
     format!("No results found for: {information_request}")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_codebase_retrieval(
     home_dir: &Path,
     data_dir: &Path,
@@ -609,6 +611,7 @@ pub async fn run_codebase_retrieval(
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: &Settings,
     information_request: &str,
+    filters: Option<QueryFilters>,
     workspace_full_path: &str,
 ) -> String {
     // Linked-worktree guard: serve the query from the MAIN repository's index
@@ -626,6 +629,7 @@ pub async fn run_codebase_retrieval(
                 repo_dbs,
                 settings,
                 information_request,
+                filters,
                 &main_root,
             )
             .await;
@@ -639,6 +643,7 @@ pub async fn run_codebase_retrieval(
                 repo_dbs,
                 settings,
                 information_request,
+                filters,
                 requested,
             )
             .await
@@ -656,6 +661,7 @@ pub fn worktree_redirect_note(worktree: &str, main_root: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_codebase_retrieval_resolved(
     home_dir: &Path,
     data_dir: &Path,
@@ -663,6 +669,7 @@ async fn run_codebase_retrieval_resolved(
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: &Settings,
     information_request: &str,
+    filters: Option<QueryFilters>,
     workspace_full_path: &str,
 ) -> String {
     // 1. Validate workspace_full_path.
@@ -747,6 +754,7 @@ async fn run_codebase_retrieval_resolved(
         repo_dbs,
         settings,
         information_request,
+        filters,
         repo,
         query_graph_mode,
         query_warm_wait,
@@ -755,48 +763,31 @@ async fn run_codebase_retrieval_resolved(
     format!("{output_prefix}{output}")
 }
 
-/// Build an augmented query string that prepends structured filter params as inline
-/// filter prefixes (e.g. `kind:function lang:rust path:src/ <original query>`).
-/// The `run_query` filter parser strips these back out before embedding and
-/// reranking; values containing whitespace are quoted so they strip whole.
-fn build_augmented_query(
-    information_request: &str,
+/// Structured MCP filter params as engine filters, or `None` when none are set.
+/// Kinds and languages are lowercased the way the inline `kind:`/`lang:` parser
+/// lowercases them, so both routes narrow candidates identically.
+fn mcp_query_filters(
     filter_kind: Option<&[String]>,
     filter_lang: Option<&[String]>,
     filter_path: Option<&str>,
-) -> String {
-    let mut prefixes = Vec::new();
-    if let Some(kinds) = filter_kind {
-        for k in kinds {
-            prefixes.push(filter_token("kind", k));
-        }
-    }
-    if let Some(langs) = filter_lang {
-        for l in langs {
-            prefixes.push(filter_token("lang", l));
-        }
-    }
-    if let Some(path) = filter_path
-        && !path.is_empty()
-    {
-        prefixes.push(filter_token("path", path));
-    }
-    if prefixes.is_empty() {
-        information_request.to_string()
-    } else {
-        format!("{} {}", prefixes.join(" "), information_request)
-    }
-}
-
-/// One `prefix:value` token for the query filter parser. Values containing
-/// whitespace are quoted, else the parser would end the value at the first
-/// space and leave the rest in the text the embedder and reranker judge.
-fn filter_token(prefix: &str, value: &str) -> String {
-    if value.contains(char::is_whitespace) {
-        format!("{prefix}:\"{value}\"")
-    } else {
-        format!("{prefix}:{value}")
-    }
+) -> Option<QueryFilters> {
+    let lowercased = |v: Option<&[String]>| -> Vec<String> {
+        v.unwrap_or_default()
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect()
+    };
+    let filters = QueryFilters {
+        kinds: lowercased(filter_kind),
+        languages: lowercased(filter_lang),
+        path_filters: filter_path
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        name_filters: vec![],
+    };
+    (!filters.is_empty()).then_some(filters)
 }
 
 /// Format an enriched caller tag: `[callers: fn_a, fn_b, fn_c +N more]`
@@ -855,11 +846,13 @@ fn format_enriched_callee_tag(count: Option<u32>, names: &[String]) -> String {
 /// vector access go through `index_engine` / `repo_dbs`, which were constructed
 /// with the boot-resolved `data_dir`. Keeping the signature path-free
 /// documents that this function never re-derives a base directory mid-run.
+#[allow(clippy::too_many_arguments)]
 async fn do_query(
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: &Settings,
     information_request: &str,
+    filters: Option<QueryFilters>,
     repo: &str,
     graph_mode: QueryGraphMode,
     warm_wait: Duration,
@@ -891,7 +884,7 @@ async fn do_query(
         settings.llm.agentic_rag_max_turns,
         settings.llm.agentic_rag_max_chunk_chars,
         settings.llm.agentic_rag_grep_read,
-        None,
+        filters,
         graph_mode,
     )
     .await

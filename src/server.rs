@@ -1292,6 +1292,7 @@ async fn post_mcp_tool(State(state): State<AppState>, Json(req): Json<McpToolReq
         &state.repo_dbs,
         &settings,
         &req.information_request,
+        None,
         &req.workspace_full_path,
     )
     .await;

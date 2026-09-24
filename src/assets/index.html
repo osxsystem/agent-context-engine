@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Context Engine Settings</title>
+  <!-- No favicon ships; an empty inline one stops the browser's /favicon.ico 404. -->
+  <link rel="icon" href="data:," />
   <!-- Serif heading webfont with full Vietnamese (precomposed) + Latin coverage.
        Locally-installed Linux Libertine reports Vietnamese glyphs (ề/ệ/…) but renders
        them decomposed, so the browser never falls through and tone marks float off
@@ -625,7 +627,7 @@
                  class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
                         placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
-          <p data-i18n="llm.rerankModelHint" class="text-amber-600 dark:text-amber-400 text-xs mt-1">
+          <p id="llm-rerank-model-hint" data-i18n="llm.rerankModelHint" class="text-amber-600 dark:text-amber-400 text-xs mt-1">
             ⚡ For best speed, use a Google -flash-lite model (e.g. gemini-3.1-flash-lite).
           </p>
         </div>
@@ -667,6 +669,59 @@
             Add
           </button>
         </form>
+        <!-- Reranking: which model orders retrieval results. Separate from the
+             LLM provider above because chat and agentic RAG keep using that. -->
+        <div class="mt-6 pt-4 border-t border-gray-200 dark:border-wiki-border">
+          <h3 data-i18n="rerank.heading" class="font-wiki text-sm dark:text-wiki-heading text-gray-700 mb-2">Reranking</h3>
+          <div class="mb-4">
+            <label data-i18n="rerank.provider" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-rerank-provider">Rerank provider</label>
+            <select id="llm-rerank-provider"
+                    class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                           focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active">
+              <option value="" data-i18n="rerank.followLlm">Same as LLM provider</option>
+              <option value="jev">TypeSafe (Jev)</option>
+            </select>
+            <p data-i18n="rerank.providerHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+              Which model orders retrieval results. Chat and agentic RAG always use the LLM provider above.
+            </p>
+          </div>
+          <div id="llm-jev-wrapper" class="hidden">
+            <p data-i18n="rerank.jevNote" class="mb-4 text-xs text-gray-400 dark:text-wiki-text-muted">
+              Jev ranks each result in one pass with the jev-latest model. Agentic RAG does not run while Jev is selected.
+            </p>
+            <div class="mb-4">
+              <label data-i18n="rerank.jevBaseUrl" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="llm-jev-base-url">TypeSafe base URL</label>
+              <input id="llm-jev-base-url" type="text" placeholder="https://api.typesafe.ai"
+                     class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
+                            placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                            focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+              <p data-i18n="rerank.jevBaseUrlHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+                Leave blank to use api.typesafe.ai. Set it to route Jev through a local proxy.
+              </p>
+            </div>
+            <div class="mb-2">
+              <label data-i18n="rerank.jevKeys" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">TypeSafe API keys</label>
+              <div id="llm-jev-keys-list" class="space-y-2 mb-2"></div>
+              <p id="llm-jev-no-keys" data-i18n="rerank.jevNoKeys" class="mb-2 text-xs text-amber-600 dark:text-amber-400 hidden">
+                Add a TypeSafe key, or results come back in search order.
+              </p>
+            </div>
+            <form id="form-add-jev-key" class="flex gap-2" onsubmit="return false;">
+              <input id="input-jev-key" type="text" placeholder="Paste API key" data-i18n-ph="field.pasteKey"
+                     class="flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
+                            placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                            focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+              <button type="submit" data-i18n="action.add"
+                      class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                             hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
+                Add
+              </button>
+            </form>
+            <p data-i18n="rerank.jevKeysHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+              Kept apart from the LLM keys above, so neither vendor ever sees the other's key. With several keys, a rate-limited key hands over to the next.
+            </p>
+          </div>
+        </div>
       </section>
 
       <!-- MCP Tools -->
@@ -1228,6 +1283,9 @@ function applyI18n() {
   if (typeof cfg !== 'undefined' && cfg && typeof syncLlmProviderUi === 'function') {
     syncLlmProviderUi(cfg.llm.provider || 'google');
   }
+  if (typeof cfg !== 'undefined' && cfg && typeof syncRerankProviderUi === 'function') {
+    syncRerankProviderUi();
+  }
   // The graph-pending badge is intentionally not data-i18n (that would refill it
   // while it's off and fire a spurious live-region announcement), so re-translate
   // it here only when it's actually showing. `aria-hidden` is the source of truth
@@ -1344,6 +1402,29 @@ const STR = {
   'llm.heading':       { en: `LLM Keys`, vi: `LLM Key`, zh: `LLM 密钥` },
   'llm.rerankModel':   { en: `Model`, vi: `Model`, zh: `模型` },
   'llm.rerankModelHint': { en: `⚡ For best speed, use a Google -flash-lite model (e.g. gemini-3.1-flash-lite).`, vi: `⚡ Để có tốc độ nhanh nhất, hãy ưu tiên dùng model dòng -flash-lite của Google (vd: gemini-3.1-flash-lite).`, zh: `⚡ 为获得最快速度，建议使用 Google -flash-lite 系列模型（如 gemini-3.1-flash-lite）。` },
+  'llm.rerankModelHintJev': { en: `Reranking goes through Jev, which ignores this field. This model now serves chat and agentic RAG only.`,
+                         vi: `Rerank đang dùng Jev, Jev bỏ qua trường này. Model này giờ chỉ phục vụ chat và agentic RAG.`,
+                         zh: `重排序由 Jev 完成，Jev 会忽略此字段。此模型现在仅用于聊天和 Agentic RAG。` },
+  'rerank.heading':    { en: `Reranking`, vi: `Rerank`, zh: `重排序` },
+  'rerank.provider':   { en: `Rerank provider`, vi: `Provider rerank`, zh: `重排序提供商` },
+  'rerank.followLlm':  { en: `Same as LLM provider`, vi: `Giống provider LLM`, zh: `与 LLM 提供商相同` },
+  'rerank.providerHelp': { en: `Which model orders retrieval results. Chat and agentic RAG always use the LLM provider above.`,
+                         vi: `Model dùng để sắp xếp kết quả truy xuất. Chat và agentic RAG luôn dùng provider LLM ở trên.`,
+                         zh: `用于对检索结果排序的模型。聊天和 Agentic RAG 始终使用上方的 LLM 提供商。` },
+  'rerank.jevNote':    { en: `Jev ranks each result in one pass with the jev-latest model. Agentic RAG does not run while Jev is selected.`,
+                         vi: `Jev xếp hạng từng kết quả trong một lượt bằng model jev-latest. Agentic RAG không chạy khi đang chọn Jev.`,
+                         zh: `Jev 使用 jev-latest 模型一次性为每个结果排序。选择 Jev 时不会运行 Agentic RAG。` },
+  'rerank.jevBaseUrl': { en: `TypeSafe base URL`, vi: `TypeSafe base URL`, zh: `TypeSafe 基础 URL` },
+  'rerank.jevBaseUrlHelp': { en: `Leave blank to use api.typesafe.ai. Set it to route Jev through a local proxy.`,
+                         vi: `Để trống để dùng api.typesafe.ai. Đặt giá trị này để gọi Jev qua proxy cục bộ.`,
+                         zh: `留空则使用 api.typesafe.ai。设置此项可通过本地代理访问 Jev。` },
+  'rerank.jevKeys':    { en: `TypeSafe API keys`, vi: `TypeSafe API key`, zh: `TypeSafe API 密钥` },
+  'rerank.jevKeysHelp': { en: `Kept apart from the LLM keys above, so neither vendor ever sees the other's key. With several keys, a rate-limited key hands over to the next.`,
+                         vi: `Tách riêng với LLM key ở trên, nên không vendor nào thấy key của bên kia. Khi có nhiều key, key bị giới hạn tốc độ sẽ chuyển sang key kế tiếp.`,
+                         zh: `与上方的 LLM 密钥分开保存，任何一方都不会看到另一方的密钥。配置多个密钥时，触发限流的密钥会切换到下一个。` },
+  'rerank.jevNoKeys':  { en: `Add a TypeSafe key, or results come back in search order.`,
+                         vi: `Hãy thêm TypeSafe key, nếu không kết quả sẽ giữ nguyên thứ tự tìm kiếm.`,
+                         zh: `请添加 TypeSafe 密钥，否则结果将按搜索顺序返回。` },
   'llm.minPrune':      { en: `Min prune lines`, vi: `Số dòng tối thiểu để prune`, zh: `最小裁剪行数` },
   'llm.minPruneHelp':  { en: `Chunks smaller than this many lines are returned whole; larger ones may be narrowed to relevant line ranges.`,
                          vi: `Các chunk nhỏ hơn số dòng này được trả về nguyên vẹn; chunk lớn hơn có thể được thu hẹp về các khoảng dòng liên quan.`,
@@ -2228,6 +2309,13 @@ function renderAll() {
     renderAll();
     saveNow();
   });
+  document.getElementById('llm-jev-base-url').value = cfg.llm.jev_base_url || '';
+  renderKeyList('llm-jev-keys-list', cfg.llm.jev_api_keys, (idx) => {
+    cfg.llm.jev_api_keys.splice(idx, 1);
+    renderAll();
+    saveNow();
+  });
+  syncRerankProviderUi();
   document.getElementById('banner-setup').classList.toggle('hidden', !needsSetup());
   // MCP tools checkboxes
   const enabledTools = cfg.enabled_mcp_tools || ['codebase-retrieval'];
@@ -2488,6 +2576,21 @@ document.getElementById('input-llm-key').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); handleAddLlmKey(); }
 });
 
+function handleAddJevKey() {
+  const input = document.getElementById('input-jev-key');
+  const val = input.value.trim();
+  if (!val) return;
+  if (!cfg.llm.jev_api_keys) cfg.llm.jev_api_keys = [];
+  cfg.llm.jev_api_keys.push(val);
+  input.value = '';
+  renderAll();
+  saveNow();
+}
+document.getElementById('form-add-jev-key').addEventListener('submit', handleAddJevKey);
+document.getElementById('input-jev-key').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); handleAddJevKey(); }
+});
+
 function renderExtensionList() {
   const container = document.getElementById('custom-extensions-list');
   container.innerHTML = '';
@@ -2716,6 +2819,39 @@ document.getElementById('llm-openai-force-tool-use').addEventListener('change', 
   if (!cfg) return;
   cfg.llm.openai_force_tool_use = e.target.checked;
   saveNow();
+});
+// Rerank provider selector. Blank means "follow llm.provider" and is stored as
+// null; any other value is written to llm.rerank_provider. A value this page
+// does not offer (e.g. "google" set by hand) gets its own option so a render
+// never silently rewrites it.
+function syncRerankProviderUi() {
+  const sel = document.getElementById('llm-rerank-provider');
+  const current = (cfg.llm.rerank_provider || '').trim();
+  sel.querySelectorAll('option[data-extra]').forEach(o => o.remove());
+  if (current && current !== 'jev') {
+    const opt = document.createElement('option');
+    opt.value = current;
+    opt.textContent = current;
+    opt.dataset.extra = '1';
+    sel.appendChild(opt);
+  }
+  sel.value = current;
+  const isJev = current === 'jev';
+  document.getElementById('llm-jev-wrapper').classList.toggle('hidden', !isJev);
+  document.getElementById('llm-jev-no-keys').classList.toggle('hidden', !(isJev && !(cfg.llm.jev_api_keys || []).length));
+  document.getElementById('llm-rerank-model-hint').textContent = t(isJev ? 'llm.rerankModelHintJev' : 'llm.rerankModelHint');
+}
+document.getElementById('llm-rerank-provider').addEventListener('change', (e) => {
+  if (!cfg) return;
+  cfg.llm.rerank_provider = e.target.value === '' ? null : e.target.value;
+  syncRerankProviderUi();
+  saveNow();
+});
+document.getElementById('llm-jev-base-url').addEventListener('input', (e) => {
+  if (!cfg) return;
+  const v = e.target.value.trim();
+  cfg.llm.jev_base_url = v === '' ? null : v;
+  saveDebounced();
 });
 
 // ─── Embedding cache purge ─────────────────────────────────────────────────

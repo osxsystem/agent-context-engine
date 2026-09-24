@@ -1,6 +1,6 @@
 # PRD: Remove the Buy Plan surface
 
-**Status:** Approved, not yet implemented
+**Status:** Shipped in 1.0.0 (`78a9e11`, `a88ddfe`)
 **Repository:** `osxsystem/agent-context-engine` (fork of `nullmastermind/vibervn-context-engine`)
 **Version at time of writing:** 0.1.72
 **Author:** Do Viet Hung

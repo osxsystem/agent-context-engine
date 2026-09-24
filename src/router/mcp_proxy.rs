@@ -21,14 +21,17 @@
 //! `/mcp` surface.
 
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
 };
 use serde_json::json;
 
 use super::proxy::{ProxyCtx, forward_json_to_worker};
+use crate::mcp::{MCP_PROGRESS_HEARTBEAT, with_progress_heartbeat};
 use crate::store::normalize_repo_path;
 
 /// Args for the proxied global `codebase-retrieval` tool. Mirrors
@@ -86,6 +89,7 @@ impl ProxyMcpHandler {
     async fn codebase_retrieval(
         &self,
         Parameters(args): Parameters<ProxyCodebaseRetrievalArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let repo = normalize_repo_path(args.workspace_full_path.trim());
         if repo.is_empty() {
@@ -104,9 +108,17 @@ impl ProxyMcpHandler {
             "information_request": args.information_request,
             "workspace_full_path": repo,
         });
-        let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool", body)
-            .await
-            .unwrap_or_else(|e| format!("Error: {e}"));
+        // A cold call spawns the worker and may index before it answers, so
+        // it gets the same progress heartbeat as the per-repo tools.
+        let text = with_progress_heartbeat(
+            ctx.peer,
+            &ctx.meta,
+            ctx.ct,
+            MCP_PROGRESS_HEARTBEAT,
+            forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool", body),
+        )
+        .await
+        .unwrap_or_else(|e| format!("Error: {e}"));
         Ok(CallToolResult::success(vec![Content::text(format!(
             "{worktree_note}{text}"
         ))]))
@@ -117,6 +129,7 @@ impl ProxyMcpHandler {
     async fn file_retrieval(
         &self,
         Parameters(args): Parameters<ProxyFileRetrievalArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let repo = normalize_repo_path(args.workspace_full_path.trim());
         if repo.is_empty() {
@@ -132,9 +145,15 @@ impl ProxyMcpHandler {
             "information_request": args.information_request,
             "top_k": args.top_k,
         });
-        let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool/file-retrieval", body)
-            .await
-            .unwrap_or_else(|e| format!("Error: {e}"));
+        let text = with_progress_heartbeat(
+            ctx.peer,
+            &ctx.meta,
+            ctx.ct,
+            MCP_PROGRESS_HEARTBEAT,
+            forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool/file-retrieval", body),
+        )
+        .await
+        .unwrap_or_else(|e| format!("Error: {e}"));
         Ok(CallToolResult::success(vec![Content::text(format!(
             "{worktree_note}{text}"
         ))]))

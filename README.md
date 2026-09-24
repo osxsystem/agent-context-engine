@@ -46,7 +46,7 @@ Supported platforms: Linux x64/arm64, macOS arm64, Windows x64.
 | Incremental indexing | Re-indexes only changed files (mtime + watcher), crash-safe via per-file commit markers |
 | Real-time file watching | `notify` (debounced) triggers re-index automatically on file changes |
 | Voyage AI embeddings | HTTP embedding client with an on-disk cache to avoid redundant API calls |
-| LLM reranking | Reorders candidate chunks with an LLM (OpenAI / Google); optional, can be disabled |
+| LLM reranking | Reorders candidate chunks with an LLM (OpenAI / Google / custom OpenAI-compatible endpoint), or with TypeSafe's Jev, chosen under **Rerank provider** in settings; optional, can be disabled |
 | Embedded SurrealDB | Stores chunks, symbols, and edges; one datastore per repo |
 | HTTP API + Web UI | Settings management, index explorer, and a query test console |
 | MCP server | Exposes `codebase-retrieval` and `file-retrieval` tools over streamable HTTP |

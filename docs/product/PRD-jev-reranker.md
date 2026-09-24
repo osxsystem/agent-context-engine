@@ -1,6 +1,6 @@
 # PRD: Adopt Jev as the reranker
 
-**Status:** Drafted, not yet approved
+**Status:** Shipped opt-in (v1.0.4–v1.0.7). The A/B gate failed on 2026-09-23, so Jev is not the default; see Key Results.
 **Repository:** `osxsystem/agent-context-engine` (fork of `nullmastermind/vibervn-context-engine`)
 **Version at time of writing:** 1.0.0 (fork line; upstream merged through v0.1.73)
 **Author:** Do Viet Hung

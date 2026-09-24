@@ -47,7 +47,7 @@ Nền tảng được hỗ trợ: Linux x64/arm64, macOS arm64, Windows x64.
 | Incremental indexing | Chỉ re-index các tệp đã thay đổi (mtime + watcher), crash-safe nhờ commit marker theo từng tệp |
 | Real-time file watching | `notify` (debounce) tự động trigger re-index khi tệp thay đổi |
 | Voyage AI embedding | HTTP embedding client có disk cache để tránh gọi API thừa |
-| LLM rerank | Sắp xếp lại các candidate chunk bằng LLM (OpenAI / Google); tùy chọn, có thể tắt |
+| LLM rerank | Sắp xếp lại các candidate chunk bằng LLM (OpenAI / Google / endpoint tương thích OpenAI tùy chỉnh) hoặc bằng Jev của TypeSafe, chọn ở mục **Provider rerank** trong settings; tùy chọn, có thể tắt |
 | Embedded SurrealDB | Lưu chunk, symbol và edge; một datastore cho mỗi repo |
 | HTTP API + Web UI | Quản lý cấu hình, index explorer và bảng điều khiển thử query |
 | MCP server | Cung cấp `codebase-retrieval` và `file-retrieval` tool qua streamable HTTP |

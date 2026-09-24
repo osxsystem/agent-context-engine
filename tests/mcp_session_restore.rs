@@ -46,7 +46,16 @@ async fn start_mcp_server() -> (
     Arc<LocalSessionManager>,
     Arc<BoundedSessionStore>,
 ) {
-    let store = Arc::new(BoundedSessionStore::new());
+    start_mcp_server_with(Arc::new(BoundedSessionStore::new())).await
+}
+
+async fn start_mcp_server_with(
+    store: Arc<BoundedSessionStore>,
+) -> (
+    SocketAddr,
+    Arc<LocalSessionManager>,
+    Arc<BoundedSessionStore>,
+) {
     let manager = Arc::new(LocalSessionManager::default());
 
     // Same construction as server.rs::mcp_config_with_store: default config
@@ -196,6 +205,49 @@ async fn unknown_session_id_still_404s() {
         status,
         reqwest::StatusCode::NOT_FOUND,
         "a session id absent from the store must 404, not be fabricated"
+    );
+}
+
+/// Worker scale-to-zero: process exits, in-memory map is gone. A new process
+/// with the same persist dir must restore on POST (what Claude Code sends),
+/// not 404 "Session not found".
+#[tokio::test]
+async fn process_death_restores_session_on_post() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let client = reqwest::Client::new();
+
+    let session_id = {
+        let store = Arc::new(BoundedSessionStore::with_persist(dir.path()));
+        let (addr, _manager, _store) = start_mcp_server_with(store).await;
+        initialize_session(&client, addr).await
+    };
+
+    // New process: empty live map, store loaded from the same dir.
+    let store = Arc::new(BoundedSessionStore::with_persist(dir.path()));
+    let (addr, manager, _store) = start_mcp_server_with(store).await;
+    assert!(
+        !manager
+            .has_session(&session_id.clone().into())
+            .await
+            .unwrap(),
+        "respawned process must not have the live worker yet"
+    );
+
+    let (status, body) = post_ping(&client, addr, &session_id, 2).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "POST with the pre-death session id must restore, got {status} body={body:?}"
+    );
+    assert!(
+        !body.contains("Session not found") && !body.contains("Session service terminated"),
+        "restored POST must not surface a session error, body={body:?}"
+    );
+    let (status2, body2) = post_ping(&client, addr, &session_id, 3).await;
+    assert_eq!(
+        status2,
+        reqwest::StatusCode::OK,
+        "second POST of the same session id must stay 200 (idempotent restore), got {status2} body={body2:?}"
     );
 }
 

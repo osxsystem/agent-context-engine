@@ -1,0 +1,3 @@
+interface:
+  display_name: "Compose Multiplatform UI"
+  short_description: "Shared Compose UI across Android and iOS"

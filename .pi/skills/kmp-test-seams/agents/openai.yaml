@@ -1,0 +1,3 @@
+interface:
+  display_name: "KMP Test Seams"
+  short_description: "Where a KMP test lives and which Gradle task runs it"

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Use Git Worktree"
+  short_description: "Start feature and fix work in an isolated worktree under .worktrees/"

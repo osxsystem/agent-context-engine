@@ -1,0 +1,33 @@
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:9:56: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:     9 | void tree_sitter_liquid_external_scanner_destroy(void *payload) {}
+warning: tree-sitter-liquid@0.1.0:       |                                                        ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:11:62: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    11 | unsigned tree_sitter_liquid_external_scanner_serialize(void *payload,
+warning: tree-sitter-liquid@0.1.0:       |                                                              ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:12:62: warning: unused parameter 'buffer' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    12 |                                                        char *buffer) {
+warning: tree-sitter-liquid@0.1.0:       |                                                              ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:15:60: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    15 | void tree_sitter_liquid_external_scanner_deserialize(void *payload,
+warning: tree-sitter-liquid@0.1.0:       |                                                            ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:16:66: warning: unused parameter 'buffer' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    16 |                                                      const char *buffer,
+warning: tree-sitter-liquid@0.1.0:       |                                                                  ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:17:63: warning: unused parameter 'length' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    17 |                                                      unsigned length) {}
+warning: tree-sitter-liquid@0.1.0:       |                                                               ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:19:53: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    19 | bool tree_sitter_liquid_external_scanner_scan(void *payload, TSLexer *lexer,
+warning: tree-sitter-liquid@0.1.0:       |                                                     ^
+warning: tree-sitter-liquid@0.1.0: 7 warnings generated.
+   Compiling context-engine-rs v1.0.0 (/Users/hugues_mini/Codes/AgentTools/agent-context-engine)
+    Finished `release` profile [optimized] target(s) in 5.68s
+     Running tests/mcp_session_restore.rs (target/release/deps/mcp_session_restore-dfa5caf2842acb81)
+
+running 3 tests
+test unknown_session_id_still_404s ... ok
+test idle_dropped_session_is_restored_not_404 ... ok
+test heartbeat_keeps_session_alive_past_keep_alive ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.21s
+

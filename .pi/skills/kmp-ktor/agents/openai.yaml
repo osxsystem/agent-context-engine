@@ -1,0 +1,3 @@
+interface:
+  display_name: "KMP Ktor"
+  short_description: "Ktor client setup, auth, testing and error mapping in KMP"

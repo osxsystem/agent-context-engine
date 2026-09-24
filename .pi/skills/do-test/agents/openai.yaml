@@ -1,0 +1,3 @@
+interface:
+  display_name: "Do Test"
+  short_description: "Test a change and return a verdict backed by evidence"

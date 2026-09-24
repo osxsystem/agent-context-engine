@@ -1,0 +1,3 @@
+interface:
+  display_name: "KMP Boundaries"
+  short_description: "Pick the boundary shape when common code reaches a platform API"

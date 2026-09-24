@@ -1,0 +1,5 @@
+interface:
+  display_name: "Port From Repo"
+  short_description: "Adapt a feature in from another codebase"
+policy:
+  allow_implicit_invocation: false

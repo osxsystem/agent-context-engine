@@ -1,0 +1,3 @@
+interface:
+  display_name: "KMP iOS Integration"
+  short_description: "Wire the shared framework into Xcode"

@@ -1,0 +1,76 @@
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:9:56: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:     9 | void tree_sitter_liquid_external_scanner_destroy(void *payload) {}
+warning: tree-sitter-liquid@0.1.0:       |                                                        ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:11:62: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    11 | unsigned tree_sitter_liquid_external_scanner_serialize(void *payload,
+warning: tree-sitter-liquid@0.1.0:       |                                                              ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:12:62: warning: unused parameter 'buffer' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    12 |                                                        char *buffer) {
+warning: tree-sitter-liquid@0.1.0:       |                                                              ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:15:60: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    15 | void tree_sitter_liquid_external_scanner_deserialize(void *payload,
+warning: tree-sitter-liquid@0.1.0:       |                                                            ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:16:66: warning: unused parameter 'buffer' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    16 |                                                      const char *buffer,
+warning: tree-sitter-liquid@0.1.0:       |                                                                  ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:17:63: warning: unused parameter 'length' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    17 |                                                      unsigned length) {}
+warning: tree-sitter-liquid@0.1.0:       |                                                               ^
+warning: tree-sitter-liquid@0.1.0: src/scanner.c:19:53: warning: unused parameter 'payload' [-Wunused-parameter]
+warning: tree-sitter-liquid@0.1.0:    19 | bool tree_sitter_liquid_external_scanner_scan(void *payload, TSLexer *lexer,
+warning: tree-sitter-liquid@0.1.0:       |                                                     ^
+warning: tree-sitter-liquid@0.1.0: 7 warnings generated.
+   Compiling context-engine-rs v1.0.0 (/Users/hugues_mini/Codes/AgentTools/agent-context-engine)
+    Finished `release` profile [optimized] target(s) in 27.35s
+     Running unittests src/lib.rs (target/release/deps/context_engine_rs-2d7025d901640799)
+
+running 46 tests
+test mcp::query_gate::tests::resolve_edges_queries_vector_only_and_reports_pending ... ok
+test mcp::query_gate::tests::ready_queries_full_graph_and_reports_not_pending ... ok
+test mcp::query_gate::tests::query_has_no_degrade_shape ... ok
+test mcp::progress::tests::missing_client_progress_token_still_fabricates_one ... ok
+test mcp::readiness::tests::legacy_index_no_timestamp_is_usable ... ok
+test mcp::readiness::tests::indexing_before_mutation_keeps_previous_results_usable ... ok
+test mcp::readiness::tests::just_inside_threshold_is_usable ... ok
+test mcp::readiness::tests::just_outside_threshold_is_not_usable ... ok
+test mcp::readiness::tests::fresh_timestamp_is_not_usable_inside_mutation_fence ... ok
+test mcp::readiness::tests::fresh_timestamp_is_usable ... ok
+test mcp::readiness::tests::missing_stamp_during_run_serves_without_duplicate_trigger ... ok
+test mcp::query_gate::tests::timeout_is_a_retryable_503_warming ... ok
+test mcp::query_gate::tests::failed_is_a_non_retryable_502_carrying_the_cause ... ok
+test mcp::readiness::tests::never_indexed_idle_repo_triggers_then_waits ... ok
+test mcp::readiness::tests::no_chunks_is_not_usable ... ok
+test mcp::readiness::tests::old_timestamp_is_not_usable ... ok
+test mcp::readiness::tests::partial_chunks_are_not_usable_while_mutating ... ok
+test mcp::readiness::tests::poll_interval_is_below_the_total_wait_budget ... ok
+test mcp::readiness::tests::readiness_variants_expose_graph_pending_and_budget ... ok
+test mcp::readiness::tests::stale_idle_repo_triggers_then_waits ... ok
+test mcp::readiness::tests::stranded_mutation_fence_triggers_repair ... ok
+test mcp::readiness::tests::unparseable_timestamp_is_usable ... ok
+test mcp::readiness::tests::vector_only_budget_does_not_block ... ok
+test mcp::tests::cosine_empty_returns_zero ... ok
+test mcp::tests::cosine_identical_vectors ... ok
+test mcp::tests::budget_all_fit ... ok
+test mcp::tests::cosine_orthogonal_vectors ... ok
+test mcp::tests::budget_single_line_chunk_no_elision ... ok
+test mcp::tests::budget_first_line_capped_at_120 ... ok
+test mcp::tests::file_retrieval_db_key_unix_paths ... ok
+test mcp::tests::genuine_empty_resident_shard_keeps_existing_wording ... ok
+test mcp::tests::merge_blocks_different_files_no_merge ... ok
+test mcp::tests::merge_blocks_no_overlap ... ok
+test mcp::tests::merge_blocks_adjacent ... ok
+test mcp::tests::vector_only_fast_path_only_for_resolve_edges ... ok
+test mcp::tests::merge_blocks_preserves_priority_order ... ok
+test mcp::tests::merge_blocks_carries_caller_and_callee_names ... ok
+test mcp::tests::merge_blocks_combines_caller_tags ... ok
+test mcp::tests::merge_blocks_overlap_same_file ... ok
+test mcp::tests::merge_blocks_fallback_preserves_content_on_fs_failure ... ok
+test mcp::tests::warming_message_takes_precedence_and_says_retry ... ok
+test mcp::tests::budget_exceeded_shows_header_and_first_line ... ok
+test mcp::progress::tests::returns_work_result_when_work_finishes_first ... ok
+test mcp::progress::tests::cancel_stops_ticks_and_still_returns_work ... ok
+test mcp::progress::tests::tick_failure_stops_ticks_and_still_returns_work ... ok
+test mcp::progress::tests::ticks_concurrently_with_long_work ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 612 filtered out; finished in 0.10s
+

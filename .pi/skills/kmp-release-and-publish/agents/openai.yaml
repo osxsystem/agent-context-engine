@@ -1,0 +1,3 @@
+interface:
+  display_name: "KMP Release & Publish"
+  short_description: "Ship KMP apps and publish libraries"

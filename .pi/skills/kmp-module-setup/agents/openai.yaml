@@ -1,0 +1,3 @@
+interface:
+  display_name: "KMP Module Setup"
+  short_description: "Scaffold or audit a shared KMP module"

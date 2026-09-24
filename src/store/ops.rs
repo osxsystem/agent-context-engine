@@ -188,6 +188,41 @@ pub fn kind_to_str(k: &SymbolKind) -> &'static str {
     }
 }
 
+// ─── Checked writes ───────────────────────────────────────────────────────
+
+/// Attempts after the first before a retryable commit conflict is returned.
+const WRITE_RETRIES: u32 = 5;
+
+/// Run one write statement to completion. `db.query(..).await` is `Ok` even
+/// when the statement itself failed and rolled back; `.check()` is what
+/// surfaces that. A commit conflict with a concurrent writer (a background
+/// migration, another indexing batch) is one SurrealDB marks retryable, so it
+/// is retried with backoff rather than returned.
+async fn write<'r>(what: &str, query: impl Fn() -> surrealdb::method::Query<'r, Db>) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        let outcome = match query().await {
+            Ok(resp) => resp.check().map(|_| ()),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < WRITE_RETRIES && is_retryable(&e) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(what.to_owned())),
+        }
+    }
+}
+
+/// Whether SurrealDB says the failed transaction can simply be run again. The
+/// embedded engine reports this only in the message ("This transaction can be
+/// retried"), not as a variant it exposes.
+fn is_retryable(e: &surrealdb::Error) -> bool {
+    e.to_string().contains("can be retried")
+}
+
 // ─── Delete operations (used in transactions) ────────────────────────────
 
 /// Delete all edges, symbols, chunks, and file_meta for a given file path.
@@ -196,48 +231,56 @@ pub async fn delete_file_data(db: &Surreal<Db>, file_path: &str) -> Result<()> {
     // 1. Delete edges first (all relation tables by in_file or out_file).
     let path = file_path.to_string();
 
-    db.query("DELETE FROM calls WHERE in_file = $path OR out_file = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete calls")?;
+    write("delete calls", || {
+        db.query("DELETE FROM calls WHERE in_file = $path OR out_file = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
-    db.query("DELETE FROM uses WHERE in_file = $path OR out_file = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete uses")?;
+    write("delete uses", || {
+        db.query("DELETE FROM uses WHERE in_file = $path OR out_file = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
-    db.query("DELETE FROM imports WHERE in_file = $path OR out_file = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete imports")?;
+    write("delete imports", || {
+        db.query("DELETE FROM imports WHERE in_file = $path OR out_file = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
-    db.query("DELETE FROM contains WHERE in_file = $path OR out_file = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete contains")?;
+    write("delete contains", || {
+        db.query("DELETE FROM contains WHERE in_file = $path OR out_file = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
-    db.query("DELETE FROM implements WHERE in_file = $path OR out_file = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete implements")?;
+    write("delete implements", || {
+        db.query("DELETE FROM implements WHERE in_file = $path OR out_file = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
     // 2. Delete symbols.
-    db.query("DELETE FROM symbol WHERE file = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete symbols")?;
+    write("delete symbols", || {
+        db.query("DELETE FROM symbol WHERE file = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
     // 3. Delete chunks.
-    db.query("DELETE FROM chunk WHERE file = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete chunks")?;
+    write("delete chunks", || {
+        db.query("DELETE FROM chunk WHERE file = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
     // 4. Delete file_meta.
-    db.query("DELETE FROM file_meta WHERE path = $path")
-        .bind(("path", path.clone()))
-        .await
-        .context("delete file_meta")?;
+    write("delete file_meta", || {
+        db.query("DELETE FROM file_meta WHERE path = $path")
+            .bind(("path", path.clone()))
+    })
+    .await?;
 
     Ok(())
 }
@@ -252,54 +295,63 @@ pub async fn delete_files_data_bulk(db: &Surreal<Db>, paths: &[String]) -> Resul
     }
 
     // Edges first (all 5 relation tables, both directions).
-    db.query("DELETE FROM calls WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete calls")?;
+    write("bulk delete calls", || {
+        db.query("DELETE FROM calls WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
-    db.query("DELETE FROM uses WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete uses")?;
+    write("bulk delete uses", || {
+        db.query("DELETE FROM uses WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
-    db.query("DELETE FROM imports WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete imports")?;
+    write("bulk delete imports", || {
+        db.query("DELETE FROM imports WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
-    db.query("DELETE FROM contains WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete contains")?;
+    write("bulk delete contains", || {
+        db.query("DELETE FROM contains WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
-    db.query("DELETE FROM implements WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete implements")?;
+    write("bulk delete implements", || {
+        db.query("DELETE FROM implements WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // Symbols.
-    db.query("DELETE FROM symbol WHERE file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete symbols")?;
+    write("bulk delete symbols", || {
+        db.query("DELETE FROM symbol WHERE file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // Chunks.
-    db.query("DELETE FROM chunk WHERE file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete chunks")?;
+    write("bulk delete chunks", || {
+        db.query("DELETE FROM chunk WHERE file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // Raw edge staging rows for affected files.
-    db.query("DELETE FROM raw_edge WHERE from_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete raw_edge")?;
+    write("bulk delete raw_edge", || {
+        db.query("DELETE FROM raw_edge WHERE from_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // file_meta.
-    db.query("DELETE FROM file_meta WHERE path IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("bulk delete file_meta")?;
+    write("bulk delete file_meta", || {
+        db.query("DELETE FROM file_meta WHERE path IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     Ok(())
 }
@@ -336,49 +388,57 @@ pub async fn delete_files_data_incremental(db: &Surreal<Db>, paths: &[String]) -
     // Non-`calls` relation tables (both directions). These are re-derived
     // synchronously during streaming_index for the changed files, so wiping the
     // changed files' rows on both ends is correct and bounded by the change set.
-    db.query("DELETE FROM uses WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete uses")?;
+    write("incremental delete uses", || {
+        db.query("DELETE FROM uses WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
-    db.query("DELETE FROM imports WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete imports")?;
+    write("incremental delete imports", || {
+        db.query("DELETE FROM imports WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
-    db.query("DELETE FROM contains WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete contains")?;
+    write("incremental delete contains", || {
+        db.query("DELETE FROM contains WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
-    db.query("DELETE FROM implements WHERE in_file IN $paths OR out_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete implements")?;
+    write("incremental delete implements", || {
+        db.query("DELETE FROM implements WHERE in_file IN $paths OR out_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // Symbols.
-    db.query("DELETE FROM symbol WHERE file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete symbols")?;
+    write("incremental delete symbols", || {
+        db.query("DELETE FROM symbol WHERE file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // Chunks.
-    db.query("DELETE FROM chunk WHERE file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete chunks")?;
+    write("incremental delete chunks", || {
+        db.query("DELETE FROM chunk WHERE file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // Raw edge staging rows for affected files (re-added by streaming_index).
-    db.query("DELETE FROM raw_edge WHERE from_file IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete raw_edge")?;
+    write("incremental delete raw_edge", || {
+        db.query("DELETE FROM raw_edge WHERE from_file IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     // file_meta.
-    db.query("DELETE FROM file_meta WHERE path IN $paths")
-        .bind(("paths", paths.to_vec()))
-        .await
-        .context("incremental delete file_meta")?;
+    write("incremental delete file_meta", || {
+        db.query("DELETE FROM file_meta WHERE path IN $paths")
+            .bind(("paths", paths.to_vec()))
+    })
+    .await?;
 
     Ok(())
 }
@@ -386,35 +446,20 @@ pub async fn delete_files_data_incremental(db: &Surreal<Db>, paths: &[String]) -
 /// Delete ALL data — used for full rebuild.
 pub async fn delete_all_data(db: &Surreal<Db>) -> Result<()> {
     // Edges first.
-    db.query("DELETE FROM calls")
-        .await
-        .context("delete all calls")?;
-    db.query("DELETE FROM uses")
-        .await
-        .context("delete all uses")?;
-    db.query("DELETE FROM imports")
-        .await
-        .context("delete all imports")?;
-    db.query("DELETE FROM contains")
-        .await
-        .context("delete all contains")?;
-    db.query("DELETE FROM implements")
-        .await
-        .context("delete all implements")?;
+    write("delete all calls", || db.query("DELETE FROM calls")).await?;
+    write("delete all uses", || db.query("DELETE FROM uses")).await?;
+    write("delete all imports", || db.query("DELETE FROM imports")).await?;
+    write("delete all contains", || db.query("DELETE FROM contains")).await?;
+    write("delete all implements", || {
+        db.query("DELETE FROM implements")
+    })
+    .await?;
     // Raw edges staging table.
-    db.query("DELETE FROM raw_edge")
-        .await
-        .context("delete all raw_edge")?;
+    write("delete all raw_edge", || db.query("DELETE FROM raw_edge")).await?;
     // Then symbols, chunks, file_meta.
-    db.query("DELETE FROM symbol")
-        .await
-        .context("delete all symbols")?;
-    db.query("DELETE FROM chunk")
-        .await
-        .context("delete all chunks")?;
-    db.query("DELETE FROM file_meta")
-        .await
-        .context("delete all file_meta")?;
+    write("delete all symbols", || db.query("DELETE FROM symbol")).await?;
+    write("delete all chunks", || db.query("DELETE FROM chunk")).await?;
+    write("delete all file_meta", || db.query("DELETE FROM file_meta")).await?;
     Ok(())
 }
 
@@ -538,18 +583,19 @@ pub async fn insert_edge(
 
 /// Upsert file metadata (including chunk_count).
 pub async fn upsert_file_meta(db: &Surreal<Db>, meta: &FileMeta) -> Result<()> {
-    db.query(
-        "UPSERT file_meta SET path = $path, mtime = $mtime, size = $size, repo = $repo, \
+    write("upsert file_meta", || {
+        db.query(
+            "UPSERT file_meta SET path = $path, mtime = $mtime, size = $size, repo = $repo, \
          chunk_count = $chunk_count, chunker_version = $chunker_version WHERE path = $path",
-    )
-    .bind(("path", meta.path.clone()))
-    .bind(("mtime", meta.mtime))
-    .bind(("size", meta.size))
-    .bind(("repo", meta.repo.clone()))
-    .bind(("chunk_count", meta.chunk_count))
-    .bind(("chunker_version", meta.chunker_version))
-    .await
-    .context("upsert file_meta")?;
+        )
+        .bind(("path", meta.path.clone()))
+        .bind(("mtime", meta.mtime))
+        .bind(("size", meta.size))
+        .bind(("repo", meta.repo.clone()))
+        .bind(("chunk_count", meta.chunk_count))
+        .bind(("chunker_version", meta.chunker_version))
+    })
+    .await?;
 
     Ok(())
 }
@@ -580,11 +626,12 @@ pub async fn get_meta(db: &Surreal<Db>, key: &str) -> Result<Option<String>> {
 
 /// Set an index_meta key/value.
 pub async fn set_meta(db: &Surreal<Db>, key: &str, value: &str) -> Result<()> {
-    db.query("UPSERT index_meta SET key = $key, value = $value WHERE key = $key")
-        .bind(("key", key.to_string()))
-        .bind(("value", value.to_string()))
-        .await
-        .context("set index_meta")?;
+    write("set index_meta", || {
+        db.query("UPSERT index_meta SET key = $key, value = $value WHERE key = $key")
+            .bind(("key", key.to_string()))
+            .bind(("value", value.to_string()))
+    })
+    .await?;
     Ok(())
 }
 
@@ -2334,5 +2381,36 @@ mod ignored_paths_tests {
         set_ignored_paths(&db, &[]).await.unwrap();
         let loaded3 = get_ignored_paths(&db).await.unwrap();
         assert!(loaded3.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use crate::store::open_db;
+    use tempfile::TempDir;
+
+    /// A statement that fails inside an otherwise-successful round trip must
+    /// come back as an error, not as the `Ok` that `db.query(..).await` gives.
+    #[tokio::test]
+    async fn a_failed_statement_is_an_error() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/proj/write-check", 0).await.unwrap();
+
+        let err = write("throwing statement", || db.query("THROW 'boom'"))
+            .await
+            .expect_err("a thrown statement must surface");
+
+        assert!(format!("{err:#}").contains("boom"), "cause kept: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_successful_statement_is_ok() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/proj/write-ok", 0).await.unwrap();
+
+        write("delete all chunks", || db.query("DELETE FROM chunk"))
+            .await
+            .expect("an ordinary delete succeeds");
     }
 }

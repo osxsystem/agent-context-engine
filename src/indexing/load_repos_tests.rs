@@ -343,6 +343,66 @@ async fn vector_search_signals_warming_when_shard_not_resident() {
     );
 }
 
+/// REGRESSION: the call-graph fast path queried with a ZERO warm budget and the
+/// warm ran INSIDE that timeout, so it was cancelled at its first DB await on
+/// every query: a cold shard never loaded and every retry said "still warming"
+/// for the whole Phase 2. The warm now outlives the query's bounded wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_budget_queries_still_complete_the_warm() {
+    let home = TempDir::new().expect("tempdir");
+    let repo = "/proj/zero_budget".to_string();
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    seed_repo(&repo_dbs, home.path(), &repo, 3).await;
+    let settings = crate::config::Settings {
+        repos: vec![repo.clone()],
+        ..Default::default()
+    };
+    let settings_handle = Arc::new(RwLock::new(settings.clone()));
+    let engine = IndexEngine::start(
+        home.path().to_path_buf(),
+        home.path().join("embeddings"),
+        &settings,
+        repo_dbs.clone(),
+        settings_handle,
+        false,
+    )
+    .await;
+
+    // Hold the warm lock so the warm is guaranteed to be parked at an await when
+    // the zero budget expires (a tiny test DB could otherwise finish in one poll).
+    let warm_lock = engine.get_warm_lock(&repo).await;
+    let held = warm_lock.lock().await;
+
+    let q = vec![1.0f32, 0.0, 0.0, 0.0];
+    let identity = test_identity();
+    let first = engine
+        .vector_search(&q, 10, Some(&repo), std::time::Duration::ZERO, &identity)
+        .await;
+    assert!(first.warming, "the shard cannot be resident yet");
+    drop(held);
+
+    // No further queries: only the warm the first query started can load it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine
+        .vector_index
+        .read()
+        .await
+        .resident_identity(&repo)
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the warm started by a zero-budget query must complete on its own"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let outcome = engine
+        .vector_search(&q, 10, Some(&repo), std::time::Duration::ZERO, &identity)
+        .await;
+    assert!(!outcome.warming);
+    assert_eq!(outcome.results.len(), 3, "the warmed shard is complete");
+}
+
 /// Multi-repo (`repo_filter=None`) search must fail closed per shard identity:
 /// matching shards contribute results, mismatched shards contribute NOTHING,
 /// are identity-fenced evicted, and are background-warmed for repair.
@@ -517,6 +577,58 @@ async fn vector_search_resident_empty_is_not_warming() {
         !outcome.warming,
         "resident shard must NOT signal warming, even when empty"
     );
+}
+
+/// A scoped search on a RESIDENT shard that has no rows of the requested class is
+/// a genuine empty (warming=false), which is exactly the signal the code↔docs
+/// fallback keys on — while the other class on the same shard still hits. Seeded
+/// files are all `.rs`, so `docs` is the empty class here.
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_vector_search_empty_class_is_genuine_empty_not_warming() {
+    use crate::vector::{Scope, ScopeFilter};
+
+    let home = TempDir::new().expect("tempdir");
+    let repo = "/proj/scoped".to_string();
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    seed_repo(&repo_dbs, home.path(), &repo, 3).await;
+    let settings = crate::config::Settings {
+        repos: vec![repo.clone()],
+        ..Default::default()
+    };
+    let settings_handle = Arc::new(RwLock::new(settings.clone()));
+    let engine = IndexEngine::start(
+        home.path().to_path_buf(),
+        home.path().join("embeddings"),
+        &settings,
+        repo_dbs.clone(),
+        settings_handle,
+        false,
+    )
+    .await;
+    let identity = test_identity();
+    engine
+        .warm_repo_blocking(repo.clone(), identity.clone())
+        .await;
+
+    let q = vec![1.0f32, 0.0, 0.0, 0.0];
+    let wait = std::time::Duration::from_secs(10);
+    let docs = ScopeFilter::new(Scope::Docs, ["md"]);
+    let code = ScopeFilter::new(Scope::Code, ["md"]);
+
+    let none_found = engine
+        .vector_search_with(&q, 10, Some(&repo), wait, &identity, Some(&docs))
+        .await;
+    assert!(none_found.results.is_empty());
+    assert!(
+        !none_found.warming,
+        "an empty class on a resident shard is a real empty, not 'retry'"
+    );
+
+    let found = engine
+        .vector_search_with(&q, 10, Some(&repo), wait, &identity, Some(&code))
+        .await;
+    assert_eq!(found.results.len(), 3);
+    assert!(!found.warming);
 }
 
 /// Harness for the full-rebuild window: delete_all_data removes every chunk
@@ -839,4 +951,91 @@ async fn mutation_fence_writer_boundary_normalizes_repo_spelling() {
         &[],
     );
     assert!(!engine.repo_is_mutating(&canonical).await);
+}
+
+/// S10/D9: a persisted shard file whose CURRENT pointer survived a later run
+/// (the best-effort delete failed — e.g. Defender holding the file on Windows) and
+/// whose chunk count still matches must NOT be mmap'd: the index epoch bumped by
+/// that run invalidates it.
+#[tokio::test]
+async fn stale_persisted_shard_with_same_chunk_count_is_not_mmapped() {
+    let home = TempDir::new().expect("tempdir");
+    let repo = "/proj/stale-same-count".to_string();
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    seed_repo(&repo_dbs, home.path(), &repo, 1).await;
+    let identity = test_identity();
+    let vector_index = Arc::new(RwLock::new(ShardedVectorIndex::new(1024 * 1024 * 1024)));
+
+    // First warm builds from DB and persists generation 0 with f0.rs.
+    warm_repo_shard(
+        &vector_index,
+        &repo_dbs,
+        home.path(),
+        &repo,
+        0,
+        &identity,
+        &[],
+    )
+    .await
+    .expect("first warm");
+    vector_index.write().await.evict_repo(&repo);
+
+    // A later run replaced f0.rs with f1.rs (same chunk count) and bumped the
+    // epoch, but its CURRENT delete "failed": the old file is still CURRENT.
+    let db = store::get_or_open(&repo_dbs, home.path(), &repo, 0)
+        .await
+        .expect("open");
+    store::ops::bump_index_epoch(&db).await.expect("bump epoch");
+    db.query(format!(
+        "DELETE FROM chunk; CREATE chunk SET file = '{repo}/f1.rs', line_start = 1, \
+         line_end = 2, content = 'y', embedding = [0.1, 0.2, 0.3, 0.4], symbol_ref = NONE;"
+    ))
+    .await
+    .expect("replace chunk");
+
+    warm_repo_shard(
+        &vector_index,
+        &repo_dbs,
+        home.path(),
+        &repo,
+        0,
+        &identity,
+        &[],
+    )
+    .await
+    .expect("second warm");
+    let files: Vec<String> = vector_index
+        .read()
+        .await
+        .search(
+            &PROBE_EMBEDDING,
+            10,
+            Some(&repo),
+            std::slice::from_ref(&repo),
+        )
+        .results
+        .into_iter()
+        .map(|r| r.chunk_id.file)
+        .collect();
+    assert_eq!(
+        files,
+        vec![format!("{repo}/f1.rs")],
+        "warm must rebuild from DB, not mmap the stale same-count file"
+    );
+}
+
+/// S16/D18: a run holding the repo lock (no HTTP request attached) is activity
+/// for the idle watchdog.
+#[tokio::test]
+async fn index_run_counts_as_busy_for_idle_watchdog() {
+    let home = TempDir::new().expect("tempdir");
+    let repo = crate::store::normalize_repo_path("/proj/busy");
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    let engine = start_test_engine(home.path(), &repo_dbs, &repo).await;
+    assert!(!engine.is_index_busy(&repo).await);
+    let lock = engine.get_repo_lock_public(&repo).await;
+    let guard = lock.lock().await;
+    assert!(engine.is_index_busy(&repo).await, "a held run lock is busy");
+    drop(guard);
+    assert!(!engine.is_index_busy(&repo).await);
 }

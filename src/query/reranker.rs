@@ -6,6 +6,7 @@ use crate::query::engine::{QueryGraphMode, read_lines_from_fs, run_sub_query, sl
 use crate::query::filters::{ParsedQuery, QueryFilters};
 use crate::query::jev::{self, JevReranker};
 use crate::query::merger::MergeChunk;
+use crate::vector::ScopeFilter;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -623,6 +624,9 @@ struct LiveBackend<'a> {
     repo_dbs: &'a Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     warm_wait: std::time::Duration,
     graph_mode: QueryGraphMode,
+    /// The code/docs scope the parent query was served in; sub-queries inherit it
+    /// so the agent's own searches cannot pull the other class back in.
+    class: Option<ScopeFilter>,
 }
 
 impl AgenticBackend for LiveBackend<'_> {
@@ -657,6 +661,7 @@ impl AgenticBackend for LiveBackend<'_> {
             self.repo_dbs,
             self.warm_wait,
             self.graph_mode,
+            self.class.clone(),
         )
     }
 
@@ -695,6 +700,7 @@ pub async fn rerank_agentic(
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     warm_wait: std::time::Duration,
     graph_mode: QueryGraphMode,
+    class: Option<ScopeFilter>,
 ) -> (RerankOutput, ExtendedPool) {
     use std::hash::{Hash, Hasher};
     let cache_key = {
@@ -713,6 +719,7 @@ pub async fn rerank_agentic(
         repo_dbs,
         warm_wait,
         graph_mode,
+        class,
     };
     run_agentic_loop(
         &backend,

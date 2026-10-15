@@ -6,8 +6,13 @@ use tracing::info;
 
 use crate::path_in_repo;
 
+pub mod scope;
 pub mod shard_file;
 pub mod sharded;
+pub use scope::{Scope, ScopeFilter, ext_key};
+
+#[cfg(test)]
+mod scope_tests;
 pub use sharded::{ScopedAll, ScopedSearch, ShardedSearch, ShardedVectorIndex};
 
 // ─── Public types ─────────────────────────────────────────────────────────
@@ -50,6 +55,13 @@ pub struct VectorIndex {
     /// Parallel array: chunk_ids[i] corresponds to row i. Always heap-resident
     /// (small: ~tens of bytes/row), even for an mmap shard.
     chunk_ids: Vec<ChunkId>,
+    /// Parallel array: ext_ids[i] is row i's interned extension id (see
+    /// `scope.rs`). Derived from `chunk_ids[i].file`, never persisted, so legacy
+    /// and mmap shards get it for free. INVARIANT: same length as `chunk_ids`,
+    /// mutated in lockstep by every method that touches `chunk_ids`.
+    ext_ids: Vec<u16>,
+    /// Interns extension keys for `ext_ids`. Ids are local to this shard.
+    exts: scope::ExtTable,
     /// Dimensionality of every vector. 0 until the first insert / mmap load.
     dim: usize,
 }
@@ -115,6 +127,8 @@ impl VectorIndex {
         Self {
             store: EmbeddingStore::Ram(Vec::new()),
             chunk_ids: Vec::new(),
+            ext_ids: Vec::new(),
+            exts: scope::ExtTable::default(),
             dim: 0,
         }
     }
@@ -156,6 +170,45 @@ impl VectorIndex {
             let normalized = l2_normalize(raw_emb);
             self.store.ram_mut().extend_from_slice(&normalized);
             self.chunk_ids.push(id.clone());
+            let ext_id = self.exts.intern_path(&id.file);
+            self.ext_ids.push(ext_id);
+        }
+    }
+
+    /// Remove every embedding whose `file` is in `files`, in ONE pass over the
+    /// shard: O(shard) per call instead of O(shard × files) for a per-file loop,
+    /// which a branch switch touching thousands of files turned into a multi-minute
+    /// stall at kernel scale. Stable compaction (row order is irrelevant to
+    /// search). An mmap-backed shard is only materialized when something actually
+    /// matches.
+    pub fn remove_files(&mut self, files: &std::collections::HashSet<&str>) {
+        if files.is_empty()
+            || !self
+                .chunk_ids
+                .iter()
+                .any(|c| files.contains(c.file.as_str()))
+        {
+            return;
+        }
+        let dim = self.dim;
+        let emb = self.store.ram_mut();
+        let mut write = 0usize;
+        for read in 0..self.chunk_ids.len() {
+            if files.contains(self.chunk_ids[read].file.as_str()) {
+                continue;
+            }
+            if write != read {
+                emb.copy_within(read * dim..(read + 1) * dim, write * dim);
+                self.chunk_ids.swap(write, read);
+                self.ext_ids.swap(write, read);
+            }
+            write += 1;
+        }
+        self.chunk_ids.truncate(write);
+        self.ext_ids.truncate(write);
+        emb.truncate(write * dim);
+        if self.chunk_ids.is_empty() {
+            self.dim = 0;
         }
     }
 
@@ -168,6 +221,7 @@ impl VectorIndex {
         while i < self.chunk_ids.len() {
             if self.chunk_ids[i].file == file {
                 self.chunk_ids.swap_remove(i);
+                self.ext_ids.swap_remove(i);
                 // Swap the flat rows: row i ↔ last row.
                 let last = self.chunk_ids.len(); // after swap_remove, len is already decremented
                 if i < last {
@@ -198,6 +252,7 @@ impl VectorIndex {
         while i < self.chunk_ids.len() {
             if path_in_repo(&self.chunk_ids[i].file, repo) {
                 self.chunk_ids.swap_remove(i);
+                self.ext_ids.swap_remove(i);
                 let last = self.chunk_ids.len();
                 if i < last {
                     let src_start = last * self.dim;
@@ -238,6 +293,19 @@ impl VectorIndex {
         self.store
             .ram_mut()
             .extend_from_slice(other.store.as_slice());
+        // `other`'s ext ids index ITS table, not ours: remap through the names.
+        let remap: Vec<u16> = other
+            .exts
+            .names()
+            .iter()
+            .map(|n| self.exts.intern(n))
+            .collect();
+        self.ext_ids.extend(other.ext_ids.iter().map(|&id| {
+            remap
+                .get(id as usize)
+                .copied()
+                .unwrap_or(scope::EXT_SENTINEL)
+        }));
         self.chunk_ids.extend(other.chunk_ids);
     }
 
@@ -247,6 +315,22 @@ impl VectorIndex {
     /// Returns results sorted by descending score, capped at `top_k`.
     /// Uses rayon for parallel dot-product computation.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
+        self.search_filtered(query, top_k, None)
+    }
+
+    /// [`search`](Self::search) restricted to one scope (code or docs).
+    ///
+    /// The restriction is applied INSIDE the scan, before top-k selection: rows of
+    /// the other class are skipped without computing their dot product, so a class
+    /// that is crowded out by higher-scoring rows of the other class (docs vs
+    /// code) is never starved the way a post-filter over top-k would be. Scores
+    /// are plain cosine, so cross-shard merging stays exact.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        scope: Option<&ScopeFilter>,
+    ) -> Vec<SearchResult> {
         if self.is_empty() || query.is_empty() || top_k == 0 || self.dim == 0 {
             return vec![];
         }
@@ -257,13 +341,29 @@ impl VectorIndex {
         // `embeddings_slice()` borrows the f32 region from either heap or mmap —
         // the dot-product kernel is identical, so scores are bit-identical to the
         // in-RAM path (exact, no quantization).
-        let mut scored: Vec<(usize, f32)> = self
-            .store
-            .as_slice()
-            .par_chunks(self.dim)
-            .enumerate()
-            .map(|(i, row)| (i, dot_product(&q_norm, row)))
-            .collect();
+        let rows = self.store.as_slice().par_chunks(self.dim).enumerate();
+        let mut scored: Vec<(usize, f32)> = match scope {
+            None => rows
+                .map(|(i, row)| (i, dot_product(&q_norm, row)))
+                .collect(),
+            Some(sf) => {
+                let keep = sf.keep_table(&self.exts);
+                let keep_unknown = sf.keeps_unknown();
+                rows.filter_map(|(i, row)| {
+                    let kept = keep
+                        .get(self.ext_ids[i] as usize)
+                        .copied()
+                        .unwrap_or(keep_unknown);
+                    kept.then(|| (i, dot_product(&q_norm, row)))
+                })
+                .collect()
+            }
+        };
+
+        // Nothing survived the scope filter: `k - 1` below would underflow.
+        if scored.is_empty() {
+            return vec![];
+        }
 
         // Partial sort: bring the top-k largest scores to the front.
         let k = top_k.min(scored.len());
@@ -350,6 +450,8 @@ impl VectorIndex {
     pub fn clear(&mut self) {
         self.store = EmbeddingStore::Ram(Vec::new());
         self.chunk_ids.clear();
+        self.ext_ids.clear();
+        self.exts = scope::ExtTable::default();
         self.dim = 0;
     }
 
@@ -364,11 +466,13 @@ impl VectorIndex {
     pub fn byte_size(&self) -> usize {
         match &self.store {
             EmbeddingStore::Ram(v) => v.len() * std::mem::size_of::<f32>(),
-            EmbeddingStore::Mmap { .. } => self
-                .chunk_ids
-                .iter()
-                .map(|c| c.file.len() + 32)
-                .sum::<usize>(),
+            EmbeddingStore::Mmap { .. } => {
+                self.chunk_ids
+                    .iter()
+                    .map(|c| c.file.len() + 32)
+                    .sum::<usize>()
+                    + self.ext_ids.len() * std::mem::size_of::<u16>()
+            }
         }
     }
 
@@ -393,6 +497,12 @@ impl VectorIndex {
         dim: usize,
         chunk_ids: Vec<ChunkId>,
     ) -> Self {
+        // Not persisted in the shard file: re-derived from the paths on open.
+        let mut exts = scope::ExtTable::default();
+        let ext_ids = chunk_ids
+            .iter()
+            .map(|c| exts.intern_path(&c.file))
+            .collect();
         Self {
             store: EmbeddingStore::Mmap {
                 map,
@@ -400,6 +510,8 @@ impl VectorIndex {
                 f32_len,
             },
             chunk_ids,
+            ext_ids,
+            exts,
             dim,
         }
     }
@@ -817,5 +929,57 @@ mod tests {
         for r in &results {
             assert_ne!(r.chunk_id.file, "/a/f1.rs");
         }
+    }
+
+    /// D10: batched removal keeps exactly the rows a per-file loop keeps, with
+    /// each surviving id still paired with its own vector.
+    #[test]
+    fn remove_files_matches_per_file_removal() {
+        let dim = 4;
+        let mut batched = VectorIndex::new();
+        let rows: Vec<(ChunkId, Vec<f32>)> = (0..12)
+            .map(|i| {
+                let mut v = vec![0.0f32; dim];
+                v[i % dim] = 1.0 + i as f32;
+                (
+                    chunk(&format!("/r/f{}.rs", i % 5), i as u32, i as u32 + 1),
+                    v,
+                )
+            })
+            .collect();
+        batched.insert(&rows);
+        let mut looped = VectorIndex::new();
+        looped.insert(&rows);
+
+        let gone = ["/r/f0.rs", "/r/f3.rs", "/r/missing.rs"];
+        batched.remove_files(&gone.iter().copied().collect());
+        for f in gone {
+            looped.remove_file(f);
+        }
+
+        let key = |ix: &VectorIndex| {
+            let mut v: Vec<(String, u32, Vec<u32>)> = ix
+                .chunk_ids
+                .iter()
+                .enumerate()
+                .map(|(row, c)| {
+                    let vec = ix.store.as_slice()[row * dim..(row + 1) * dim]
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect();
+                    (c.file.clone(), c.line_start, vec)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(key(&batched), key(&looped));
+        assert!(
+            batched
+                .chunk_ids
+                .iter()
+                .all(|c| !gone.contains(&c.file.as_str()))
+        );
+        assert_eq!(batched.store.as_slice().len(), batched.len() * dim);
     }
 }

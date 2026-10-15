@@ -29,7 +29,7 @@ use crate::parsing::relations::{EdgeKind, EdgeTarget};
 use crate::parsing::symbols::Symbol;
 use crate::store::build_index_concurrently;
 use crate::store::ops::{
-    FileMeta, SymbolWithPos, delete_all_data, delete_files_data_incremental,
+    FileMeta, SymbolWithPos, bump_index_epoch, delete_all_data, delete_files_data_incremental,
     find_symbols_by_names_with_pos, get_all_file_meta, get_meta, set_meta, upsert_file_meta,
 };
 use crate::vector::{ChunkId, ShardedVectorIndex};
@@ -116,7 +116,19 @@ struct RawEdgeRecord {
 /// Output of parse_one_file — either a successfully parsed file or a skip record.
 enum ParseOutput {
     Parsed(ParsedFile),
-    Skipped { file: String, reason: String },
+    /// `retry`: the cause is transient (I/O error such as a sharing violation
+    /// mid-save, failed stat) — queue the file in `pending_retry`. Permanent
+    /// causes (binary content, invalid UTF-8) are not retried.
+    Skipped {
+        file: String,
+        reason: String,
+        retry: bool,
+        /// `(mtime, size)` for a PERMANENT skip (binary content, invalid UTF-8):
+        /// recorded as a zero-chunk file_meta so later walks see the file as
+        /// unchanged. Without a row, every walk re-detected it as Added and no
+        /// catch-up / poll could ever be a no-change run.
+        permanent_stat: Option<(i64, i64)>,
+    },
 }
 
 /// A parsed file result ready for the embed stage.
@@ -276,15 +288,19 @@ pub struct IndexPipelineStats {
     pub incr_phase2_total_ms: u64,
     /// Phase-2 sub: the `SELECT name FROM symbol WHERE file IN $files` query (ms).
     pub incr_p2_symname_ms: u64,
-    /// Phase-2 sub: the `SELECT from_file FROM raw_edge WHERE to_name IN $names`
-    /// direction-2 expansion scan (ms). PRIME SUSPECT — timed in isolation.
+    /// Phase-2 sub: the per-name `raw_edge WHERE to_name = $n` direction-2
+    /// expansion (ms), timed in isolation.
     pub incr_p2_dir2_scan_ms: u64,
     /// Phase-2 sub: the scoped `DELETE FROM calls` (ms).
     pub incr_p2_delete_calls_ms: u64,
-    /// Phase-2 sub: the raw_edge keyset scan + resolve loop + tail flush (ms).
+    /// Phase-2 sub: the per-file-batch raw_edge read + resolve loop + tail flush
+    /// (ms); the whole full Phase 2 when `incr_p2_full_fallback`.
     pub incr_p2_reresolve_ms: u64,
     /// Phase-2 sub: final `resolve_set.len()` (a count, not a time — explains cost).
     pub incr_resolve_set_size: u64,
+    /// The blast radius exceeded the incremental budget, so the run replayed the
+    /// full Phase 2 instead.
+    pub incr_p2_full_fallback: bool,
 }
 
 /// Per-stage timings produced INSIDE `resolve_edges_incremental` and threaded up
@@ -297,6 +313,41 @@ pub struct Phase2IncrStats {
     pub p2_delete_calls_ms: u64,
     pub p2_reresolve_ms: u64,
     pub resolve_set_size: u64,
+    /// The blast radius was too large for per-file re-resolution, so the run
+    /// replayed the full file-keyset Phase 2 instead.
+    pub full_fallback: bool,
+}
+
+/// Incremental Phase 2 hands off to the full Phase 2 replay once the resolve set
+/// covers more than 1/N of the indexed files. Re-resolving per file pays a scoped
+/// calls delete, a symbol lookup per page and live index maintenance on every
+/// row, while the replay drops the calls indexes and streams raw_edge once — so
+/// the incremental worst case is bounded by one replay.
+///
+/// Measured (`notepad_incremental_phase2_bench`, 2845 files, release): scoped
+/// re-resolution ≈ 74 ms per resolve-set file (378 files: 27.9 s), the replay
+/// ≈ 31 s ≈ 11 ms per indexed file — break-even ≈ 1/7. (A full REBUILD's Phase 2
+/// is cheaper, 13 s, because its raw edges are still in RAM and `calls` is
+/// already empty; neither is true for an incremental run.)
+const INCREMENTAL_PHASE2_FULL_FALLBACK_DIVISOR: usize = 8;
+
+/// The fallback only engages for resolve sets at least this large: below it a
+/// per-file pass is cheap whatever the repo size (40 files: 0.9 s), and small
+/// repos keep the scoped path (and its never-touch-unrelated-edges guarantee).
+const INCREMENTAL_PHASE2_FULL_FALLBACK_MIN_FILES: usize = 64;
+
+/// Files per raw_edge read in incremental Phase 2 (`from_file IN $files`). Bounds
+/// rows held per read to the edges of this many files, independent of the
+/// resolve-set size. `IN` cost grows faster than its list on SurrealDB 2.6.5
+/// (notepad-ade: 2.8 ms/file at 16, 3.9 at 64, 5.0 at 256), so keep it small.
+const INCREMENTAL_PHASE2_FILE_BATCH: usize = 16;
+
+/// `to_name = $n{i}` statements per round trip in the direction-2 expansion.
+const NAME_EXPANSION_BATCH: usize = 64;
+
+fn exceeds_incremental_phase2_budget(resolve_set_len: usize, indexed_files: usize) -> bool {
+    resolve_set_len >= INCREMENTAL_PHASE2_FULL_FALLBACK_MIN_FILES
+        && resolve_set_len.saturating_mul(INCREMENTAL_PHASE2_FULL_FALLBACK_DIVISOR) > indexed_files
 }
 
 /// Per-stage timings produced INSIDE `incremental_run` and threaded up to `run`.
@@ -315,18 +366,75 @@ pub struct IncrementalRunStats {
 }
 
 /// Key used to track whether Phase 2 (raw edge resolution) has completed.
-/// Set once the whole calls graph is resolved; absent means it cannot be
-/// trusted and the next run rebuilds. Versioned: indexes built before the
-/// incremental path kept this marker had their calls graph truncated by a
-/// Phase 2 replay from partial `raw_edge` rows, and lacking the `_v2` key sends
-/// each of them through one full rebuild.
-const EDGES_RESOLVED_KEY: &str = "edges_resolved_v2";
+const EDGES_RESOLVED_KEY: &str = "edges_resolved";
+
+/// Set once the `raw_edge` table holds the raw edges of EVERY indexed file (a full
+/// rebuild's Stage 3, or an edge heal, completed). Incremental runs keep it true by
+/// maintaining raw_edge per file. Anything that rebuilds `calls` from `raw_edge`
+/// requires it: before this flag existed, the RAM-path full rebuild never persisted
+/// raw_edge, so replaying Phase 2 (or re-resolving an unchanged caller) from the
+/// partial table silently dropped most of the call graph.
+pub(crate) const RAW_EDGE_COMPLETE_KEY: &str = "raw_edge_complete";
+
+/// Set once the stored `file_meta` paths were reconciled with the current ignore
+/// rules (nested ignore files included). Absent on DBs written by builds whose
+/// watcher filter read only the ROOT ignore files: those leaked build artifacts
+/// (e.g. `NotepadADE/build-tdd/**`), which nothing else would ever remove. A
+/// watcher run prunes while this is absent, then records it on success.
+const IGNORE_PRUNE_KEY: &str = "ignore_prune_v1";
+
+/// Stored chunks re-embedded to prove an unmarked index's embedding space.
+const IDENTITY_PROBE_SAMPLES: i64 = 3;
+
+/// Same text, same model: providers return the same vector up to float noise
+/// (cosine ≈ 1). Any other model or dimension lands far below this.
+const IDENTITY_PROBE_MIN_COSINE: f32 = 0.99;
+
+/// Cosine similarity; 0 for empty or different-length vectors.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// JSON array of framework resolver names detected by the last whole-repo pass.
+/// Incremental runs only see the changed files, which usually lack the manifest
+/// (package.json / go.mod) that detection keys on, so they start from this set.
+const ACTIVE_FRAMEWORKS_KEY: &str = "active_frameworks";
+
+/// Parse-pool thread stack. The default rayon global pool has ~2 MB stacks which
+/// overflow on deeply-nested ASTs (Linux kernel C files). 64 MB virtual stack (only
+/// committed pages are physical) gives 3200 frames * ~512 bytes per frame = ~1.6 MB
+/// actual usage with headroom for future growth.
+const PARSE_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// RAM cap on raw edges buffered for the in-RAM Phase 2 (full rebuild and edge
+/// heal). Memory bound: 8M × ~200 bytes ≈ 1.6 GB (constant, bounded regardless of
+/// repo size). Measured: the Linux kernel produces 4.44M raw edges in a full
+/// rebuild, which exceeded the previous 4M cap and fell through to the slow
+/// DB-scan Phase 2 path (45+ min). 8M gives ~1.8× headroom above real kernel
+/// scale while keeping memory bounded. Repos exceeding 8M edges (Chromium-scale)
+/// overflow to the DB path gracefully — no OOM risk.
+const MAX_RAM_EDGES: usize = 8_000_000;
+
+/// Files parsed per round during an edge heal: bounds the raw edges held in RAM
+/// to O(chunk × edges/file), independent of repo size.
+const HEAL_PARSE_CHUNK: usize = 1024;
 
 /// A row fetched from `raw_edge` during Phase 2 edge resolution.
 /// Shared by both full-build and incremental Phase 2 paths.
 #[derive(Deserialize)]
 struct RawEdgeRow {
-    id_str: String,
     from_file: String,
     #[allow(dead_code)]
     from_name: String,
@@ -487,27 +595,136 @@ impl IndexPipeline {
     /// Enter the destructive full-rebuild window while the consumer's per-repo
     /// serialization lock is held. The vector write lock is released before the DB
     /// await (preserving `repo_dbs → vector_index`), but the mutation fence remains
-    /// set so neither query nor warm can expose a shard until publish succeeds.
+    /// set so neither query nor warm can expose a LIVE shard until publish succeeds.
+    ///
+    /// The persisted shard file is deliberately kept: the run's epoch bump already
+    /// makes its content stamp obsolete for every normal warm, and until publish it
+    /// is the only stale snapshot a cold worker can answer queries from
+    /// (`shard_file::open_current_stale`). Publish invalidates it.
     async fn begin_full_vector_update(
         &self,
         vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+        captured: Option<(crate::vector::VectorIndex, String)>,
     ) {
         if let Some(vi) = vector_index {
-            vi.write().await.begin_full_update(&self.repo);
+            let mut vi = vi.write().await;
+            vi.begin_full_update(&self.repo);
+            // Same write guard: no query can observe the fence without a snapshot.
+            if let Some((index, identity)) = captured {
+                let count = index.len();
+                if vi.install_stale(&self.repo, index, identity) {
+                    info!(repo = %self.repo, count, "full_rebuild: captured stale snapshot for queries during the rebuild");
+                }
+            }
         }
-        self.invalidate_persisted_shard();
     }
 
-    /// Incremental counterpart: the old shard is removed from search but retained
-    /// privately so unaffected vectors can be re-used when the delta publishes.
+    /// Incremental counterpart: the old shard is removed from the live path but
+    /// retained privately so unaffected vectors can be re-used when the delta
+    /// publishes (and searched as the stale snapshot until then). The persisted
+    /// file is kept for the same reason as in `begin_full_vector_update`.
     async fn begin_incremental_vector_update(
         &self,
         vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+        identity_key: Option<&str>,
     ) {
         if let Some(vi) = vector_index {
-            vi.write().await.begin_incremental_update(&self.repo);
+            let mut vi = vi.write().await;
+            vi.begin_incremental_update(&self.repo);
+            if let Some(key) = identity_key {
+                vi.note_incremental_identity(&self.repo, key.to_owned());
+            }
         }
-        self.invalidate_persisted_shard();
+    }
+
+    /// True when a sample of stored chunk vectors is what this run's client
+    /// produces for the same text — i.e. the stored vectors are in this run's
+    /// embedding space. One small embed request; false whenever it cannot be
+    /// shown (no client, no embedded rows, request failure, any sample off).
+    async fn stored_vectors_match_client(&self, db: &Surreal<Db>) -> bool {
+        #[derive(Deserialize)]
+        struct Row {
+            content: String,
+            #[serde(deserialize_with = "crate::store::ops::de_embedding_dual")]
+            embedding: Vec<f32>,
+        }
+        let Some(client) = &self.voyage else {
+            return false;
+        };
+        // A match, not `.and_then(|mut r| r.take(0))`: that closure trips
+        // `clippy::result_large_err` (surrealdb::Error is >140 bytes).
+        let response = db
+            .query("SELECT content, embedding FROM chunk WHERE embedding IS NOT NONE LIMIT $n")
+            .bind(("n", IDENTITY_PROBE_SAMPLES))
+            .await;
+        let rows: Result<Vec<Row>, _> = match response {
+            Ok(mut r) => r.take(0),
+            Err(e) => Err(e),
+        };
+        let rows: Vec<Row> = match rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(repo = %self.repo, error = %e, "identity probe: could not sample stored chunks");
+                return false;
+            }
+        };
+        let rows: Vec<Row> = rows
+            .into_iter()
+            .filter(|r| !r.content.trim().is_empty() && !r.embedding.is_empty())
+            .collect();
+        if rows.is_empty() {
+            return false;
+        }
+        let texts: Vec<String> = rows.iter().map(|r| r.content.clone()).collect();
+        let fresh = match client
+            .embed(&texts, crate::embedding::InputType::Document)
+            .await
+        {
+            Ok(fresh) if fresh.len() == rows.len() => fresh,
+            Ok(_) => return false,
+            Err(e) => {
+                warn!(repo = %self.repo, error = %format!("{e:#}"), "identity probe: embed failed");
+                return false;
+            }
+        };
+        rows.iter()
+            .zip(&fresh)
+            .all(|(row, f)| cosine(&row.embedding, f) >= IDENTITY_PROBE_MIN_COSINE)
+    }
+
+    /// Before a full rebuild deletes everything: if no snapshot of the current
+    /// index is in memory (cold worker) and the rebuild keeps the embedding space,
+    /// load one from the still-intact DB so queries during the rebuild still have
+    /// an answer. Loaded BEFORE the fence and installed by
+    /// `begin_full_vector_update` under the same write guard as the fence, so
+    /// there is no window without a snapshot. One warm-equivalent scan, only on
+    /// cold rebuilds; best-effort.
+    async fn load_stale_snapshot_if_cold(
+        &self,
+        db: &Surreal<Db>,
+        vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+        stored_identity: Option<&str>,
+        identity_key: Option<&str>,
+    ) -> Option<(crate::vector::VectorIndex, String)> {
+        let (Some(vi), Some(key)) = (vector_index, identity_key) else {
+            return None;
+        };
+        {
+            let vi = vi.read().await;
+            if stored_identity != Some(key)
+                || vi.is_resident(&self.repo)
+                || vi.has_stale(&self.repo)
+            {
+                return None;
+            }
+        }
+        match crate::vector::VectorIndex::load_from_db(db).await {
+            Ok(index) => Some((index, key.to_owned())),
+            Err(e) => {
+                warn!(repo = %self.repo, error = %format!("{e:#}"), "full_rebuild: stale snapshot capture failed; queries wait for the rebuild");
+                None
+            }
+        }
     }
 
     /// Fail-closed cleanup after a resident vector publish whose DB commit did not
@@ -588,14 +805,34 @@ impl IndexPipeline {
 
         // Snapshot the REAL client used by this run before any tracker/parse/store
         // work. This same snapshot is used for mixed-index gating, resident publish,
-        // persisted-shard stamp, and the final commit marker.
+        // persisted-shard stamp, and the identity commit marker.
         let run_identity = self.voyage.as_ref().map(EmbeddingIdentity::from_client);
         let stored_identity = get_meta(db, EMBEDDING_IDENTITY_KEY).await?;
+        let mut adopted_identity = false;
         let identity_forces_rebuild = match (&run_identity, &stored_identity) {
             (Some(current), Some(stored)) => current.as_key_string() != *stored,
-            (Some(_), None) => has_data,
+            (Some(current), None) if has_data => {
+                // An ABSENT marker is not a mismatch. Builds before the marker
+                // moved ahead of Phase 2 lost it on every interrupted run (crash,
+                // cancel, a Phase 2 that never finished) — the vectors were fine.
+                // Prove the space by re-embedding a few stored chunks; only an
+                // unprovable or different space still costs a full re-embed.
+                adopted_identity = self.stored_vectors_match_client(db).await;
+                if adopted_identity {
+                    set_meta(db, EMBEDDING_IDENTITY_KEY, &current.as_key_string())
+                        .await
+                        .context("adopt verified embedding identity")?;
+                    info!(repo = %self.repo, "embedding identity marker was missing; stored vectors verified against the client and the marker restored (no re-embed)");
+                }
+                !adopted_identity
+            }
+            (Some(_), None) => false,
             (None, _) => false,
         };
+        // The interrupted run that lost the marker may have left files half
+        // processed (no file_meta): walk the repo so every one is reconciled,
+        // whatever change set the trigger carried.
+        let changes = if adopted_identity { None } else { changes };
 
         // `changes=None` is manual/poll mode and may discover changes after walking;
         // treat it as potentially mutating. An explicitly-empty watcher set is the
@@ -650,6 +887,8 @@ impl IndexPipeline {
                     run_identity_key.as_deref(),
                 )
                 .await?;
+            // The rebuild's walk applied every ignore file: nothing left to prune.
+            set_meta(db, IGNORE_PRUNE_KEY, "1").await?;
             let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
             info!(
                 repo = %self.repo,
@@ -719,11 +958,58 @@ impl IndexPipeline {
         // change set is watcher-supplied (no walk performed).
         let walk_start = Instant::now();
         let mut incr_walk_ms: u64 = 0;
+        let ignore_pruned = get_meta(db, IGNORE_PRUNE_KEY).await?.is_some();
         let file_changes = match changes {
             Some(explicit) => {
-                // Watcher-supplied explicit change set: skip the walk entirely.
-                // total_files is derived from stored_meta (already loaded above).
-                explicit
+                // Watcher-supplied explicit change set: skip the full walk. Event
+                // kinds are re-derived from the filesystem and directory events
+                // expanded (see normalize_explicit_changes); total_files is derived
+                // from stored_meta (already loaded above).
+                let stored_paths: HashSet<String> =
+                    stored_meta.iter().map(|m| m.path.clone()).collect();
+                // An edited ignore file can exclude files that are already stored,
+                // and no event will ever arrive for them. Re-check every stored
+                // path then (and once on DBs that predate nested-ignore support).
+                let prune = !ignore_pruned || explicit.iter().any(|c| is_ignore_file(&c.path));
+                let mut changes = normalize_explicit_changes(
+                    &self.repo,
+                    explicit,
+                    &stored_paths,
+                    &self.extra_extensions,
+                    &self.ignore_filenames,
+                    &self.ignore_paths,
+                );
+                if prune {
+                    let repo = self.repo.clone();
+                    let ext = self.extra_extensions.clone();
+                    let names = self.ignore_filenames.clone();
+                    let paths = self.ignore_paths.clone();
+                    let pruned = tokio::task::spawn_blocking(move || {
+                        now_ignored_deletions(
+                            std::path::Path::new(&repo),
+                            &stored_paths,
+                            ext,
+                            names,
+                            paths,
+                        )
+                    })
+                    .await
+                    .context("ignore prune spawn_blocking")?;
+                    if !pruned.is_empty() {
+                        info!(repo = %self.repo, files = pruned.len(), "pruning stored files now excluded by ignore rules");
+                    }
+                    let already_deleted: HashSet<String> = changes
+                        .iter()
+                        .filter(|c| c.kind == ChangeKind::Deleted)
+                        .map(|c| c.path.clone())
+                        .collect();
+                    changes.extend(
+                        pruned
+                            .into_iter()
+                            .filter(|c| !already_deleted.contains(&c.path)),
+                    );
+                }
+                changes
             }
             None => {
                 // Manual/poll incremental: must walk to detect changes.
@@ -752,6 +1038,47 @@ impl IndexPipeline {
             }
         };
 
+        // Fold the durable retry queue into this run: files skipped earlier for a
+        // transient reason have no file_meta, and a watcher-path run never walks,
+        // so nothing else would ever revisit them. Entries are classified like
+        // watcher paths; ones that no longer resolve to a file are dropped from
+        // the queue here.
+        let file_changes = {
+            let pending = crate::store::ops::get_pending_retry(db).await?;
+            if pending.is_empty() {
+                file_changes
+            } else {
+                let stored_paths: HashSet<String> =
+                    stored_meta.iter().map(|m| m.path.clone()).collect();
+                let resolved = normalize_explicit_changes(
+                    &self.repo,
+                    pending
+                        .iter()
+                        .map(|p| FileChange {
+                            path: p.clone(),
+                            kind: ChangeKind::Modified,
+                        })
+                        .collect(),
+                    &stored_paths,
+                    &self.extra_extensions,
+                    &self.ignore_filenames,
+                    &self.ignore_paths,
+                );
+                let resolved_paths: HashSet<&str> =
+                    resolved.iter().map(|c| c.path.as_str()).collect();
+                let vanished: Vec<String> = pending
+                    .iter()
+                    .filter(|p| !resolved_paths.contains(p.as_str()))
+                    .cloned()
+                    .collect();
+                crate::store::ops::remove_pending_retry(db, &vanished).await?;
+                let mut merged = file_changes;
+                let already: HashSet<String> = merged.iter().map(|c| c.path.clone()).collect();
+                merged.extend(resolved.into_iter().filter(|c| !already.contains(&c.path)));
+                merged
+            }
+        };
+
         // Filter out Added/Modified changes whose paths are inside dot-prefixed directories.
         // Deleted changes are allowed through to clean up any previously indexed dot-dir entries.
         let file_changes = filter_hidden_changes_with(
@@ -762,48 +1089,30 @@ impl IndexPipeline {
             self.ignore_paths.clone(),
         );
 
-        // A missing edges_resolved marker means the calls graph cannot be trusted
-        // anywhere, so recover repo-wide before any incremental work: an
-        // incremental run re-resolves only its changed files' blast radius and
-        // would leave the rest unresolved. Recovery is always a full rebuild.
-        // Replaying Phase 2 from `raw_edge` is not safe: incremental runs leave
-        // rows there for their changed files only, and a replay deletes every
-        // calls edge before rebuilding from whatever rows it finds. The embedding
-        // cache keeps the rebuild mostly to parsing and resolution.
-        if get_meta(db, EDGES_RESOLVED_KEY).await?.is_none() {
-            if self.voyage.is_none() && !self.allow_no_client_mutation {
-                anyhow::bail!(
-                    "embedding client required to rebuild {} after unresolved edges",
-                    self.repo
-                );
-            }
-            warn!(
-                repo = %self.repo,
-                "edges_resolved marker absent — forcing full rebuild to recover calls edges"
-            );
-            let stage_stats = self
-                .full_rebuild(
-                    db,
-                    vector_index,
-                    None,
-                    event_bus,
-                    key_hints,
-                    cancel_token.as_ref(),
-                    run_identity_key.as_deref(),
-                )
-                .await?;
-            let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
-            let total_files = stored_meta.len() as u64;
-            return Ok(IndexPipelineStats {
-                indexed_files: indexed,
-                total_files,
-                phase2_ms: stage_stats.phase2_ms,
-                ..Default::default()
-            });
-        }
-
         if file_changes.is_empty() {
             debug!(repo = %self.repo, "no changes detected");
+            let resolved = get_meta(db, EDGES_RESOLVED_KEY).await?.is_some();
+            let raw_edge_complete = get_meta(db, RAW_EDGE_COMPLETE_KEY).await?.is_some();
+            if !raw_edge_complete {
+                // raw_edge does not cover every file (a DB written before raw edges
+                // were persisted on the RAM path, or an interrupted heal). Replaying
+                // Phase 2 from it would wipe `calls` down to the files it does cover,
+                // so rebuild raw_edge from source instead — no embedding involved.
+                info!(repo = %self.repo, "raw_edge incomplete — healing call graph");
+                self.heal_edges(db, progress.as_ref(), cancel_token.as_ref())
+                    .await
+                    .context("edge heal on no-change run")?;
+            } else if !resolved {
+                // Crash after Stage 3 / during Phase 2: raw_edge is complete, so a
+                // full Phase 2 replay reproduces the call graph exactly.
+                info!(repo = %self.repo, "edges_resolved marker absent — replaying Phase 2 from DB");
+                self.resolve_edges_phase2(db, progress.as_ref(), cancel_token.as_ref())
+                    .await
+                    .context("edges Phase 2 replay on no-change run")?;
+            }
+            if !ignore_pruned {
+                set_meta(db, IGNORE_PRUNE_KEY, "1").await?;
+            }
             let indexed = stored_meta.len() as u64;
             let total_files = stored_meta.len() as u64;
             return Ok(IndexPipelineStats {
@@ -840,8 +1149,14 @@ impl IndexPipeline {
                 key_hints,
                 cancel_token.as_ref(),
                 run_identity_key.as_deref(),
+                stored_meta.len(),
             )
             .await?;
+        // Both change-set shapes reconciled stored files with the ignore rules:
+        // the walk emits Deleted for unwalked paths, the watcher path pruned above.
+        if !ignore_pruned {
+            set_meta(db, IGNORE_PRUNE_KEY, "1").await?;
+        }
 
         let post_meta_start = Instant::now();
         let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
@@ -871,6 +1186,7 @@ impl IndexPipeline {
             incr_p2_delete_calls_ms = p2.p2_delete_calls_ms,
             incr_p2_reresolve_ms = p2.p2_reresolve_ms,
             incr_resolve_set_size = p2.resolve_set_size,
+            incr_p2_full_fallback = p2.full_fallback,
             incr_vi_apply_ms,
             incr_post_meta_ms,
             files = indexed,
@@ -891,6 +1207,7 @@ impl IndexPipeline {
             incr_p2_delete_calls_ms: p2.p2_delete_calls_ms,
             incr_p2_reresolve_ms: p2.p2_reresolve_ms,
             incr_resolve_set_size: p2.resolve_set_size,
+            incr_p2_full_fallback: p2.full_fallback,
             ..Default::default()
         })
     }
@@ -983,14 +1300,65 @@ impl IndexPipeline {
             return Err(PipelineAbort::Cancelled.into());
         }
 
+        // Prove the embedding client works BEFORE destroying anything. Everything
+        // below deletes first and embeds later, so a dead/expired key used to turn
+        // every forced rebuild (needs_rebuild, identity mismatch, crash recovery)
+        // into an empty repo. One uncached request; a failure (fatal, or transient
+        // after the normal retries) aborts with the existing index still serving.
+        if let Some(client) = &self.voyage {
+            let probe = match client
+                .embed(
+                    &["context-engine preflight".to_owned()],
+                    crate::embedding::InputType::Document,
+                )
+                .await
+            {
+                Ok(probe) => probe,
+                // Fatal (auth/config): typed so the consumer does not schedule a
+                // retry that would only hammer a dead key.
+                Err(e) => match classify_embed_error(e) {
+                    EmbedFileError::Fatal(e) => {
+                        return Err(PipelineAbort::EmbeddingFailed(format!(
+                            "full_rebuild preflight (existing index left intact): {e:#}"
+                        ))
+                        .into());
+                    }
+                    EmbedFileError::Transient(e) => {
+                        return Err(e.context(
+                            "full_rebuild preflight: embedding endpoint unreachable; existing index left intact",
+                        ));
+                    }
+                },
+            };
+            if probe.len() != 1 || probe[0].is_empty() {
+                anyhow::bail!(
+                    "full_rebuild preflight: embedding endpoint returned {} vectors for 1 input; existing index left intact",
+                    probe.len()
+                );
+            }
+        }
+
         // Enter the fail-closed mutation window BEFORE deleting any durable row.
         // The caller holds the per-repo run lock; query sees Cold and warm install
         // is rejected until the replacement publish atomically releases the fence.
-        self.begin_full_vector_update(vector_index).await;
-        db.query("DELETE FROM index_meta WHERE key = $k")
-            .bind(("k", EMBEDDING_IDENTITY_KEY))
+        let stored_identity = get_meta(db, EMBEDDING_IDENTITY_KEY).await?;
+        let captured = self
+            .load_stale_snapshot_if_cold(db, vector_index, stored_identity.as_deref(), identity_key)
+            .await;
+        self.begin_full_vector_update(vector_index, captured).await;
+        db.query("DELETE FROM index_meta WHERE key IN $keys")
+            .bind((
+                "keys",
+                vec![
+                    EMBEDDING_IDENTITY_KEY.to_owned(),
+                    RAW_EDGE_COMPLETE_KEY.to_owned(),
+                ],
+            ))
             .await
             .context("full_rebuild: clear committed embedding identity before delete")?;
+        bump_index_epoch(db)
+            .await
+            .context("full_rebuild: bump index_epoch")?;
 
         // Delete everything first (crash-safe: file_meta is the commit marker,
         // written per-file only after its chunks are durable).
@@ -1021,12 +1389,32 @@ impl IndexPipeline {
             )
             .await
             .context("full_rebuild: streaming_index")?;
+        // Stage 3 flushed every raw edge (RAM path included), so raw_edge is now
+        // complete and safe to re-resolve from on later incremental / replay runs.
+        set_meta(db, RAW_EDGE_COMPLETE_KEY, "1")
+            .await
+            .context("full_rebuild: set raw_edge_complete")?;
 
-        // Stage 3 has durably committed chunks, raw_edge rows (or bounded RAM raw
-        // edges), and file_meta commit markers. Publish the vector shard now so
-        // MCP can answer vector-only while Phase 2 builds the call graph. If the
-        // process dies during Phase 2, this RAM shard is lost and the existing
-        // edges_resolved/raw_edge recovery path remains the source of truth.
+        // Stage 3 has durably committed chunks, raw_edge rows, and file_meta commit
+        // markers: the vectors ARE this embedding space from here on, so commit
+        // the identity marker now — Phase 2 only rewrites `calls`, which
+        // `edges_resolved` tracks on its own. Committing it last (after Phase 2)
+        // made a warm during Phase 2 read "no identity" as a mismatch and queue a
+        // full re-embed, and turned a crash or cancel mid-Phase-2 into a full
+        // re-embed instead of a Phase 2 replay.
+        if let Some(key) = identity_key
+            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
+                .await
+                .context("commit embedding_identity marker")
+        {
+            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                .await;
+            return Err(e);
+        }
+
+        // Publish the vector shard now so MCP can answer vector-only while Phase 2
+        // builds the call graph. If the process dies during Phase 2, this RAM shard
+        // is lost; the next warm rebuilds it from the committed chunks.
         let vi_publish_ms = if let Some(identity_key) = identity_key {
             self.publish_full_vectors(vector_index, &chunk_vectors, identity_key)
                 .await
@@ -1058,16 +1446,10 @@ impl IndexPipeline {
                     .await
                     .context("full_rebuild: resolve_edges_phase2")
             };
-        let p2 = match phase2_result {
-            Ok(stats) => stats,
-            Err(e) => {
-                if let Some(key) = identity_key {
-                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                        .await;
-                }
-                return Err(e);
-            }
-        };
+        // A Phase 2 failure leaves the committed chunks and the published shard
+        // valid; `edges_resolved` stays unset, so the next run replays Phase 2
+        // from the complete raw_edge table.
+        let p2 = phase2_result?;
         let phase2_ms = phase2_start.elapsed().as_millis() as u64;
         stats.phase2_ms = phase2_ms;
         stats.phase2_sym_load_ms = p2.sym_load_ms;
@@ -1082,18 +1464,6 @@ impl IndexPipeline {
                 repo: self.repo.clone(),
                 elapsed_ms: phase2_ms,
             });
-        }
-
-        // LAST commit marker: every chunk/file_meta row and all resolved edges are
-        // durable before the run identity becomes authoritative.
-        if let Some(key) = identity_key
-            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
-                .await
-                .context("commit embedding_identity marker")
-        {
-            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                .await;
-            return Err(e);
         }
 
         Ok(stats)
@@ -1112,6 +1482,7 @@ impl IndexPipeline {
         key_hints: &[String],
         cancel_token: Option<&CancellationToken>,
         identity_key: Option<&str>,
+        indexed_files: usize,
     ) -> Result<(IncrementalRunStats, u64)> {
         let pre_publish_generation = self.data_dir.as_ref().and_then(|data_dir| {
             let root = crate::vector::shard_file::repo_shard_root(data_dir, &self.repo);
@@ -1150,8 +1521,14 @@ impl IndexPipeline {
         // `calls` deletion is deferred to resolve_edges_incremental, scoped to the
         // computed resolve_set — wiping incoming edges here (as the OR-deleting
         // bulk helper does) is exactly the blow-up we are fixing.
+        // Whether the previous run left a complete call graph. If its Phase 2 was
+        // interrupted (crash, cancel, failure), `calls` is partial beyond this run's
+        // blast radius, so this run must replay the full Phase 2 instead.
+        let prior_graph_complete = get_meta(db, EDGES_RESOLVED_KEY).await?.is_some();
+
         let delete_bulk_start = Instant::now();
-        self.begin_incremental_vector_update(vector_index).await;
+        self.begin_incremental_vector_update(vector_index, identity_key)
+            .await;
         db.query("DELETE FROM index_meta WHERE key IN $keys")
             .bind((
                 "keys",
@@ -1162,6 +1539,9 @@ impl IndexPipeline {
             ))
             .await
             .context("incremental_run: clear committed readiness before delete")?;
+        bump_index_epoch(db)
+            .await
+            .context("incremental_run: bump index_epoch")?;
         delete_files_data_incremental(db, &all_affected)
             .await
             .context("incremental_run: delete_files_data_incremental")?;
@@ -1193,13 +1573,30 @@ impl IndexPipeline {
                 .await
                 .context("incremental_run: delete file_meta for deleted file")?;
         }
+        crate::store::ops::remove_pending_retry(db, &to_delete)
+            .await
+            .context("incremental_run: drop deleted files from pending_retry")?;
 
         // Stage 3 has durably committed the changed files' chunks/raw_edges and
-        // removed deleted files' durable file_meta anchors. Publish the in-memory
-        // vector delta before Phase 2 so MCP can answer vector-only while `calls`
-        // is being rebuilt. The existing file_meta/raw_edge markers remain the
-        // crash-recovery source of truth; this shard is RAM-only and disappears on
-        // restart.
+        // removed deleted files' durable file_meta anchors: every stored vector is
+        // in this run's embedding space, so the identity marker commits HERE, not
+        // after Phase 2 (which only rewrites `calls`, tracked by `edges_resolved`).
+        // Committing it last made a warm during Phase 2 read "no identity" as a
+        // mismatch and queue a full re-embed, and turned a crash or cancel
+        // mid-Phase-2 into a full re-embed instead of a Phase 2 replay.
+        if let Some(key) = identity_key
+            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
+                .await
+                .context("commit embedding_identity marker")
+        {
+            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                .await;
+            return Err(e);
+        }
+
+        // Publish the in-memory vector delta before Phase 2 so MCP can answer
+        // vector-only while `calls` is being rebuilt. This shard is RAM-only; after
+        // a restart the next warm rebuilds it from the committed chunks.
         let vi_apply_ms = if let Some(key) = identity_key {
             self.publish_incremental_vectors(vector_index, &all_affected, &chunk_vectors, key)
                 .await
@@ -1208,27 +1605,29 @@ impl IndexPipeline {
         };
         drop(chunk_vectors);
 
+        // From here on only the call graph is in flight. A failure returns without
+        // rolling the vectors back: they are committed and valid, and
+        // `edges_resolved` (cleared at the start of this run) stays unset, so the
+        // next run replays Phase 2 — see `prior_graph_complete`.
+
         // ── Compute the surface delta now that NEW symbols are written ──────────
         // removed_surface_files = modified files that LOST/MOVED a (name,fqn) pair,
         // plus every deleted file (these gate direction-1). added_names = leaf names
         // that gained a (name,fqn) pair (these gate direction-2). A pure-addition or
         // surface-unchanged file appears in NEITHER gate's file set.
         let surface_start2 = Instant::now();
-        let new_surface = match load_file_surface(db, &to_process)
+        let new_surface = load_file_surface(db, &to_process)
             .await
-            .context("incremental_run: load new symbol surface")
-        {
-            Ok(surface) => surface,
-            Err(e) => {
-                if let Some(key) = identity_key {
-                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                        .await;
-                }
-                return Err(e);
-            }
-        };
+            .context("incremental_run: load new symbol surface")?;
         let delta = compute_surface_delta(&old_surface, &new_surface, &to_process, &to_delete);
         run_stats.surface_delta_ms += surface_start2.elapsed().as_millis() as u64;
+
+        // Re-resolving the blast radius reads unchanged callers' raw edges, which
+        // only exist when raw_edge is complete. Without the flag (a DB written by a
+        // build that kept raw edges RAM-only) heal the whole graph instead of
+        // re-resolving from a partial table, which would drop those callers' edges.
+        let raw_edge_complete = get_meta(db, RAW_EDGE_COMPLETE_KEY).await?.is_some();
+        let scoped_phase2 = raw_edge_complete && prior_graph_complete;
 
         // ── Direction-1: callers pointing INTO a file that REMOVED/MOVED a symbol ─
         // Only a file that LOST a `(name, fqn)` pair (or was deleted) can have
@@ -1239,17 +1638,19 @@ impl IndexPipeline {
         // and stay out of the resolve_set. Pure additions are handled solely by
         // direction-2 (`added_names`). The query runs against the still-intact
         // `calls` table (the incremental delete left `calls` untouched). Skipped
-        // entirely when nothing was removed — the common comment/add-symbol cases.
+        // entirely when nothing was removed — the common comment/add-symbol cases —
+        // and when Phase 2 is not scoped (a full replay needs no blast radius).
         let predelete_start = Instant::now();
-        let dir1_callers: Vec<String> = if delta.removed_surface_files.is_empty() {
+        let dir1_callers: Vec<String> = if !scoped_phase2 || delta.removed_surface_files.is_empty()
+        {
             Vec::new()
         } else {
             #[derive(Deserialize)]
             struct CallerRow {
                 in_file: String,
             }
-            let rows_result: Result<Vec<CallerRow>> = async {
-                db.query(
+            let rows: Vec<CallerRow> = db
+                .query(
                     "SELECT in_file FROM calls \
                      WHERE out_file IN $changed AND in_file NOT IN $affected \
                      GROUP BY in_file",
@@ -1259,24 +1660,7 @@ impl IndexPipeline {
                 .await
                 .context("incremental_run: direction-1 caller query")?
                 .take(0)
-                .context("incremental_run: decode direction-1 callers")
-            }
-            .await;
-            let rows = match rows_result {
-                Ok(rows) => rows,
-                Err(e) => {
-                    if let Some(key) = identity_key {
-                        self.rollback_published_vectors(
-                            db,
-                            vector_index,
-                            key,
-                            pre_publish_generation,
-                        )
-                        .await;
-                    }
-                    return Err(e);
-                }
-            };
+                .context("incremental_run: decode direction-1 callers")?;
             rows.into_iter().map(|r| r.in_file).collect()
         };
         run_stats.predelete_callers_ms = predelete_start.elapsed().as_millis() as u64;
@@ -1295,19 +1679,43 @@ impl IndexPipeline {
             });
         }
         let phase2_start = Instant::now();
-        let phase2_result = self
-            .resolve_edges_incremental(db, &all_affected, &dir1_callers, &delta.added_names)
-            .await
-            .context("incremental_run: resolve_edges_incremental");
-        let phase2_stats = match phase2_result {
-            Ok(stats) => stats,
-            Err(e) => {
-                if let Some(key) = identity_key {
-                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                        .await;
-                }
-                return Err(e);
+        let phase2_stats = if scoped_phase2 {
+            let stats = self
+                .resolve_edges_incremental_with(
+                    db,
+                    &all_affected,
+                    &dir1_callers,
+                    &delta.added_names,
+                    Some(indexed_files),
+                    progress,
+                    cancel_token,
+                )
+                .await
+                .context("incremental_run: resolve_edges_incremental")?;
+            // `incremental_run` cleared `edges_resolved` before deleting; restamp
+            // it now that the blast radius is re-resolved. Leaving it absent made
+            // the next no-change run replay Phase 2 over the whole table.
+            set_meta(db, EDGES_RESOLVED_KEY, "1")
+                .await
+                .context("incremental_run: set edges_resolved")?;
+            stats
+        } else if raw_edge_complete {
+            info!(repo = %self.repo, "incremental: previous Phase 2 incomplete — replaying full Phase 2");
+            let replay_start = Instant::now();
+            self.resolve_edges_phase2(db, progress, cancel_token)
+                .await
+                .context("incremental_run: Phase 2 replay")?;
+            Phase2IncrStats {
+                p2_reresolve_ms: replay_start.elapsed().as_millis() as u64,
+                full_fallback: true,
+                ..Default::default()
             }
+        } else {
+            info!(repo = %self.repo, "incremental: raw_edge incomplete — healing call graph");
+            self.heal_edges(db, progress, cancel_token)
+                .await
+                .context("incremental_run: heal_edges")?;
+            Phase2IncrStats::default()
         };
         run_stats.phase2_total_ms = phase2_start.elapsed().as_millis() as u64;
         run_stats.phase2 = phase2_stats;
@@ -1318,32 +1726,185 @@ impl IndexPipeline {
             });
         }
 
-        // The changed files' edges are resolved again. `run` recovered any
-        // unresolved state before this run, so the whole graph is resolved.
-        if let Err(e) = set_meta(db, EDGES_RESOLVED_KEY, "1")
-            .await
-            .context("commit edges_resolved marker")
-        {
-            if let Some(key) = identity_key {
-                self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                    .await;
-            }
-            return Err(e);
-        }
-
-        // LAST commit marker for the incremental path, after changed chunks,
-        // file_meta, and resolved edges are durable.
-        if let Some(key) = identity_key
-            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
-                .await
-                .context("commit embedding_identity marker")
-        {
-            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                .await;
-            return Err(e);
-        }
-
         Ok((run_stats, vi_apply_ms))
+    }
+
+    // ─── Edge heal ───────────────────────────────────────────────────────
+
+    /// Rebuild `raw_edge` (and from it `calls`) for every indexed file by
+    /// re-parsing source — no embedding, no API key, chunks/symbols/vectors/file_meta
+    /// untouched.
+    ///
+    /// WHY: DBs written before the RAM-path full rebuild persisted raw edges hold a
+    /// partial raw_edge table, and some of them already carry a `calls` table
+    /// truncated by the old lossy replay with `edges_resolved` stamped over it —
+    /// indistinguishable from a healthy DB. A forced full rebuild would heal them
+    /// too, but it is destructive before it embeds anything, so a dead or expired
+    /// key would empty the repo. This heal needs only the files on disk.
+    ///
+    /// Crash-safe: both markers are cleared first and `raw_edge_complete` is set
+    /// only after the last raw edge is durable, so an interrupted heal re-runs.
+    /// Memory: files are parsed HEAL_PARSE_CHUNK at a time.
+    async fn heal_edges(
+        &self,
+        db: &Surreal<Db>,
+        progress: Option<&ProgressHandle>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<Phase2Stats> {
+        db.query("DELETE FROM index_meta WHERE key IN $keys")
+            .bind((
+                "keys",
+                vec![
+                    RAW_EDGE_COMPLETE_KEY.to_owned(),
+                    EDGES_RESOLVED_KEY.to_owned(),
+                ],
+            ))
+            .await
+            .context("heal: clear edge markers")?;
+
+        let files: Vec<String> = get_all_file_meta(db, &self.repo)
+            .await?
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        let registry = self.framework_registry(db, &files, true).await?;
+
+        db.query("DELETE FROM raw_edge")
+            .await
+            .context("heal: delete raw_edge")?;
+
+        let heal_start = Instant::now();
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .stack_size(PARSE_STACK_SIZE)
+                .build()
+                .context("heal: build parse pool")?,
+        );
+        let mut total_edges: u64 = 0;
+        // Same RAM fast path as a full rebuild: the DB keyset-scan Phase 2 was
+        // measured at 45+ min on the kernel, and the heal runs once per repo on
+        // upgrade with that repo's call graph empty meanwhile.
+        let mut ram_edges: Option<Vec<RawEdgeRecord>> = Some(Vec::new());
+        for chunk in files.chunks(HEAL_PARSE_CHUNK) {
+            if let Some(ct) = cancel_token
+                && ct.is_cancelled()
+            {
+                return Err(PipelineAbort::Cancelled.into());
+            }
+            let chunk_owned = chunk.to_vec();
+            let reg = registry.clone();
+            let pool = pool.clone();
+            let edges: Vec<RawEdgeRecord> = tokio::task::spawn_blocking(move || {
+                use rayon::prelude::*;
+                pool.install(|| {
+                    chunk_owned
+                        .par_iter()
+                        .flat_map_iter(|file| match parse_one_file_with_frameworks(file, &reg) {
+                            ParseOutput::Parsed(parsed) => parsed.raw_edges,
+                            ParseOutput::Skipped { .. } => Vec::new(),
+                        })
+                        .collect()
+                })
+            })
+            .await
+            .context("heal: parse spawn_blocking")?;
+            total_edges += edges.len() as u64;
+            for batch in edges.chunks(RAW_EDGE_INSERT_BATCH_SIZE) {
+                flush_raw_edge_batch_native(db, batch)
+                    .await
+                    .context("heal: write raw_edge batch")?;
+            }
+            if let Some(buf) = ram_edges.as_mut() {
+                if buf.len() + edges.len() <= MAX_RAM_EDGES {
+                    buf.extend(edges);
+                } else {
+                    ram_edges = None;
+                }
+            }
+        }
+        set_meta(db, RAW_EDGE_COMPLETE_KEY, "1")
+            .await
+            .context("heal: set raw_edge_complete")?;
+        info!(
+            repo = %self.repo,
+            files = files.len(),
+            raw_edges = total_edges,
+            parse_write_ms = heal_start.elapsed().as_millis() as u64,
+            "heal: raw_edge rebuilt from source"
+        );
+        // Full Phase 2 from the now-complete edge set; both paths stamp
+        // edges_resolved. The RAM resolver does not clear `calls` itself (a full
+        // rebuild already emptied it), so the heal does.
+        match ram_edges {
+            Some(edges) => {
+                db.query("DELETE FROM calls")
+                    .await
+                    .context("heal: delete calls")?;
+                self.resolve_edges_from_ram(db, edges, None, progress, cancel_token)
+                    .await
+            }
+            None => self.resolve_edges_phase2(db, progress, cancel_token).await,
+        }
+    }
+
+    // ─── Framework detection ─────────────────────────────────────────────
+
+    /// Build the framework registry for a run over `files`.
+    ///
+    /// Whole-repo passes (`whole_repo`: full rebuild, edge heal) detect over every
+    /// file and persist the active set. Incremental runs start from that persisted
+    /// set and add whatever the changed files reveal: detection keys on manifests
+    /// (package.json, go.mod, …) that an edit to `App.tsx` alone does not include,
+    /// so detecting over the change set only used to drop every framework edge of
+    /// the edited files. Re-detecting over the whole repo per incremental is not an
+    /// option either — the Django/Spring detectors read every .py/.java file.
+    /// Frameworks are only removed by a whole-repo pass (stale extra edges, never
+    /// missing ones).
+    async fn framework_registry(
+        &self,
+        db: &Surreal<Db>,
+        files: &[String],
+        whole_repo: bool,
+    ) -> Result<Arc<crate::indexing::frameworks::FrameworkRegistry>> {
+        use crate::indexing::frameworks::{DetectionContext, FrameworkRegistry};
+        let persisted: Vec<String> = if whole_repo {
+            Vec::new()
+        } else {
+            get_meta(db, ACTIVE_FRAMEWORKS_KEY)
+                .await?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        };
+        let files_owned: Vec<String> = files.to_vec();
+        let persisted_for_detect = persisted.clone();
+        let registry = tokio::task::spawn_blocking(move || {
+            let mut registry = FrameworkRegistry::new();
+            let file_set: HashSet<String> = files_owned.into_iter().collect();
+            let ctx = DetectionContext {
+                file_set: &file_set,
+                read_file: &|path: &str| std::fs::read_to_string(path).ok(),
+            };
+            registry.detect(&ctx);
+            registry.activate_names(&persisted_for_detect);
+            registry
+        })
+        .await
+        .context("framework detection spawn_blocking")?;
+
+        let mut active: Vec<String> = registry
+            .active_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        active.sort();
+        let mut persisted_sorted = persisted;
+        persisted_sorted.sort();
+        if whole_repo || active != persisted_sorted {
+            set_meta(db, ACTIVE_FRAMEWORKS_KEY, &serde_json::to_string(&active)?)
+                .await
+                .context("persist active_frameworks")?;
+        }
+        Ok(Arc::new(registry))
     }
 
     // ─── Streaming parse→embed→write pipeline ────────────────────────────
@@ -1395,18 +1956,10 @@ impl IndexPipeline {
         let key_hints_owned: Vec<String> = key_hints.to_vec();
 
         // ── Framework detection (once per run) ───────────────────────────────
-        // Build a file set from the files being indexed to detect active frameworks.
-        let framework_registry = {
-            use crate::indexing::frameworks::{DetectionContext, FrameworkRegistry};
-            let mut registry = FrameworkRegistry::new();
-            let file_set: HashSet<String> = files.iter().cloned().collect();
-            let ctx = DetectionContext {
-                file_set: &file_set,
-                read_file: &|path: &str| std::fs::read_to_string(path).ok(),
-            };
-            registry.detect(&ctx);
-            Arc::new(registry)
-        };
+        let framework_registry = self
+            .framework_registry(db, files, is_full_rebuild)
+            .await
+            .context("streaming_index: framework detection")?;
 
         // ── Stage 1: parallel parse (rayon), feed into bounded channel ────
         let (parse_tx, parse_rx) = mpsc::channel::<ParseOutput>(PARSE_CHANNEL_CAP);
@@ -1423,8 +1976,6 @@ impl IndexPipeline {
                 // per frame = ~1.6 MB actual usage with headroom for future growth.
                 // We do NOT change the global pool — vector search uses it and must
                 // not be affected.
-                const PARSE_STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB virtual
-
                 let pool = rayon::ThreadPoolBuilder::new()
                     .stack_size(PARSE_STACK_SIZE)
                     .build();
@@ -1469,6 +2020,14 @@ impl IndexPipeline {
         // "user cancelled" from "Voyage failed".
         let embed_error: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
+        // Files skipped for a transient reason after their old rows were deleted;
+        // persisted to `pending_retry` when the run completes.
+        let retry_paths: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Permanently skipped files `(path, mtime, size)`: committed as zero-chunk
+        // file_meta rows when the run completes.
+        let skipped_permanent: Arc<std::sync::Mutex<Vec<(String, i64, i64)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
 
         {
             let voyage_clone = voyage.clone();
@@ -1480,6 +2039,8 @@ impl IndexPipeline {
             let hints_clone = key_hints_owned.clone();
             let cancel_clone = cancel_token.cloned();
             let embed_error_clone = embed_error.clone();
+            let retry_paths_clone = retry_paths.clone();
+            let skipped_permanent_clone = skipped_permanent.clone();
 
             tokio::spawn(async move {
                 // Convert mpsc receiver to a stream that stops on cancel.
@@ -1506,6 +2067,8 @@ impl IndexPipeline {
                         let hints_ref = hints_clone.clone();
                         let ct_ref = cancel_clone.clone();
                         let err_slot = embed_error_clone.clone();
+                        let retry_ref = retry_paths_clone.clone();
+                        let skipped_ref = skipped_permanent_clone.clone();
                         async move {
                             // Short-circuit if cancelled — skip the expensive embed call.
                             if let Some(ref ct) = ct_ref
@@ -1514,7 +2077,20 @@ impl IndexPipeline {
                                 return None;
                             }
                             match output {
-                                ParseOutput::Skipped { file, reason } => {
+                                ParseOutput::Skipped {
+                                    file,
+                                    reason,
+                                    retry,
+                                    permanent_stat,
+                                } => {
+                                    if retry && let Ok(mut v) = retry_ref.lock() {
+                                        v.push(file.clone());
+                                    }
+                                    if let Some((mtime, size)) = permanent_stat
+                                        && let Ok(mut v) = skipped_ref.lock()
+                                    {
+                                        v.push((file.clone(), mtime, size));
+                                    }
                                     // Emit skip event and count it — no EmbeddedFile produced.
                                     if let Some(ref bus) = bus_ref {
                                         bus.emit(IndexEvent::FileSkipped {
@@ -1569,8 +2145,14 @@ impl IndexPipeline {
                                                         file = %file_path,
                                                         error = %msg,
                                                         "embed failed (transient, retry exhausted) — skipping file; \
-                                                         will retry on next index trigger"
+                                                         queued in pending_retry"
                                                     );
+                                                    // Its old rows are already gone: queue it so
+                                                    // the next run retries it even when that run is
+                                                    // a watcher trigger that never walks the repo.
+                                                    if let Ok(mut v) = retry_ref.lock() {
+                                                        v.push(file_path.clone());
+                                                    }
                                                     // Emit FileSkipped event + advance progress so
                                                     // the run completes without this file.
                                                     if let Some(ref bus) = bus_ref {
@@ -1699,15 +2281,17 @@ impl IndexPipeline {
         let mut pending_symbol_batch: Vec<Symbol> = Vec::with_capacity(SYM_BATCH_SIZE);
         // Cross-file raw_edge accumulator: buffer raw edges from multiple files before INSERT.
         // Reduces raw_edge write round-trips from O(files) to O(total_edges/RAW_EDGE_INSERT_BATCH_SIZE).
-        // Used on the overflow path (full rebuild after RAM cap exceeded) and incremental path.
-        // The RAM fast path (pre-overflow full rebuild) does NOT use this — edges stay in ram_raw_edges.
+        // Every path writes through it, including the RAM fast path (which ALSO keeps
+        // a copy in ram_raw_edges for Phase 2): raw_edge must be complete for the
+        // incremental path to re-resolve unchanged callers (RAW_EDGE_COMPLETE_KEY).
         let mut pending_raw_edge_batch: Vec<RawEdgeRecord> =
             Vec::with_capacity(RAW_EDGE_INSERT_BATCH_SIZE);
 
-        // Full-rebuild optimisation: buffer raw_edges in RAM (up to MAX_RAM_EDGES).
-        // Avoids writing/reading raw_edges from DB (saves ~27s for notepad-ade).
-        // If the repo exceeds MAX_RAM_EDGES, the buffer is flushed to DB and
-        // `ram_edges_overflowed` is set — Phase 2 falls back to the DB scan path.
+        // Full-rebuild optimisation: buffer raw_edges in RAM (up to MAX_RAM_EDGES)
+        // so Phase 2 skips the DB read-back. They are still written to raw_edge
+        // (see pending_raw_edge_batch). If the repo exceeds MAX_RAM_EDGES, the
+        // buffer is dropped and `ram_edges_overflowed` is set — Phase 2 falls back
+        // to the DB scan path.
         // Memory bound: 8M × ~200 bytes ≈ 1.6 GB (constant, bounded regardless of
         // repo size). Fits comfortably in a 64 GB workstation.
         // Measured: the Linux kernel produces 4.44M raw edges in a full rebuild,
@@ -1716,7 +2300,6 @@ impl IndexPipeline {
         // while keeping memory bounded. Repos exceeding 8M edges (Chromium-scale)
         // overflow to DB gracefully — no OOM risk.
         // NOT used for incremental (few edges, existing DB path is already fast).
-        const MAX_RAM_EDGES: usize = 8_000_000;
         let mut ram_raw_edges: Vec<RawEdgeRecord> = if is_full_rebuild {
             Vec::with_capacity(std::cmp::min(4096, MAX_RAM_EDGES))
         } else {
@@ -1791,9 +2374,13 @@ impl IndexPipeline {
         // No data loss; file_meta crash-safety ordering is untouched.
         if is_full_rebuild {
             let t_sym_idx_drop = Instant::now();
+            // `idx_raw_edge_to_name` rides along: the bulk raw_edge write is just as
+            // large, and only incremental Phase 2 reads it (rebuilt after the raw_edge
+            // tail flush below; crash recovery via store::ensure_secondary_indexes).
             db.query(
                 "REMOVE INDEX IF EXISTS idx_symbol_file ON symbol; \
-                 REMOVE INDEX IF EXISTS idx_symbol_name ON symbol;",
+                 REMOVE INDEX IF EXISTS idx_symbol_name ON symbol; \
+                 REMOVE INDEX IF EXISTS idx_raw_edge_to_name ON raw_edge;",
             )
             .await
             .context("streaming_index: drop symbol indexes")?;
@@ -1863,54 +2450,33 @@ impl IndexPipeline {
             // ── raw edges ──────────────────────────────────────────────
             let t1 = Instant::now();
             total_raw_edges_count += ef.raw_edges.len() as u64;
-            // Full-rebuild path: buffer raw_edges in RAM (bounded by MAX_RAM_EDGES).
-            // This avoids a DB write + read round-trip (~27s for notepad-ade).
-            // If the buffer overflows, flush everything to DB and continue with DB path.
-            // Incremental path: always write to DB (crash-safe anchor for Phase 2 replay).
+            // Full-rebuild path: additionally keep a RAM copy (bounded by
+            // MAX_RAM_EDGES) so Phase 2 skips the DB read-back. Once the cap is
+            // exceeded the copy is dropped — every edge is already on its way to the
+            // DB below, so nothing is flushed twice — and Phase 2 scans the DB.
             if is_full_rebuild && !ram_edges_overflowed {
                 let new_total = ram_raw_edges.len() + ef.raw_edges.len();
                 if new_total <= MAX_RAM_EDGES {
-                    // Buffer in RAM — no DB write.
                     ram_raw_edges.extend(ef.raw_edges.iter().cloned());
                 } else {
-                    // RAM cap exceeded: flush all accumulated edges to DB and stop buffering.
                     info!(
                         buffered = ram_raw_edges.len(),
                         new_edges = ef.raw_edges.len(),
-                        "stage3: RAM raw_edge buffer full — flushing to DB"
+                        "stage3: RAM raw_edge buffer full — Phase 2 will scan the DB"
                     );
-                    // Flush the entire RAM buffer to DB first.
-                    if !ram_raw_edges.is_empty() {
-                        flush_raw_edge_batch_native(db, &std::mem::take(&mut ram_raw_edges))
-                            .await
-                            .context("streaming_index: ram_raw_edges flush on overflow")?;
-                    }
-                    // Route current file's edges into the cross-file pending batch
-                    // (not a direct per-file flush). The batch flushes at
-                    // RAW_EDGE_INSERT_BATCH_SIZE granularity, converting O(files)
-                    // round-trips into O(total_edges / batch_size).
-                    pending_raw_edge_batch.extend(ef.raw_edges);
-                    if pending_raw_edge_batch.len() >= RAW_EDGE_INSERT_BATCH_SIZE {
-                        flush_raw_edge_batch_native(
-                            db,
-                            &std::mem::take(&mut pending_raw_edge_batch),
-                        )
-                        .await
-                        .context("streaming_index: raw_edges (overflow batch)")?;
-                    }
+                    ram_raw_edges = Vec::new();
                     ram_edges_overflowed = true;
                 }
-            } else {
-                // Incremental path or post-overflow: accumulate into cross-file batch.
-                // Crash-safe anchor: if process dies after Stage 3 but before Phase 2
-                // completes, the next run detects the absent `edges_resolved` marker
-                // and replays Phase 2 from the raw_edge DB table.
-                pending_raw_edge_batch.extend(ef.raw_edges);
-                if pending_raw_edge_batch.len() >= RAW_EDGE_INSERT_BATCH_SIZE {
-                    flush_raw_edge_batch_native(db, &std::mem::take(&mut pending_raw_edge_batch))
-                        .await
-                        .context("streaming_index: raw_edges (batched)")?;
-                }
+            }
+            // Every path persists raw edges, batched across files
+            // (O(total_edges / RAW_EDGE_INSERT_BATCH_SIZE) round-trips). This is what
+            // keeps raw_edge complete (RAW_EDGE_COMPLETE_KEY) and is the crash-safe
+            // anchor for replaying Phase 2 when `edges_resolved` is absent.
+            pending_raw_edge_batch.extend(ef.raw_edges);
+            if pending_raw_edge_batch.len() >= RAW_EDGE_INSERT_BATCH_SIZE {
+                flush_raw_edge_batch_native(db, &std::mem::take(&mut pending_raw_edge_batch))
+                    .await
+                    .context("streaming_index: raw_edges (batched)")?;
             }
             rawedge_ns += t1.elapsed().as_nanos() as u64;
 
@@ -1979,6 +2545,18 @@ impl IndexPipeline {
                         .await
                         .context("streaming_index: raw_edge batch at chunk-batch boundary")?;
                         rawedge_ns += t_re.elapsed().as_nanos() as u64;
+                    }
+                    // Same invariant for symbols: the symbol batch only flushes every
+                    // SYM_BATCH_SIZE symbols, so without this a crash could leave a
+                    // file's file_meta durable while its symbols were still pending —
+                    // the file would never be re-processed and its symbols (graph
+                    // nodes, callee targets) would be missing for good.
+                    if !pending_symbol_batch.is_empty() {
+                        let t_sym = Instant::now();
+                        flush_symbol_batch_native(db, &std::mem::take(&mut pending_symbol_batch))
+                            .await
+                            .context("streaming_index: symbol batch at chunk-batch boundary")?;
+                        sym_ns += t_sym.elapsed().as_nanos() as u64;
                     }
                     // Commit all deferred file_metas accumulated so far.
                     let t_fm = Instant::now();
@@ -2061,11 +2639,13 @@ impl IndexPipeline {
         // If cancelled, drop remaining channel items and return early.
         // Check the shared error slot first — if Voyage failed, return the typed
         // EmbeddingFailed variant so run_consumer can distinguish it from user cancel.
-        if cancelled {
+        // A fatal embed error is checked even when nothing was cancelled: without
+        // a cancel token Stage 2 cannot stop the run, so the failed files simply
+        // vanished and the run reported success over a repo it had just emptied.
+        let fatal_embed = embed_error.lock().ok().and_then(|slot| slot.clone());
+        if cancelled || fatal_embed.is_some() {
             drop(embed_rx);
-            if let Ok(slot) = embed_error.lock()
-                && let Some(msg) = slot.clone()
-            {
+            if let Some(msg) = fatal_embed {
                 return Err(PipelineAbort::EmbeddingFailed(msg).into());
             }
             return Err(PipelineAbort::Cancelled.into());
@@ -2147,6 +2727,18 @@ impl IndexPipeline {
                 .context("streaming_index: tail raw_edge batch")?;
             rawedge_ns += t_re.elapsed().as_nanos() as u64;
         }
+        // Last raw_edge write of a full rebuild: rebuild the name index dropped
+        // before the bulk write, before the tail file_meta commits this run.
+        if is_full_rebuild {
+            let t_re_idx = Instant::now();
+            let (index, table, field) = crate::store::RAW_EDGE_NAME_INDEX;
+            build_index_concurrently(db, index, table, field)
+                .await
+                .context("streaming_index: build idx_raw_edge_to_name")?;
+            let raw_edge_idx_ms = t_re_idx.elapsed().as_millis() as u64;
+            sym_idx_rebuild_ms += raw_edge_idx_ms;
+            info!(repo = %self.repo, raw_edge_idx_ms, "stage3: rebuilt idx_raw_edge_to_name concurrently (full rebuild)");
+        }
         if !pending_file_metas.is_empty() {
             let t_fm = Instant::now();
             for fm in pending_file_metas {
@@ -2155,6 +2747,48 @@ impl IndexPipeline {
                     .context("streaming_index: upsert_file_meta (tail)")?;
             }
             filemeta_ns += t_fm.elapsed().as_nanos() as u64;
+        }
+
+        // Persist the retry queue: a full rebuild re-derives it from scratch; an
+        // incremental drops the files it just processed (committed, or re-queued
+        // below) and queues this run's transient skips.
+        let retry: Vec<String> = retry_paths
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
+        if is_full_rebuild {
+            crate::store::ops::clear_pending_retry(db)
+                .await
+                .context("streaming_index: clear pending_retry")?;
+        } else {
+            crate::store::ops::remove_pending_retry(db, files)
+                .await
+                .context("streaming_index: drop processed pending_retry")?;
+        }
+        crate::store::ops::add_pending_retry(db, &retry)
+            .await
+            .context("streaming_index: queue pending_retry")?;
+        if !retry.is_empty() {
+            warn!(repo = %self.repo, files = retry.len(), "files skipped for a transient reason; queued for retry");
+        }
+        let permanent: Vec<(String, i64, i64)> = skipped_permanent
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
+        for (path, mtime, size) in permanent {
+            upsert_file_meta(
+                db,
+                &FileMeta {
+                    path,
+                    mtime,
+                    size,
+                    repo: self.repo.clone(),
+                    chunk_count: 0,
+                    chunker_version: crate::parsing::chunker::CHUNKER_VERSION,
+                },
+            )
+            .await
+            .context("streaming_index: file_meta for permanently skipped file")?;
         }
 
         let stage3_total_ms = stage3_start.elapsed().as_millis() as u64;
@@ -2363,52 +2997,33 @@ impl IndexPipeline {
     ///   edge count.  This is the legitimate fix for the prior O(N²) per-page symbol
     ///   subquery; the map must stay.
     ///
-    /// Pass 2 — compound keyset scan over raw_edge (O(N) total via index seek):
-    ///   Pages through `raw_edge` using a compound keyset on `(from_file, id_str)`:
+    /// Pass 2 — one ordered scan over raw_edge (O(N) total via idx_raw_edge_from_file):
     ///
     ///   ```text
-    ///   SELECT type::string(id) AS id_str, from_file, from_name, from_fqn,
-    ///          to_name, kind, line, import_path
+    ///   SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path
     ///   FROM raw_edge
     ///   WHERE from_file > $last_file
-    ///      OR (from_file = $last_file AND type::string(id) > $last_id)
-    ///   ORDER BY from_file, id_str
+    ///   ORDER BY from_file
     ///   LIMIT $page
     ///   ```
     ///
-    ///   ORDER BY uses `id_str` (the projected alias for `type::string(id)`).
-    ///   SurrealDB 2.6.5 requires ORDER BY fields to appear in the SELECT list; it
-    ///   rejects bare function calls (`type::string(id)`) and the native `id` field
-    ///   unless explicitly included in SELECT.  Since `id_str` is already selected,
-    ///   `ORDER BY id_str` is accepted.  The WHERE tiebreaker `type::string(id) > $last_id`
-    ///   and ORDER BY `id_str` compare the same string values — perfectly consistent,
-    ///   no rows skipped or duplicated.
-    ///
-    ///   The `from_file > $last_file` branch lets SurrealDB seek via
-    ///   `idx_raw_edge_from_file` (defined in schema.rs) — O(log N) per boundary
-    ///   lookup, O(N) total over all pages.  `id_str` (= type::string(id)) is unique
-    ///   per row, so `(from_file, id_str)` is a unique compound key; every row is
-    ///   visited exactly once with no skip or duplicate hazard.
-    ///
-    ///   Start with `last_file = ""` and `last_id = ""` (empty strings sort before all
-    ///   real values).  After each page, advance:
-    ///
-    ///   ```text
-    ///   last_file = batch.last().from_file
-    ///   last_id   = batch.last().id_str
-    ///   ```
+    ///   Start with `last_file = ""` (sorts before every real path). The last file of
+    ///   a full page may continue past it, so its partial rows are dropped and the
+    ///   file is re-read whole by `from_file = $file`; `last_file` then advances to it.
+    ///   Every file is processed exactly once, no row is skipped.
     ///
     ///   Each page is resolved in-memory against the symbol map and accumulated into
-    ///   `edge_batch`.  `edge_batch` flushes at WRITE_BATCH_SIZE, so peak memory is
-    ///   bounded by: symbol map + one raw_edge page + at most WRITE_BATCH_SIZE resolved
-    ///   edges — independent of total raw_edge count and safe at Linux/Chromium scale.
+    ///   `edge_batch`, flushed at EDGE_RELATE_BATCH_SIZE, so peak memory is bounded
+    ///   by: symbol map + one page + one file's edges + one flush batch —
+    ///   independent of total raw_edge count and safe at Linux/Chromium scale.
     ///
     /// NOTE: OFFSET pagination (`START $offset`) is O(N²) — to fetch page i the DB
     /// walks and discards i×page_size rows.  It must NOT be used here.
     /// NOTE: keyset on `type::string(id) > $cursor` alone was measured as O(N²) in
     /// SurrealDB 2.6.5 (145 s for 34 pages) because the function-call predicate cannot
-    /// use any index.  The compound `from_file > $last_file` branch is what enables
-    /// the index seek and achieves O(N) total.
+    /// use any index; so was a `GROUP BY from_file` outer step (it groups every
+    /// remaining row per page). Only the plain `from_file > $last_file` range is
+    /// index-served.
     ///
     /// Writes the `edges_resolved` marker in `index_meta` only after all pages commit.
     async fn resolve_edges_phase2(
@@ -2420,7 +3035,24 @@ impl IndexPipeline {
         use serde::Deserialize;
         let mut p2 = Phase2Stats::default();
 
-        // First delete all existing calls edges (we're rewriting them from raw_edge).
+        // Drop all 4 calls indexes before touching any calls row: both the whole-table
+        // delete below and the bulk RELATE flush would otherwise maintain 4 index
+        // entries per row (~4 × 97K updates for the delete alone: 18 s of a 55 s
+        // notepad-ade replay). Rebuilt synchronously after all RELATEs commit; a crash
+        // in between is repaired by `store::ensure_secondary_indexes` on open.
+        let t_idx_drop = Instant::now();
+        db.query(
+            "REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;",
+        )
+        .await
+        .context("phase2: drop calls indexes")?;
+        p2.idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, idx_drop_ms = p2.idx_drop_ms, "phase2: dropped calls indexes");
+
+        // Then delete all existing calls edges (we're rewriting them from raw_edge).
         db.query("DELETE FROM calls")
             .await
             .context("phase2: delete calls")?;
@@ -2444,6 +3076,18 @@ impl IndexPipeline {
         }
 
         if total == 0 {
+            // The indexes were dropped above; on the now-empty table the rebuild is
+            // instant, and leaving them absent would full-scan every query.
+            for (index, field) in [
+                ("idx_calls_in_file", "in_file"),
+                ("idx_calls_out_file", "out_file"),
+                ("idx_calls_in_name", "in_name"),
+                ("idx_calls_out_name", "out_name"),
+            ] {
+                build_index_concurrently(db, index, "calls", field)
+                    .await
+                    .with_context(|| format!("phase2: rebuild {index} (empty)"))?;
+            }
             set_meta(db, EDGES_RESOLVED_KEY, "1")
                 .await
                 .context("phase2: set edges_resolved marker (empty)")?;
@@ -2477,46 +3121,21 @@ impl IndexPipeline {
         }
         p2.bucket_build_ms = t_bucket.elapsed().as_millis() as u64;
 
-        // Drop all 4 calls indexes before the bulk RELATE flush to eliminate per-insert
-        // index maintenance overhead (~4 index updates × 77K rows). Rebuild synchronously
-        // after all RELATEs are committed — much faster than writing through live indexes.
-        // This is the same drop→bulk-write→rebuild trick used in the old in-memory path.
-        let t_idx_drop = Instant::now();
-        db.query(
-            "REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
-             REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
-             REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
-             REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;",
-        )
-        .await
-        .context("phase2: drop calls indexes")?;
-        p2.idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64;
-        info!(repo = %self.repo, idx_drop_ms = p2.idx_drop_ms, "phase2: dropped calls indexes");
-
-        // Stream raw_edge in O(N) passes via file-keyset pagination.
+        // Stream raw_edge in ONE ordered pass over idx_raw_edge_from_file.
         //
-        // Strategy: paginate the outer loop by `from_file` (the indexed field), processing
-        // all edges for one file before advancing to the next.  This avoids any secondary
-        // sort on a computed field (type::string(id)) that cannot use an index and would
-        // cause O(N²) full-table scans.
+        // Each page is `WHERE from_file > $cursor ORDER BY from_file LIMIT $page` —
+        // the rows themselves, no GROUP BY. The last file of a full page may continue
+        // past it, so its partial rows are dropped and that file is re-read whole by
+        // equality; the cursor then moves past it. Every row is read about once.
         //
-        // Outer step: get the next `from_file` value via:
-        //   SELECT from_file FROM raw_edge WHERE from_file > $cursor
-        //   GROUP BY from_file ORDER BY from_file LIMIT $batch_files
-        //   → uses idx_raw_edge_from_file; O(log N) seek per file boundary.
+        // The previous outer step, `SELECT from_file … GROUP BY from_file ORDER BY
+        // from_file LIMIT 256`, grouped every remaining row for each page: measured
+        // 3.8 s per page on notepad-ade (178K raw edges), ~24 s of a 55 s replay,
+        // while the ordered walk over the whole table takes ~2 s.
         //
-        // Inner fetch: for each file, fetch all its edges via:
-        //   SELECT ... FROM raw_edge WHERE from_file = $file
-        //   → simple equality on the indexed field; O(edges_per_file).
-        //
-        // Memory: symbol map (3.3 MB) + max(edges_per_file) rows + at most
-        //   WRITE_BATCH_SIZE resolved edges — independent of total raw_edge count.
-        //
-        // O(N) total: O(distinct_files) outer seeks + O(total_edges) inner reads.
-        //
-        // File-batch size: fetch FILE_BATCH_SIZE distinct files per outer query to amortise
-        // the outer round-trip overhead (2464 files / FILE_BATCH_SIZE = few outer calls).
-        const FILE_BATCH_SIZE: i64 = 256;
+        // Memory: symbol map + one page + one file's edges + at most
+        // EDGE_RELATE_BATCH_SIZE resolved edges — independent of total raw_edge count.
+        const RAW_EDGE_SCAN_PAGE: i64 = 2048;
 
         let t_load_start = Instant::now();
         let mut last_file = String::new();
@@ -2542,56 +3161,39 @@ impl IndexPipeline {
                 return Err(PipelineAbort::Cancelled.into());
             }
 
-            // Outer: get next batch of distinct from_file values after the cursor.
-            #[derive(Deserialize)]
-            struct FileRow {
-                from_file: String,
-            }
-            let t_outer = Instant::now();
-            let file_batch: Vec<FileRow> = db
+            let t_scan = Instant::now();
+            let mut batch: Vec<RawEdgeRow> = db
                 .query(
-                    "SELECT from_file FROM raw_edge \
+                    "SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path \
+                     FROM raw_edge \
                      WHERE from_file > $cursor \
-                     GROUP BY from_file \
                      ORDER BY from_file \
-                     LIMIT $batch",
+                     LIMIT $page",
                 )
                 .bind(("cursor", last_file.clone()))
-                .bind(("batch", FILE_BATCH_SIZE))
+                .bind(("page", RAW_EDGE_SCAN_PAGE))
                 .await
-                .context("phase2: get next file batch")?
+                .context("phase2: scan raw_edge page")?
                 .take(0)?;
-            scan_ms_total += t_outer.elapsed().as_millis() as u64;
-
-            if file_batch.is_empty() {
+            let Some(page_last) = batch.last().map(|r| r.from_file.clone()) else {
                 break;
+            };
+            if batch.len() as i64 == RAW_EDGE_SCAN_PAGE {
+                batch.retain(|r| r.from_file != page_last);
+                let whole: Vec<RawEdgeRow> = db
+                    .query(
+                        "SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path \
+                         FROM raw_edge \
+                         WHERE from_file = $file",
+                    )
+                    .bind(("file", page_last.clone()))
+                    .await
+                    .context("phase2: read page-boundary file")?
+                    .take(0)?;
+                batch.extend(whole);
             }
-
-            // Advance outer cursor to the last file in this batch.
-            if let Some(last) = file_batch.last() {
-                last_file = last.from_file.clone();
-            }
-
-            // Inner: for each file, fetch all its raw_edge rows and resolve them.
-            // No ORDER BY needed — we just need all rows for this file.
-            let files_in_batch: Vec<String> = file_batch.into_iter().map(|r| r.from_file).collect();
-            let t_inner = Instant::now();
-            let batch: Vec<RawEdgeRow> = db
-                .query(
-                    "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, from_fqn, to_name, kind, line, import_path \
-                     FROM raw_edge \
-                     WHERE from_file IN $files",
-                )
-                .bind(("files", files_in_batch))
-                .await
-                .context("phase2: scan raw_edge for file batch")?
-                .take(0)?;
-            scan_ms_total += t_inner.elapsed().as_millis() as u64;
-
-            if batch.is_empty() {
-                continue;
-            }
+            last_file = page_last;
+            scan_ms_total += t_scan.elapsed().as_millis() as u64;
 
             pages_processed += 1;
             raw_edges_scanned += batch.len() as u64;
@@ -2619,11 +3221,6 @@ impl IndexPipeline {
                 p2.relate_write_ms += t_write.elapsed().as_millis() as u64;
                 edge_batch.clear();
             }
-
-            // If the outer batch was smaller than FILE_BATCH_SIZE, we've exhausted
-            // all files — no need for another outer query.
-            // (The outer loop will break because file_batch.is_empty() on next iter,
-            //  but we can also break early here for clarity.)
         }
 
         p2.resolve_cpu_ms = resolve_ms_total;
@@ -2964,14 +3561,18 @@ impl IndexPipeline {
     ///      those would never be re-resolved (their from_file is not in resolve_set,
     ///      and at repo scale their `raw_edge` rows aren't even persisted). So the
     ///      in_file-only delete is both correct AND the lever that bounds the cost.
-    ///   3. Re-resolve raw_edge rows WHERE from_file IN resolve_set via keyset
-    ///      pagination (uses idx_raw_edge_from_file).
+    ///   3. Re-resolve raw_edge rows of resolve_set, one file batch per read
+    ///      (`from_file IN $batch`, idx_raw_edge_from_file); every row read once.
+    ///
+    /// A resolve set covering a large share of the repo is handed to the full
+    /// Phase 2 instead (see [`exceeds_incremental_phase2_budget`]).
     ///
     /// The `edges_resolved` crash-recovery marker is NOT written here — it is only
     /// meaningful for a full rebuild where ALL raw_edge must be re-resolved on crash
     /// recovery. Incremental is already idempotent: if it crashes before file_meta
     /// is written (the crash-safe anchor in streaming_index), the whole incremental
     /// re-runs on next trigger, including this method.
+    #[cfg(test)]
     async fn resolve_edges_incremental(
         &self,
         db: &Surreal<Db>,
@@ -2979,24 +3580,96 @@ impl IndexPipeline {
         dir1_callers: &[String],
         added_names: &[String],
     ) -> Result<Phase2IncrStats> {
-        use serde::Deserialize;
+        self.resolve_edges_incremental_with(
+            db,
+            changed_files,
+            dir1_callers,
+            added_names,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
 
+    /// [`resolve_edges_incremental`](Self::resolve_edges_incremental) with the
+    /// run's context: `indexed_files` enables the full-Phase-2 fallback for an
+    /// oversized blast radius, and `cancel_token` is honored between batches. A
+    /// cancel leaves `edges_resolved` unset (the caller stamps it only on Ok), so
+    /// the next run replays Phase 2 from the durable raw_edge table.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_edges_incremental_with(
+        &self,
+        db: &Surreal<Db>,
+        changed_files: &[String],
+        dir1_callers: &[String],
+        added_names: &[String],
+        indexed_files: Option<usize>,
+        progress: Option<&ProgressHandle>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<Phase2IncrStats> {
         let mut stats = Phase2IncrStats::default();
 
         if changed_files.is_empty() {
             return Ok(stats);
         }
 
-        // Step 1: Build resolve_set = changed_files ∪ dir1_callers (deduped).
-        //
+        let resolve_set = self
+            .build_resolve_set(db, changed_files, dir1_callers, added_names, &mut stats)
+            .await?;
+        debug!(
+            repo = %self.repo,
+            changed = changed_files.len(),
+            resolve_set = resolve_set.len(),
+            "incremental phase2: resolve_set built"
+        );
+        stats.resolve_set_size = resolve_set.len() as u64;
+
+        if let Some(indexed) = indexed_files
+            && exceeds_incremental_phase2_budget(resolve_set.len(), indexed)
+        {
+            info!(
+                repo = %self.repo,
+                resolve_set = resolve_set.len(),
+                indexed,
+                "incremental phase2: blast radius too large — replaying full Phase 2"
+            );
+            let reresolve_start = Instant::now();
+            self.resolve_edges_phase2(db, progress, cancel_token)
+                .await
+                .context("incremental phase2: full fallback")?;
+            stats.p2_reresolve_ms = reresolve_start.elapsed().as_millis() as u64;
+            stats.full_fallback = true;
+            return Ok(stats);
+        }
+
+        self.reresolve_files(db, &resolve_set, cancel_token, &mut stats)
+            .await?;
+        info!(repo = %self.repo, resolve_set = resolve_set.len(), "incremental Phase 2 edge resolution complete");
+        Ok(stats)
+    }
+
+    /// Step 1: resolve_set = changed ∪ dir1_callers ∪ callers of `added_names`.
+    async fn build_resolve_set(
+        &self,
+        db: &Surreal<Db>,
+        changed_files: &[String],
+        dir1_callers: &[String],
+        added_names: &[String],
+        stats: &mut Phase2IncrStats,
+    ) -> Result<Vec<String>> {
+        use serde::Deserialize;
+
         // dir1_callers was computed by incremental_run as the callers pointing into
         // SURFACE-CHANGED (or deleted) files — the "removal/identity direction". A
         // surface-unchanged changed file contributes no dir1 callers, so its
-        // thousands of incoming edges stay out of the resolve_set.
-        let mut resolve_set: Vec<String> = changed_files.to_vec();
-        for caller in dir1_callers {
-            if !resolve_set.contains(caller) {
-                resolve_set.push(caller.clone());
+        // thousands of incoming edges stay out of the resolve_set. Deduped through a
+        // set: a Vec `contains` here was quadratic in a large name expansion.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut resolve_set: Vec<String> = Vec::new();
+        for file in changed_files.iter().chain(dir1_callers) {
+            if seen.insert(file.clone()) {
+                resolve_set.push(file.clone());
             }
         }
 
@@ -3007,44 +3680,66 @@ impl IndexPipeline {
         // that were unchanged are NOT in added_names and are not expanded — this is
         // the narrowing that keeps a comment edit's resolve_set == changed_files.
         //
-        // NOTE: `p2_symname_ms` is no longer measured here — the symbol-surface
-        // load+diff that produces `added_names` now happens once in incremental_run
-        // (its time is reported as the surface-delta stage), so this method just
-        // consumes the precomputed result.
+        // raw_edge.to_name stores the unresolved leaf callee name, so this finds any
+        // file that calls a symbol with the given leaf name — including files whose
+        // existing calls row points to a different definition (stale lex-first
+        // target). One `to_name = $n` equality per name is a point seek on
+        // idx_raw_edge_to_name (v8); the old `to_name IN $names` with no index
+        // full-scanned raw_edge on every incremental run.
         if !added_names.is_empty() {
-            // Find callers that target any added name via raw_edge.to_name.
-            // raw_edge.to_name stores the unresolved leaf callee name, so this correctly
-            // finds any file that calls a symbol with the given leaf name — including files
-            // whose existing calls row points to a different definition (stale lex-first target).
-            // Uses idx_raw_edge_from_file for the GROUP BY; the to_name lookup is bounded
-            // by the number of edges with matching callee names.
             #[derive(Deserialize)]
             struct FromFileRow {
                 from_file: String,
             }
             let dir2_start = Instant::now();
-            let name_exp_rows: Vec<FromFileRow> = db
-                .query("SELECT from_file FROM raw_edge WHERE to_name IN $names GROUP BY from_file")
-                .bind(("names", added_names.to_vec()))
-                .await
-                .context("incremental phase2: name-based expansion via raw_edge")?
-                .take(0)?;
-            stats.p2_dir2_scan_ms = dir2_start.elapsed().as_millis() as u64;
-
-            for row in name_exp_rows {
-                if !resolve_set.contains(&row.from_file) {
-                    resolve_set.push(row.from_file);
+            for names in added_names.chunks(NAME_EXPANSION_BATCH) {
+                let mut stmt = String::new();
+                for i in 0..names.len() {
+                    stmt.push_str(&format!(
+                        "SELECT from_file FROM raw_edge WHERE to_name = $n{i} GROUP BY from_file;\n"
+                    ));
+                }
+                let mut q = db.query(&stmt);
+                for (i, name) in names.iter().enumerate() {
+                    q = q.bind((format!("n{i}"), name.clone()));
+                }
+                let mut resp = q
+                    .await
+                    .context("incremental phase2: name-based expansion via raw_edge")?;
+                for i in 0..names.len() {
+                    let rows: Vec<FromFileRow> = resp
+                        .take(i)
+                        .context("incremental phase2: decode name expansion")?;
+                    for row in rows {
+                        if seen.insert(row.from_file.clone()) {
+                            resolve_set.push(row.from_file);
+                        }
+                    }
                 }
             }
+            stats.p2_dir2_scan_ms = dir2_start.elapsed().as_millis() as u64;
         }
+        Ok(resolve_set)
+    }
 
-        debug!(
-            repo = %self.repo,
-            changed = changed_files.len(),
-            resolve_set = resolve_set.len(),
-            "incremental phase2: resolve_set built"
-        );
-        stats.resolve_set_size = resolve_set.len() as u64;
+    /// Steps 2–3: delete the resolve set's OUTGOING calls, then re-resolve its
+    /// raw edges. O(resolve_set files + their edges) — never O(repo).
+    async fn reresolve_files(
+        &self,
+        db: &Surreal<Db>,
+        resolve_set: &[String],
+        cancel_token: Option<&CancellationToken>,
+        stats: &mut Phase2IncrStats,
+    ) -> Result<()> {
+        let check_cancel = || -> Result<()> {
+            if let Some(ct) = cancel_token
+                && ct.is_cancelled()
+            {
+                info!(repo = %self.repo, "incremental phase2: cancelled");
+                return Err(PipelineAbort::Cancelled.into());
+            }
+            Ok(())
+        };
 
         // Step 2: Delete only the OUTGOING calls rows of resolve_set files.
         //
@@ -3074,6 +3769,7 @@ impl IndexPipeline {
         // (no injection, no per-row re-parse of the path string).
         let delete_calls_start = Instant::now();
         for chunk in resolve_set.chunks(CALLS_DELETE_TXN_CHUNK) {
+            check_cancel()?;
             let mut stmt = String::from("BEGIN;\n");
             for i in 0..chunk.len() {
                 stmt.push_str(&format!("DELETE FROM calls WHERE in_file = $p{i};\n"));
@@ -3090,43 +3786,30 @@ impl IndexPipeline {
         }
         stats.p2_delete_calls_ms = delete_calls_start.elapsed().as_millis() as u64;
 
-        // Step 3: Re-resolve raw_edge rows whose from_file is in the resolve set.
-        // Keyset-paginated with from_file filter — uses idx_raw_edge_from_file.
-
+        // Step 3: Re-resolve the raw_edge rows of the resolve set, one file batch
+        // per read — the full pass's inner `from_file IN $files` shape. The old
+        // `type::string(id) > $cursor ORDER BY id_str` keyset re-read and re-sorted
+        // every resolve-set edge for each 512-row page (O(pages × edges)): ~7 min
+        // of Phase 2 for a 23-file C++ change. No ordering is needed — each edge
+        // resolves independently — so every row is now read exactly once.
+        // Resolution keeps its 512-row granularity so each symbol name lookup has
+        // the same bounded `name IN` list as before.
         let reresolve_start = Instant::now();
-        let page_size: i64 = WRITE_BATCH_SIZE as i64;
-        let mut cursor = String::new();
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
-
-        loop {
-            let batch: Vec<RawEdgeRow> = db
+        for files in resolve_set.chunks(INCREMENTAL_PHASE2_FILE_BATCH) {
+            check_cancel()?;
+            let rows: Vec<RawEdgeRow> = db
                 .query(
-                    "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, from_fqn, to_name, kind, line, import_path \
+                    "SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path \
                      FROM raw_edge \
-                     WHERE from_file IN $files \
-                       AND type::string(id) > $cursor \
-                     ORDER BY id_str \
-                     LIMIT $page",
+                     WHERE from_file IN $files",
                 )
-                .bind(("files", resolve_set.clone()))
-                .bind(("cursor", cursor.clone()))
-                .bind(("page", page_size))
+                .bind(("files", files.to_vec()))
                 .await
-                .context("incremental phase2: scan raw_edge page")?
+                .context("incremental phase2: read raw_edge for file batch")?
                 .take(0)?;
-
-            if batch.is_empty() {
-                break;
-            }
-
-            cursor = batch.last().map(|r| r.id_str.clone()).unwrap_or(cursor);
-
-            resolve_raw_edge_page(db, &batch, &mut edge_batch, "incremental phase2").await?;
-
-            let batch_len = batch.len() as i64;
-            if batch_len < page_size {
-                break;
+            for page in rows.chunks(WRITE_BATCH_SIZE) {
+                resolve_raw_edge_page(db, page, &mut edge_batch, "incremental phase2").await?;
             }
         }
 
@@ -3137,9 +3820,7 @@ impl IndexPipeline {
                 .context("incremental phase2: flush tail edge batch")?;
         }
         stats.p2_reresolve_ms = reresolve_start.elapsed().as_millis() as u64;
-
-        info!(repo = %self.repo, resolve_set = resolve_set.len(), "incremental Phase 2 edge resolution complete");
-        Ok(stats)
+        Ok(())
     }
 }
 
@@ -3442,6 +4123,24 @@ fn parse_one_file(file: &str) -> ParseOutput {
 
     let parse_start = Instant::now();
 
+    // Stat BEFORE reading. The recorded mtime/size must describe content no newer
+    // than what was read: stat-after-read let a write that landed between the two
+    // record the NEW mtime against the OLD content, so the next walk saw "unchanged"
+    // and the edit was never indexed. Stat-first errs the safe way — a concurrent
+    // write leaves an older mtime on record and the next walk re-indexes the file.
+    let (mtime, size) = match stat_file(file) {
+        Some(s) => (s.mtime, s.size),
+        None => {
+            warn!(file = %file, "failed to stat file");
+            return ParseOutput::Skipped {
+                file: file.to_string(),
+                reason: "stat failed".to_string(),
+                retry: true,
+                permanent_stat: None,
+            };
+        }
+    };
+
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -3449,6 +4148,9 @@ fn parse_one_file(file: &str) -> ParseOutput {
             return ParseOutput::Skipped {
                 file: file.to_string(),
                 reason: format!("read error: {e}"),
+                retry: e.kind() != std::io::ErrorKind::InvalidData,
+                permanent_stat: (e.kind() == std::io::ErrorKind::InvalidData)
+                    .then_some((mtime, size)),
             };
         }
     };
@@ -3458,19 +4160,10 @@ fn parse_one_file(file: &str) -> ParseOutput {
         return ParseOutput::Skipped {
             file: file.to_string(),
             reason: "binary file (contains null byte)".to_string(),
+            retry: false,
+            permanent_stat: Some((mtime, size)),
         };
     }
-
-    let (mtime, size) = match stat_file(file) {
-        Some(s) => (s.mtime, s.size),
-        None => {
-            warn!(file = %file, "failed to stat file");
-            return ParseOutput::Skipped {
-                file: file.to_string(),
-                reason: "stat failed".to_string(),
-            };
-        }
-    };
 
     let result = parse_file(file, &source);
 
@@ -4107,6 +4800,139 @@ pub(crate) fn filter_hidden_changes_with(
             filter.allows(std::path::Path::new(&c.path))
         })
         .collect()
+}
+
+/// True for the files whose edit can change which paths are indexable.
+fn is_ignore_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| matches!(n, ".gitignore" | ".ignore" | ".augmentignore"))
+}
+
+/// A `Deleted` change for every stored path the current rule set excludes.
+///
+/// O(stored + directories × depth): one filter for the whole set, so each
+/// directory's ignore files are read once, and no per-file `stat` (stored paths
+/// are files by construction).
+pub(crate) fn now_ignored_deletions(
+    repo: &std::path::Path,
+    stored_paths: &HashSet<String>,
+    extra_extensions: Vec<String>,
+    ignore_filenames: HashSet<String>,
+    ignore_paths: HashSet<String>,
+) -> Vec<FileChange> {
+    let filter = ChangeFilter::new_complete(repo, extra_extensions, ignore_filenames, ignore_paths);
+    stored_paths
+        .iter()
+        .filter(|p| !filter.allows_as(std::path::Path::new(p.as_str()), false))
+        .map(|p| FileChange {
+            path: p.clone(),
+            kind: ChangeKind::Deleted,
+        })
+        .collect()
+}
+
+/// Re-classify a watcher change set against the filesystem and the stored
+/// `file_meta` paths, expanding directory events into file events.
+///
+/// WHY: the watcher's event kinds are not trustworthy as file operations. A
+/// directory created or moved into the repo is ONE event for the directory (its
+/// files never get their own), which the extension filter then dropped; a
+/// directory deleted or moved out is one event whose path matches no file_meta
+/// row, so its files stayed indexed forever. Rules:
+/// - existing file → Added (unknown) / Modified (known);
+/// - existing directory → expanded via [`walk_subtree_with`] ONLY for Added
+///   (create / rename-to). `Modify` on a directory is ignored: Windows emits one
+///   on every parent of a changed child, and expanding it would walk up to the
+///   repo root on every batch;
+/// - missing path that is a stored file → Deleted;
+/// - missing path that is not a stored file, has no indexable extension, and
+///   could hold indexed files → candidate removed directory: every stored path
+///   under it becomes Deleted. Candidates are resolved in ONE pass over
+///   `stored_paths` (each path's ancestors checked against a set), so the cost
+///   is O(changes + stored × depth), not O(changes × stored);
+/// - a path whose metadata cannot be read for another reason (e.g. a sharing
+///   violation mid-save) keeps its original kind.
+pub(crate) fn normalize_explicit_changes(
+    repo: &str,
+    changes: Vec<FileChange>,
+    stored_paths: &HashSet<String>,
+    extra_extensions: &[String],
+    ignore_filenames: &HashSet<String>,
+    ignore_paths: &HashSet<String>,
+) -> Vec<FileChange> {
+    use crate::indexing::walker::{ChangeFilter, has_indexable_extension_with, walk_subtree_with};
+    let filter = ChangeFilter::new_complete(
+        std::path::Path::new(repo),
+        extra_extensions.to_vec(),
+        ignore_filenames.clone(),
+        ignore_paths.clone(),
+    );
+    let mut out: Vec<FileChange> = Vec::with_capacity(changes.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut emit = |out: &mut Vec<FileChange>, path: String, kind: ChangeKind| {
+        if seen.insert(path.clone()) {
+            out.push(FileChange { path, kind });
+        }
+    };
+    let file_kind = |path: &str| {
+        if stored_paths.contains(path) {
+            ChangeKind::Modified
+        } else {
+            ChangeKind::Added
+        }
+    };
+    let mut removed_dirs: HashSet<String> = HashSet::new();
+
+    for change in changes {
+        let path = std::path::Path::new(&change.path);
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {
+                let kind = file_kind(&change.path);
+                emit(&mut out, change.path, kind);
+            }
+            Ok(meta) if meta.is_dir() => {
+                if change.kind == ChangeKind::Added {
+                    for file in walk_subtree_with(
+                        repo,
+                        &change.path,
+                        extra_extensions,
+                        ignore_filenames,
+                        ignore_paths,
+                    ) {
+                        let kind = file_kind(&file);
+                        emit(&mut out, file, kind);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if stored_paths.contains(&change.path) {
+                    emit(&mut out, change.path, ChangeKind::Deleted);
+                } else if !has_indexable_extension_with(path, extra_extensions)
+                    && filter.could_contain_indexed(path)
+                {
+                    removed_dirs.insert(change.path.trim_end_matches(['/', '\\']).to_owned());
+                }
+            }
+            Err(_) => emit(&mut out, change.path, change.kind),
+        }
+    }
+
+    if !removed_dirs.is_empty() {
+        for stored in stored_paths {
+            let under_removed = std::path::Path::new(stored)
+                .ancestors()
+                .skip(1)
+                .filter_map(|a| a.to_str())
+                .any(|a| removed_dirs.contains(a));
+            if under_removed {
+                emit(&mut out, stored.clone(), ChangeKind::Deleted);
+            }
+        }
+    }
+    out
 }
 
 // ─── SurrealQL escaping ───────────────────────────────────────────────────
@@ -7789,7 +8615,8 @@ mod mmap_warm_microbench {
 
         // (b) Persist the shard to disk (this is what the slow-path warm does once).
         let t_persist = Instant::now();
-        shard_file::write_new_generation(tmp.path(), repo, &ram, n as u64).unwrap();
+        shard_file::write_new_generation(tmp.path(), repo, &ram, n as u64, "test-identity")
+            .unwrap();
         let persist_ms = t_persist.elapsed().as_millis();
 
         // Drop the in-RAM shard so the OS page cache for this file is the only
@@ -8606,8 +9433,8 @@ mod raw_edge_batching_tests {
         );
     }
 
-    /// Builds alpha, beta and gamma (beta and gamma call alpha), then changes
-    /// gamma incrementally, which leaves `raw_edge` rows for gamma only.
+    /// Builds alpha, beta and gamma, changes gamma, then simulates an older
+    /// index whose raw_edge table contains only gamma's rows.
     async fn index_with_partial_raw_edges() -> (TempDir, TempDir, Surreal<Db>, IndexPipeline, String)
     {
         let home = TempDir::new().unwrap();
@@ -8628,6 +9455,13 @@ mod raw_edge_batching_tests {
             .run(&db, None, false, None, None, None, &[], None)
             .await
             .expect("incremental run");
+        db.query("DELETE FROM raw_edge WHERE from_file != $gamma; DELETE FROM index_meta WHERE key = $key")
+            .bind(("gamma", file_g.to_str().unwrap().replace('\\', "/")))
+            .bind(("key", RAW_EDGE_COMPLETE_KEY))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
         let beta = format!("{repo}/beta.rs");
         assert!(count_calls_from(&db, &beta).await > 0, "beta calls alpha");
         (home, repo_dir, db, pipeline, beta)
@@ -8840,3 +9674,7 @@ mod transient_embed_resilience_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_drift_tests.rs"]
+mod drift_tests;

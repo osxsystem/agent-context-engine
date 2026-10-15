@@ -22,11 +22,13 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
+#[cfg(test)]
+mod availability_tests;
 mod progress;
 pub(crate) mod query_gate;
 pub(crate) mod readiness;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use progress::{MCP_PROGRESS_HEARTBEAT, with_progress_heartbeat};
 
@@ -58,6 +60,270 @@ struct OutputBlock {
     caller_names: Vec<String>,
     callee_names: Vec<String>,
     callees: Option<u32>,
+    symbols: Vec<String>,
+}
+
+// ─── Grep hint footer ────────────────────────────────────────────────────
+// Retrieval is top-k, not exhaustive. Handing the agent a ready-to-run literal
+// pattern for the symbols it just received beats a static "use grep" line, which
+// gives it nothing to run and tends to be ignored.
+
+const GREP_HINT_MAX_SYMBOLS: usize = 5;
+/// Shorter names (`new`, `get`, `run`) would make the grep all noise.
+const GREP_HINT_MIN_NAME_LEN: usize = 4;
+const GREP_HINT_MAX_NAME_LEN: usize = 40;
+/// Total length of the `a|b|c` pattern. It appears TWICE in the hint (once for
+/// `rg`, once for `grep`), so this bounds the hint size, not just its pattern.
+const GREP_HINT_MAX_PATTERN_CHARS: usize = 100;
+/// Upper bound on the whole rendered hint: template text (~135 chars) plus the
+/// pattern twice. Reserved out of the output budget so the hint can never push the
+/// response past `MAX_TOOL_OUTPUT_CHARS` or squeeze out the truncation footer.
+const GREP_HINT_MAX_CHARS: usize = 400;
+
+/// Identifiers only. That keeps the pattern free of regex and shell
+/// metacharacters, so quoting it in the hint is always safe (`operator==` and
+/// the like are dropped rather than escaped).
+fn is_greppable_symbol(name: &str) -> bool {
+    (GREP_HINT_MIN_NAME_LEN..=GREP_HINT_MAX_NAME_LEN).contains(&name.len())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Repo-relative, `/`-separated view of `file`. Absolute paths MUST NOT reach the
+/// test-path check: a repo that lives under a `test/` directory would otherwise lose
+/// its hint on every query. When `file` is not under `repo` (should not happen), only
+/// the file name is kept so no directory segment can produce a false positive.
+fn repo_relative(file: &str, repo: &str) -> String {
+    let file = file.replace('\\', "/");
+    let repo = repo.replace('\\', "/");
+    let repo = repo.trim_end_matches('/');
+    if file.len() > repo.len()
+        && file.is_char_boundary(repo.len())
+        && file[..repo.len()].eq_ignore_ascii_case(repo)
+        && file.as_bytes()[repo.len()] == b'/'
+    {
+        return file[repo.len() + 1..].to_string();
+    }
+    file.rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// The own symbol of a result, if it is worth grepping for. Dropped: modules,
+/// symbols from test files, and symbols from generated files. `impl_Foo` is
+/// rewritten to the type name `Foo`. A test block's CALLEES are kept elsewhere: they are the
+/// production API it exercises.
+fn hint_symbol(file: &str, repo: &str, symbol: Option<&str>, kind: Option<&str>) -> Option<String> {
+    let symbol = symbol?;
+    if kind.is_some_and(|k| k.eq_ignore_ascii_case("module")) {
+        return None;
+    }
+    // The Rust extractor names an impl block `impl_<Type>`: not itself grep-able,
+    // but the type it names is. Dropping it outright left impl-only result sets
+    // (e.g. a whole query answered by `impl Runner`/`impl Registry` chunks) with no
+    // hint at all. Generics are stripped; anything non-identifier (`&Foo`) is
+    // filtered later by `is_greppable_symbol`.
+    let symbol = if kind.is_some_and(|k| k.eq_ignore_ascii_case("impl")) {
+        symbol
+            .strip_prefix("impl_")
+            .and_then(|ty| ty.split('<').next())?
+    } else {
+        symbol
+    };
+    if crate::parsing::generated::is_generated_file(file)
+        || crate::parsing::test_paths::is_test_path(&repo_relative(file, repo))
+    {
+        return None;
+    }
+    Some(symbol.to_string())
+}
+
+/// A row of the `symbol` table overlapping a result block.
+#[derive(Debug, Clone)]
+struct DefinedSymbol {
+    name: String,
+    kind: Option<String>,
+    line_start: u32,
+    line_end: u32,
+}
+
+/// One block must not fill the whole hint on its own.
+const GREP_HINT_MAX_DEFINED_PER_BLOCK: usize = 3;
+
+/// Symbols that name a block which carries no `symbol_ref` of its own. Measured on
+/// real repos, MOST result chunks have none: `symbol_ref` is only set at index time
+/// when a chunk maps onto exactly one symbol, so a chunk that includes a doc comment,
+/// a `static` plus a `fn`, or the middle of a long function gets nothing — which is
+/// how `open_gate` (defined inside such a chunk) never reached the hint.
+///
+/// Symbols that START inside the block come first, in line order. Only when none
+/// does is the innermost enclosing symbol used (a slice from the middle of a long
+/// function is named by that function, not by its `impl` or module).
+fn pick_block_symbols(rows: &[DefinedSymbol], start: u32, end: u32) -> Vec<&DefinedSymbol> {
+    let overlapping = rows
+        .iter()
+        .filter(|s| s.line_start <= end && s.line_end >= start);
+    let mut inside: Vec<&DefinedSymbol> = overlapping
+        .clone()
+        .filter(|s| s.line_start >= start)
+        .collect();
+    if inside.is_empty() {
+        return overlapping
+            .min_by_key(|s| s.line_end.saturating_sub(s.line_start))
+            .into_iter()
+            .collect();
+    }
+    inside.sort_by_key(|s| s.line_start);
+    inside
+}
+
+/// Rust keeps unit tests inline in production files, so the test-path rule cannot
+/// see them. A block whose own text carries a test attribute must not contribute
+/// the test functions it defines.
+fn has_inline_test_marker(content: &str) -> bool {
+    ["#[test]", "#[tokio::test]", "#[cfg(test)]"]
+        .iter()
+        .any(|marker| content.contains(marker))
+}
+
+/// Whether the definition starting at `line_start` (1-based) carries a test
+/// attribute: tree-sitter starts a Rust item at its `fn`/`mod` keyword, so its
+/// `#[test]` / `#[cfg(test)]` sits on the few lines just above it.
+fn is_test_marked(source: &str, line_start: u32) -> bool {
+    let end = line_start as usize;
+    let begin = end.saturating_sub(3).max(1);
+    let window: Vec<&str> = source
+        .lines()
+        .skip(begin - 1)
+        .take(end.saturating_sub(begin) + 1)
+        .collect();
+    has_inline_test_marker(&window.join("\n"))
+}
+
+/// `symbol` rows overlapping `file:start-end`, from whichever repo DB owns the file.
+/// Empty on any failure: the hint is best-effort and must never fail a query.
+async fn defined_symbols_for(
+    db_map: &HashMap<String, Surreal<Db>>,
+    file: &str,
+    start: u32,
+    end: u32,
+) -> Vec<DefinedSymbol> {
+    let Some(db) = crate::query::find_db_for_file(db_map, file) else {
+        return Vec::new();
+    };
+    crate::query::graph_expand::query_overlapping_symbols(db, file, start, end)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| DefinedSymbol {
+            name: row.name,
+            kind: row.kind,
+            line_start: row.line_start.max(0) as u32,
+            line_end: row.line_end.max(0) as u32,
+        })
+        .collect()
+}
+
+/// The hint symbols one result contributes: its own symbol when it has a usable
+/// one, otherwise the symbols the block defines (see `pick_block_symbols`). An own
+/// symbol that was FILTERED (e.g. a `module`) does not fall back: the block is that
+/// module, and in Rust an inline module is almost always a test module.
+async fn block_hint_symbols(
+    db_map: &HashMap<String, Surreal<Db>>,
+    repo: &str,
+    r: &crate::query::engine::CodeResult,
+) -> Vec<String> {
+    if r.symbol.is_some() {
+        return hint_symbol(&r.file, repo, r.symbol.as_deref(), r.symbol_kind.as_deref())
+            .into_iter()
+            .collect();
+    }
+    if has_inline_test_marker(&r.content) {
+        return Vec::new();
+    }
+    let rows = defined_symbols_for(db_map, &r.file, r.line_start, r.line_end).await;
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    // Rust is the one language here that keeps unit tests INSIDE production files,
+    // so neither the path rule nor the block's own text (a reranker slice from the
+    // middle of a test body has no attribute in it) can see them. Read the source
+    // once and look above each definition instead. Other languages skip the read.
+    let source = if r.file.ends_with(".rs") {
+        std::fs::read_to_string(&r.file).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // Strictly enclosing (starts before the block): a symbol whose range IS the
+    // block is a candidate, judged by the per-candidate check below.
+    let in_test_scope = rows.iter().any(|s| {
+        s.line_start < r.line_start
+            && s.line_end >= r.line_end
+            && is_test_marked(&source, s.line_start)
+    });
+    if in_test_scope {
+        return Vec::new();
+    }
+    pick_block_symbols(&rows, r.line_start, r.line_end)
+        .into_iter()
+        .filter(|s| !is_test_marked(&source, s.line_start))
+        .filter_map(|s| hint_symbol(&r.file, repo, Some(&s.name), s.kind.as_deref()))
+        .take(GREP_HINT_MAX_DEFINED_PER_BLOCK)
+        .collect()
+}
+
+/// Build the grep hint from the final, priority-ordered blocks, in two passes:
+/// first the symbols every block DEFINES (block order), then the callees of every
+/// block. Measured across five repos, defined symbols are on-topic while callees
+/// often drag in logging/util helpers (`maskUserID`, `CreatePendingLog`), so callees
+/// only fill what is left. They still matter: they come from the resolved call
+/// graph, so they always name real in-repo definitions, and for test blocks they
+/// are the production API under test.
+/// `None` when no usable symbol exists: no static fallback, nothing to grep for.
+fn build_grep_hint(blocks: &[OutputBlock]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut pattern_len = 0usize;
+    let defined = blocks.iter().flat_map(|b| &b.symbols);
+    let callees = blocks.iter().flat_map(|b| &b.callee_names);
+    for symbol in defined.chain(callees) {
+        if names.len() >= GREP_HINT_MAX_SYMBOLS {
+            break;
+        }
+        let name = symbol.as_str();
+        if !is_greppable_symbol(name) || names.contains(&name) {
+            continue;
+        }
+        let added = name.len() + usize::from(!names.is_empty());
+        if pattern_len + added > GREP_HINT_MAX_PATTERN_CHARS {
+            break;
+        }
+        pattern_len += added;
+        names.push(name);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(render_grep_hint(
+        crate::prompts::MCP_GREP_HINT,
+        &names.join("|"),
+    ))
+}
+
+/// `core.autocrlf=true` checks the template out with CRLF on Windows and
+/// `include_str!` embeds those bytes, so line endings are normalized here rather
+/// than trusting the checkout.
+fn render_grep_hint(template: &str, pattern: &str) -> String {
+    let rendered = crate::prompts::render(template, &[("pattern", pattern)]);
+    format!("\n\n{}", rendered.replace("\r\n", "\n").trim_end())
+}
+
+/// Append the grep hint after the assembled output (and its truncation footer).
+fn with_grep_hint(mut assembled: String, blocks: &[OutputBlock]) -> String {
+    if let Some(hint) = build_grep_hint(blocks) {
+        assembled.push_str(&hint);
+    }
+    assembled
 }
 
 /// Assemble result blocks into a single string respecting `MAX_TOOL_OUTPUT_CHARS`.
@@ -66,8 +332,11 @@ struct OutputBlock {
 /// budget would be exceeded; from that point, all remaining blocks are shown as
 /// header + first line (capped at 120 chars) + elision marker.
 fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
-    // Reserve space for the footer so it's never squeezed out.
-    const FOOTER_RESERVE: usize = 150;
+    // Reserve space for the truncation footer so it's never squeezed out, plus the
+    // grep hint that `with_grep_hint` appends after it: the hint is appended
+    // unconditionally, and dropping it only when it didn't fit would lose it
+    // exactly on the big, truncated responses where the agent most needs to search.
+    const FOOTER_RESERVE: usize = 150 + GREP_HINT_MAX_CHARS;
     let effective_budget = MAX_TOOL_OUTPUT_CHARS - FOOTER_RESERVE;
 
     let mut out = String::new();
@@ -209,6 +478,9 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                         current.callees = next.callees;
                         current.callee_names = std::mem::take(&mut next.callee_names);
                     }
+                    // Carry the absorbed block's symbols so the grep hint can still
+                    // name them; the block itself is gone after this merge.
+                    current.symbols.append(&mut next.symbols);
                     originals.push(next.content);
                 } else {
                     let content_snapshot = next.content.clone();
@@ -295,6 +567,9 @@ pub struct CodebaseRetrievalArgs {
     /// Optional: filter results to files matching this path substring.
     #[serde(default)]
     pub filter_path: Option<String>,
+    #[doc = include_str!("prompts/mcp_scope_param.txt")]
+    #[serde(default)]
+    pub scope: Option<crate::vector::Scope>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -383,6 +658,7 @@ impl McpHandler {
                 &args.information_request,
                 filters,
                 &args.workspace_full_path,
+                args.scope.unwrap_or_default(),
             ),
         )
         .await;
@@ -437,6 +713,9 @@ impl ServerHandler for McpHandler {
 pub struct RepoCodebaseRetrievalArgs {
     /// Natural-language description of the code or information you are looking for.
     pub information_request: String,
+    #[doc = include_str!("prompts/mcp_scope_param.txt")]
+    #[serde(default)]
+    pub scope: Option<crate::vector::Scope>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -512,6 +791,7 @@ impl RepoMcpHandler {
                 &args.information_request,
                 None,
                 &self.repo_path,
+                args.scope.unwrap_or_default(),
             ),
         )
         .await;
@@ -603,6 +883,9 @@ fn select_empty_or_warming_message(
     format!("No results found for: {information_request}")
 }
 
+/// `scope` is REQUIRED here (not an `Option`) so that every entry surface must
+/// decide it explicitly — each passes `args.scope.unwrap_or_default()`, i.e.
+/// `code` when the caller omitted it — and none can silently skip the default.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_codebase_retrieval(
     home_dir: &Path,
@@ -613,6 +896,7 @@ pub async fn run_codebase_retrieval(
     information_request: &str,
     filters: Option<QueryFilters>,
     workspace_full_path: &str,
+    scope: crate::vector::Scope,
 ) -> String {
     // Linked-worktree guard: serve the query from the MAIN repository's index
     // so a worktree path never auto-registers (and never embeds) a duplicate
@@ -631,6 +915,7 @@ pub async fn run_codebase_retrieval(
                 information_request,
                 filters,
                 &main_root,
+                scope,
             )
             .await;
             format!("{}{}", worktree_redirect_note(requested, &main_root), text)
@@ -645,6 +930,7 @@ pub async fn run_codebase_retrieval(
                 information_request,
                 filters,
                 requested,
+                scope,
             )
             .await
         }
@@ -671,6 +957,7 @@ async fn run_codebase_retrieval_resolved(
     information_request: &str,
     filters: Option<QueryFilters>,
     workspace_full_path: &str,
+    scope: crate::vector::Scope,
 ) -> String {
     // 1. Validate workspace_full_path.
     let repo = workspace_full_path.trim();
@@ -722,45 +1009,165 @@ async fn run_codebase_retrieval_resolved(
 
     // 4. One shared readiness decision selects both the wait budget and graph
     // mode. MCP and REST therefore cannot drift on the ResolveEdges fast path.
-    let (query_graph_mode, query_warm_wait, output_prefix) = match readiness::await_index_ready(
-        settings,
+    let readiness =
+        readiness::await_index_ready(settings, index_engine, repo_dbs, data_dir, repo).await;
+    let request = scoped_request(information_request, scope);
+    let output = match query_with(
+        readiness,
         index_engine,
         repo_dbs,
-        data_dir,
+        settings,
+        &request,
+        filters.clone(),
         repo,
     )
     .await
     {
+        Ok(output) => output,
+        Err(degrade) => return degrade,
+    };
+    if !output.warming_empty {
+        return output.text;
+    }
+    // Nothing could be served yet: no stale snapshot existed after all (cold
+    // worker, no persisted shard of this embedding space), or the warm is waiting
+    // on a run that has to verify the repo first (absent identity marker). Wait
+    // for that run, bounded, and ask once more instead of answering "retry".
+    let budget = Duration::from_secs(settings.mcp_index_wait_secs);
+    let readiness = readiness::wait_for_run(index_engine, repo, budget).await;
+    match query_with(
+        readiness,
+        index_engine,
+        repo_dbs,
+        settings,
+        &request,
+        filters,
+        repo,
+    )
+    .await
+    {
+        Ok(output) => output.text,
+        Err(degrade) => degrade,
+    }
+}
+
+/// Run the query a readiness decision allows, or return its degrade message.
+async fn query_with(
+    readiness: readiness::IndexReadiness,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    settings: &Settings,
+    request: &str,
+    filters: Option<QueryFilters>,
+    repo: &str,
+) -> Result<PrefixedOutput, String> {
+    let (graph_mode, warm_wait, prefix) = match readiness {
         readiness::IndexReadiness::Ready { warm_budget } => (QueryGraphMode::Full, warm_budget, ""),
         readiness::IndexReadiness::ReadyVectorOnly { warm_budget } => (
             QueryGraphMode::VectorOnly,
             warm_budget,
             crate::prompts::MCP_GRAPH_PENDING,
         ),
+        readiness::IndexReadiness::ReadyStale { warm_budget } => (
+            QueryGraphMode::VectorOnly,
+            warm_budget,
+            crate::prompts::MCP_STALE_RESULTS,
+        ),
         readiness::IndexReadiness::Timeout => {
-            return crate::prompts::MCP_DEGRADE_INDEXING.to_string();
+            return Err(crate::prompts::MCP_DEGRADE_INDEXING.to_string());
         }
         readiness::IndexReadiness::Failed(error) => {
             let message = format!("{error:#}");
-            return crate::prompts::render(
+            return Err(crate::prompts::render(
                 crate::prompts::MCP_DEGRADE_INDEX_FAILED,
                 &[("err", &message)],
-            );
+            ));
         }
     };
-
     let output = do_query(
         index_engine,
         repo_dbs,
         settings,
-        information_request,
+        request,
         filters,
         repo,
-        query_graph_mode,
-        query_warm_wait,
+        graph_mode,
+        warm_wait,
     )
     .await;
-    format!("{output_prefix}{output}")
+    Ok(PrefixedOutput {
+        warming_empty: output.warming_empty,
+        text: prefix_output(prefix, output),
+    })
+}
+
+/// A finished answer plus whether it is the empty "still warming" retry.
+struct PrefixedOutput {
+    text: String,
+    warming_empty: bool,
+}
+
+/// Prepend the readiness prefix (e.g. "showing vector-only results") unless the
+/// answer carries no results at all because the shard is still warming: there the
+/// prefix contradicts the body, and the retry instruction must stand alone.
+fn prefix_output(prefix: &str, output: QueryOutput) -> String {
+    if output.warming_empty {
+        output.text
+    } else {
+        format!("{prefix}{}", output.text)
+    }
+}
+
+/// What [`do_query`] produced, plus whether it is the empty "still warming,
+/// retry" answer (which callers must not decorate with readiness banners).
+struct QueryOutput {
+    text: String,
+    warming_empty: bool,
+}
+
+impl From<String> for QueryOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            warming_empty: false,
+        }
+    }
+}
+
+/// Prefix the request with the structured scope as an inline `scope:` filter (the
+/// same channel `filter_lang` uses). It goes FIRST and the parser keeps the first
+/// valid `scope:`, so the tool parameter beats one typed inside the free text.
+fn scoped_request(information_request: &str, scope: crate::vector::Scope) -> String {
+    format!("scope:{} {}", scope.as_str(), information_request)
+}
+
+/// Banner for results served from the OTHER scope after the requested one was
+/// empty — the agent must know it did not get what it asked for.
+fn scope_fallback_notice(requested: crate::vector::Scope, served: crate::vector::Scope) -> String {
+    crate::prompts::render(
+        crate::prompts::MCP_SCOPE_FALLBACK,
+        &[
+            ("requested", requested.as_str()),
+            ("served", served.as_str()),
+        ],
+    )
+}
+
+/// A genuine empty for a scoped query means BOTH scopes were searched (the
+/// fallback ran and also found nothing). Say so, but only when that is true:
+/// not while warming (retry wording must stay intact) and not when candidates
+/// existed and the reranker rejected them.
+fn note_both_scopes_searched(
+    message: String,
+    scoped: bool,
+    no_candidates: bool,
+    warming: bool,
+) -> String {
+    if scoped && no_candidates && !warming {
+        format!("{message} (searched both code and docs)")
+    } else {
+        message
+    }
 }
 
 /// Structured MCP filter params as engine filters, or `None` when none are set.
@@ -786,6 +1193,7 @@ fn mcp_query_filters(
             .into_iter()
             .collect(),
         name_filters: vec![],
+        ..Default::default()
     };
     (!filters.is_empty()).then_some(filters)
 }
@@ -856,8 +1264,8 @@ async fn do_query(
     repo: &str,
     graph_mode: QueryGraphMode,
     warm_wait: Duration,
-) -> String {
-    let voyage_client = match VoyageClient::new_for_provider(
+) -> QueryOutput {
+    let voyage_client = match VoyageClient::shared_for_provider(
         crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
@@ -865,10 +1273,12 @@ async fn do_query(
         settings.embedding.dimensions,
     ) {
         Ok(c) => c,
-        Err(e) => return format!("Error: failed to create embedding client: {e}"),
+        Err(e) => return format!("Error: failed to create embedding client: {e}").into(),
     };
 
     let reranker = RerankProvider::from_settings(&settings.llm);
+    let mut filters = filters.unwrap_or_default();
+    filters.docs_extensions = Some(settings.docs_extensions.clone());
 
     match crate::query::engine::run_query_with_filters_and_mode(
         information_request,
@@ -884,12 +1294,12 @@ async fn do_query(
         settings.llm.agentic_rag_max_turns,
         settings.llm.agentic_rag_max_chunk_chars,
         settings.llm.agentic_rag_grep_read,
-        filters,
+        Some(filters),
         graph_mode,
     )
     .await
     {
-        Err(e) => format!("Error: query failed: {e}"),
+        Err(e) => format!("Error: query failed: {e}").into(),
         Ok(result) => {
             // Warming takes precedence over the empty-handling: an empty result with
             // `warming` set means the repo's vector shard was not resident after the
@@ -899,19 +1309,40 @@ async fn do_query(
             // decision is a pure function of (warming, empty, rerank_rejected) so it is
             // unit-tested directly (see select_empty_or_warming_message).
             if result.results.is_empty() {
-                let rerank_rejected = result.rerank.as_ref().is_some_and(|r| {
-                    !r.fallback_used && r.skip_reason.is_none() && !r.raw_response.is_empty()
-                });
-                return select_empty_or_warming_message(
-                    result.warming,
-                    rerank_rejected,
-                    information_request,
-                );
+                let rerank_rejected = result.rerank_rejected_all();
+                return QueryOutput {
+                    text: note_both_scopes_searched(
+                        select_empty_or_warming_message(
+                            result.warming,
+                            rerank_rejected,
+                            information_request,
+                        ),
+                        result.scope.is_some(),
+                        // The engine's early-return paths (no candidates survived)
+                        // are the only ones without rerank info.
+                        result.rerank.is_none(),
+                        result.warming,
+                    ),
+                    warming_empty: result.warming,
+                };
+            }
+            // Snapshot the DB handles for the grep-hint symbol lookup. The read
+            // guard is dropped at the end of this block, BEFORE any DB await.
+            let db_map: HashMap<String, Surreal<Db>> = {
+                let guard = repo_dbs.read().await;
+                guard.clone()
+            };
+            // One indexed seek (`idx_symbol_file`) per result that lacks its own
+            // symbol — bounded by the result count, like graph expansion.
+            let mut hint_symbols: Vec<Vec<String>> = Vec::with_capacity(result.results.len());
+            for r in &result.results {
+                hint_symbols.push(block_hint_symbols(&db_map, repo, r).await);
             }
             let blocks: Vec<OutputBlock> = result
                 .results
                 .iter()
-                .map(|r| {
+                .zip(hint_symbols)
+                .map(|(r, symbols)| {
                     let caller_tag =
                         format_enriched_caller_tag(r.callers, &r.caller_names, r.caller_files);
                     let callee_tag = format_enriched_callee_tag(r.callees, &r.callee_names);
@@ -929,6 +1360,7 @@ async fn do_query(
                         caller_names: r.caller_names.clone(),
                         callee_names: r.callee_names.clone(),
                         callees: r.callees,
+                        symbols,
                     }
                 })
                 .collect();
@@ -940,11 +1372,22 @@ async fn do_query(
                 .partition(|b| !crate::parsing::generated::is_generated_file(&b.file));
             let mut blocks = hand_written;
             blocks.extend(generated);
-            let assembled = assemble_with_budget(&blocks);
+            let mut assembled = with_grep_hint(assemble_with_budget(&blocks), &blocks);
+            if result.scope_fallback
+                && let Some(served) = result
+                    .scope
+                    .as_deref()
+                    .and_then(crate::vector::Scope::parse)
+            {
+                assembled = format!(
+                    "{}{assembled}",
+                    scope_fallback_notice(served.opposite(), served)
+                );
+            }
             if result.warming {
-                format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}")
+                format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}").into()
             } else {
-                assembled
+                assembled.into()
             }
         }
     }
@@ -1060,7 +1503,7 @@ async fn run_file_retrieval_resolved(
     }
 
     // Embed the query.
-    let voyage_client = match VoyageClient::new_for_provider(
+    let voyage_client = match VoyageClient::shared_for_provider(
         crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),

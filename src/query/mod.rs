@@ -5,6 +5,7 @@ pub mod graph_expand;
 pub mod jev;
 pub mod merger;
 pub mod reranker;
+pub(crate) mod scope_fallback;
 
 pub use engine::{CodeResult, QueryResult, QueryTiming, RerankInfo, run_query};
 

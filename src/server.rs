@@ -273,6 +273,9 @@ fn decode_repo_id(repo_id: &str) -> Result<String, Response> {
 /// renders an empty state instead of erroring (and without materializing a
 /// phantom DB directory as a side effect of a read). Delegates to
 /// [`store::open_if_indexed`].
+// An axum `Response` is the idiomatic early-return error for a handler helper;
+// boxing it would only add an allocation on the error path.
+#[allow(clippy::result_large_err)]
 async fn acquire_repo_db_if_indexed(
     state: &AppState,
     repo: &str,
@@ -363,6 +366,15 @@ async fn put_config(State(state): State<AppState>, body: axum::body::Bytes) -> R
     if settings.embedding.dimensions == Some(0) {
         let body = json!({ "error": "embedding.dimensions must be a positive integer" });
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+
+    // Normalize + bound the docs extension list BEFORE the disk write, so a bad
+    // value is rejected with settings untouched (same rule as the checks above).
+    match crate::config::normalize_docs_extensions(&settings.docs_extensions) {
+        Ok(list) => settings.docs_extensions = list,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
     }
 
     // Normalize repo paths to OS-native separators so D:/foo and D:\foo unify.
@@ -800,6 +812,11 @@ async fn post_ignore_file(
             .into_response();
     }
 
+    // Chunk rows changed → no persisted shard written before this may validate.
+    if let Err(e) = store::ops::bump_index_epoch(&db).await {
+        tracing::warn!(repo = %repo, error = %e, "ignore path: bump index_epoch failed");
+    }
+
     // 2. Evict vectors from the in-memory shard.
     {
         let mut vi = state.index_engine.vector_index.write().await;
@@ -963,6 +980,11 @@ async fn post_ignore_files(
                 Json(json!({ "error": format!("delete: {e}"), "count": total })),
             )
                 .into_response();
+        }
+
+        // Chunk rows changed → no persisted shard written before this may validate.
+        if let Err(e) = store::ops::bump_index_epoch(&db).await {
+            tracing::warn!(repo = %repo, error = %e, "ignore paths: bump index_epoch failed");
         }
 
         // 3. Evict this page's vectors from the in-memory shard.
@@ -1277,6 +1299,9 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
 struct McpToolRequest {
     information_request: String,
     workspace_full_path: String,
+    /// `code` (default when omitted) or `docs`; anything else is rejected by serde.
+    #[serde(default)]
+    scope: Option<crate::vector::Scope>,
 }
 
 /// POST /api/mcp-tool — call the shared MCP tool funnel over HTTP.
@@ -1296,6 +1321,7 @@ async fn post_mcp_tool(State(state): State<AppState>, Json(req): Json<McpToolReq
         &req.information_request,
         None,
         &req.workspace_full_path,
+        req.scope.unwrap_or_default(),
     )
     .await;
     Json(json!({ "result": result })).into_response()

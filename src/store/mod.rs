@@ -27,7 +27,17 @@ use crate::store::schema::SCHEMA_DDL;
 ///      graph-adjacency writes on every edge (~44% of Phase-2 write time on the
 ///      kernel). The migration clears old RELATION rows so they re-resolve as
 ///      plain rows. Output (call-graph nodes/edges) is byte-identical.
-pub const DB_SCHEMA_VERSION: u32 = 6;
+/// v7 = call-graph heal. Builds before v7 kept full-rebuild raw edges RAM-only, so
+///      `raw_edge` is partial and a later no-change run could replay Phase 2 from
+///      it, truncating `calls` while stamping `edges_resolved`. The migration
+///      clears both edge markers so the pipeline's edge heal (re-parse, no
+///      embedding) rebuilds raw_edge + calls on the next trigger. Also adds the
+///      `pending_retry` table (SCHEMA_DDL).
+/// v8 = `idx_raw_edge_to_name`. Incremental Phase 2 expands its blast radius to the
+///      callers of newly-added names (`raw_edge WHERE to_name = …`); without the
+///      index every incremental run full-scanned raw_edge. Built CONCURRENTLY by the
+///      background migration so the first open after an upgrade is not blocked.
+pub const DB_SCHEMA_VERSION: u32 = 8;
 
 /// key in index_meta for the DB schema version.
 pub const DB_SCHEMA_VERSION_KEY: &str = "db_schema_version";
@@ -164,6 +174,35 @@ pub async fn read_db_schema_version(db: &Surreal<Db>) -> u32 {
         Ok(Some(v)) => v.parse::<u32>().unwrap_or(1),
         _ => 1,
     }
+}
+
+/// Return the DB's schema version, first stamping a brand-new (empty, unversioned)
+/// DB with [`DB_SCHEMA_VERSION`].
+///
+/// WHY: an unversioned DB reads as v1, so a fresh repo used to spawn the whole
+/// v1→current migration chain in the background while its first index ran —
+/// rewriting/deleting rows the pipeline was writing at the same time. An empty DB
+/// has nothing to migrate. A DB with data but no version key is a genuine pre-v2
+/// DB and still migrates.
+pub async fn stamp_if_fresh(db: &Surreal<Db>) -> Result<u32> {
+    if ops::get_meta(db, DB_SCHEMA_VERSION_KEY).await?.is_some() {
+        return Ok(read_db_schema_version(db).await);
+    }
+    let mut res = db
+        .query(
+            "SELECT VALUE type::string(id) FROM file_meta LIMIT 1;              SELECT VALUE type::string(id) FROM chunk LIMIT 1;",
+        )
+        .await
+        .context("stamp_if_fresh: probe tables")?;
+    let metas: Vec<String> = res.take(0)?;
+    let chunks: Vec<String> = res.take(1)?;
+    if metas.is_empty() && chunks.is_empty() {
+        ops::set_meta(db, DB_SCHEMA_VERSION_KEY, &DB_SCHEMA_VERSION.to_string())
+            .await
+            .context("stamp_if_fresh: stamp version")?;
+        return Ok(DB_SCHEMA_VERSION);
+    }
+    Ok(1)
 }
 
 /// Open (or create) a SurrealDB database for the given repo.
@@ -305,6 +344,12 @@ pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: 
             }
             if stored_version < 6 {
                 run_migration_v5_to_v6(&db).await.context("v5→v6")?;
+            }
+            if stored_version < 7 {
+                run_migration_v6_to_v7(&db).await.context("v6→v7")?;
+            }
+            if stored_version < 8 {
+                run_migration_v7_to_v8(&db).await.context("v7→v8")?;
             }
             Ok(())
         }
@@ -796,10 +841,9 @@ pub async fn run_migration_v5_to_v6(db: &Surreal<Db>) -> Result<()> {
         .await
         .context("migration v5→v6: delete calls")?;
 
-    // Clear the edges_resolved marker so Phase 2 re-runs. On the next open with no
-    // file changes, run()'s "edges_resolved marker absent" branch replays Phase 2
-    // from raw_edge (incremental DBs) or forces a full rebuild (RAM-path DBs whose
-    // raw_edge table is empty) — the same self-healing path used after a crash.
+    // Clear the edges_resolved marker so Phase 2 re-runs. NOTE: a replay from
+    // raw_edge was only safe when raw_edge was complete, which pre-v7 RAM-path DBs
+    // never were; the chained v6→v7 migration below routes them to the edge heal.
     let _ = db
         .query("DELETE FROM index_meta WHERE key = $k")
         .bind(("k", "edges_resolved"))
@@ -811,6 +855,110 @@ pub async fn run_migration_v5_to_v6(db: &Surreal<Db>) -> Result<()> {
         .context("migration v5→v6: stamp db_schema_version=6")?;
 
     info!("migration v5→v6 complete");
+    Ok(())
+}
+
+/// v6→v7: clear `edges_resolved` and `raw_edge_complete` so the next index trigger
+/// heals the call graph from source (`IndexPipeline::heal_edges`).
+///
+/// WHY not `needs_rebuild`: a damaged DB (truncated `calls` under a stamped
+/// `edges_resolved`) is indistinguishable from a healthy one, so every DB must be
+/// healed — and a full rebuild deletes everything before it embeds, so with a dead
+/// key it would empty every repo. The heal needs no embedding. Idempotent.
+pub async fn run_migration_v6_to_v7(db: &Surreal<Db>) -> Result<()> {
+    info!("migration v6→v7: clearing edge markers so the call graph heals from source");
+    db.query("DELETE FROM index_meta WHERE key IN $keys")
+        .bind(("keys", vec!["edges_resolved", "raw_edge_complete"]))
+        .await
+        .context("migration v6→v7: clear edge markers")?;
+    ops::set_meta(db, DB_SCHEMA_VERSION_KEY, "7")
+        .await
+        .context("migration v6→v7: stamp db_schema_version=7")?;
+    info!("migration v6→v7 complete");
+    Ok(())
+}
+
+/// v7→v8: build `idx_raw_edge_to_name` over the existing raw_edge rows.
+///
+/// CONCURRENTLY (batched commits) for the same pinned-buffer reason as every other
+/// populated-table build; a half-built index left by a crash is dropped first. The
+/// version is stamped only once the index is ready, so an interrupted build re-runs
+/// on the next open. Until then incremental Phase 2 still works, just via a scan.
+pub async fn run_migration_v7_to_v8(db: &Surreal<Db>) -> Result<()> {
+    let (index, table, field) = RAW_EDGE_NAME_INDEX;
+    info!("migration v7→v8: building {index}");
+    if defined_index_names(db, table).await?.contains(index) {
+        let status = index_building_status(db, index, table).await?;
+        if !index_status_is_trustworthy(status.as_deref()) {
+            db.query(format!("REMOVE INDEX IF EXISTS {index} ON {table};"))
+                .await
+                .with_context(|| format!("migration v7→v8: remove half-built {index}"))?
+                .check()
+                .with_context(|| format!("migration v7→v8: remove half-built {index} (check)"))?;
+        }
+    }
+    build_index_concurrently(db, index, table, field)
+        .await
+        .context("migration v7→v8: build idx_raw_edge_to_name")?;
+    ops::set_meta(db, DB_SCHEMA_VERSION_KEY, "8")
+        .await
+        .context("migration v7→v8: stamp db_schema_version=8")?;
+    info!("migration v7→v8 complete");
+    Ok(())
+}
+
+/// `raw_edge.to_name` index (v8). Like the droppable indexes it is NOT in
+/// `SCHEMA_DDL` (a foreground backfill over a populated raw_edge would roll back
+/// under the pinned buffers), and a full rebuild drops it around the bulk raw_edge
+/// write. Unlike them, an upgraded DB gets it from the background v7→v8 migration
+/// rather than a blocking build inside `open_db`.
+pub const RAW_EDGE_NAME_INDEX: (&str, &str, &str) = ("idx_raw_edge_to_name", "raw_edge", "to_name");
+
+/// Define [`RAW_EDGE_NAME_INDEX`] on open when that is cheap or required:
+/// - absent on an empty raw_edge (fresh DB) → instant foreground define;
+/// - DB already at v8+ and the index absent or half-built (a crash between a full
+///   rebuild's drop and rebuild) → concurrent rebuild, the same crash-recovery the
+///   droppable indexes get;
+/// - DB below v8 → leave it to the background migration, never block the open.
+async fn ensure_raw_edge_name_index(db: &Surreal<Db>) -> Result<()> {
+    let (index, table, field) = RAW_EDGE_NAME_INDEX;
+    let migrated = read_db_schema_version(db).await >= 8;
+    if defined_index_names(db, table).await?.contains(index) {
+        if !migrated {
+            return Ok(());
+        }
+        let status = index_building_status(db, index, table).await?;
+        if index_status_is_trustworthy(status.as_deref()) {
+            return Ok(());
+        }
+        warn!(%index, ?status, "raw_edge name index not ready — dropping and rebuilding concurrently");
+        db.query(format!("REMOVE INDEX IF EXISTS {index} ON {table};"))
+            .await
+            .with_context(|| format!("remove half-built {index}"))?
+            .check()
+            .with_context(|| format!("remove half-built {index} (check)"))?;
+        return build_index_concurrently(db, index, table, field).await;
+    }
+    let row: Option<serde_json::Value> = db
+        .query(format!("SELECT 1 FROM {table} LIMIT 1"))
+        .await
+        .with_context(|| format!("probe {table} emptiness"))?
+        .take(0)
+        .with_context(|| format!("take {table} emptiness row"))?;
+    if row.is_none() {
+        db.query(format!(
+            "DEFINE INDEX IF NOT EXISTS {index} ON {table} FIELDS {field};"
+        ))
+        .await
+        .with_context(|| format!("define {index} on empty {table}"))?
+        .check()
+        .with_context(|| format!("define {index} on empty {table} (check)"))?;
+        return Ok(());
+    }
+    if migrated {
+        warn!(%index, "raw_edge name index absent on a populated table (likely a crash mid-rebuild) — rebuilding concurrently");
+        return build_index_concurrently(db, index, table, field).await;
+    }
     Ok(())
 }
 
@@ -1016,7 +1164,7 @@ pub async fn ensure_secondary_indexes(db: &Surreal<Db>) -> Result<()> {
                 .with_context(|| format!("crash-recovery concurrent build of {index}"))?;
         }
     }
-    Ok(())
+    ensure_raw_edge_name_index(db).await
 }
 
 /// Build a secondary index over an already-populated table without a single
@@ -1216,6 +1364,30 @@ pub async fn abort_migration(repo: &str) {
     }
 }
 
+/// Wait until no migration task is running for `repo`.
+///
+/// The index consumer calls this before running the pipeline: a migration runs
+/// unlocked in the background, and racing it is unsafe — v5→v6 `DELETE FROM calls`
+/// against a live Phase 2, v4→v5 `UPDATE` of chunk rows an incremental just deleted
+/// (resurrecting them), and v6→v7's marker clear must be visible to the very first
+/// run. Polls the registry (each task self-deregisters on completion), so the wait
+/// is bounded by the migration itself; aborted tasks are removed by
+/// `abort_migration`.
+pub async fn wait_migration(repo: &str) {
+    let repo = normalize_repo_path(repo);
+    loop {
+        let running = MIGRATION_TASKS
+            .lock()
+            .unwrap()
+            .get(&repo)
+            .is_some_and(|h| !h.is_finished());
+        if !running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Remove a repo's on-disk index directory, serialized against `open_db` via the
 /// same per-repo open gate `get_or_open` uses.
 ///
@@ -1386,7 +1558,7 @@ pub async fn get_or_open(
     let db = open_db(data_dir, repo, generation).await?;
 
     // Check schema version and spawn migration if needed (non-blocking).
-    let stored_version = read_db_schema_version(&db).await;
+    let stored_version = stamp_if_fresh(&db).await?;
 
     let mut map = repo_dbs.write().await;
     // Final double-check (defensive; the gate already guarantees uniqueness).
@@ -2832,6 +3004,111 @@ mod index_persistence_tests {
         assert!(
             names.contains(&"idx_calls_out_name".to_string()),
             "idx_calls_out_name must exist after a backfill build over {rows} rows (got {names:?})"
+        );
+    }
+
+    async fn insert_raw_edges(db: &Surreal<Db>, n: usize) {
+        for i in 0..n {
+            db.query(format!(
+                "INSERT INTO raw_edge {{ from_file: '/f{}.rs', from_name: 'a', \
+                 from_fqn: '/f.rs::a', to_name: 'n{}', kind: 'call', line: {i}, \
+                 import_path: NONE }}",
+                i % 7,
+                i % 5
+            ))
+            .await
+            .expect("insert raw_edge")
+            .check()
+            .expect("raw_edge check");
+        }
+    }
+
+    /// A fresh DB gets `idx_raw_edge_to_name` on open (empty table, instant
+    /// define), so incremental Phase 2 name expansion is index-served from day one.
+    #[tokio::test]
+    async fn fresh_open_defines_raw_edge_name_index() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/fresh_raw_edge_idx", 0)
+            .await
+            .expect("open");
+        let names = table_index_names(&db, "raw_edge").await;
+        assert!(
+            names.contains(&"idx_raw_edge_to_name".to_string()),
+            "got {names:?}"
+        );
+    }
+
+    /// Upgrade path: a populated pre-v8 DB must NOT get a blocking build inside
+    /// `open_db`/`ensure_secondary_indexes`; the v7→v8 migration builds it and
+    /// only then stamps the version.
+    #[tokio::test]
+    async fn v7_to_v8_migration_builds_raw_edge_name_index() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/v8_migration", 0)
+            .await
+            .expect("open");
+        insert_raw_edges(&db, 50).await;
+        db.query("REMOVE INDEX IF EXISTS idx_raw_edge_to_name ON raw_edge;")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        ops::set_meta(&db, DB_SCHEMA_VERSION_KEY, "7")
+            .await
+            .unwrap();
+
+        super::ensure_secondary_indexes(&db).await.unwrap();
+        assert!(
+            !table_index_names(&db, "raw_edge")
+                .await
+                .contains(&"idx_raw_edge_to_name".to_string()),
+            "a pre-v8 populated DB leaves the build to the background migration"
+        );
+
+        run_migration_v7_to_v8(&db).await.expect("migration");
+        assert!(
+            table_index_names(&db, "raw_edge")
+                .await
+                .contains(&"idx_raw_edge_to_name".to_string())
+        );
+        assert_eq!(read_db_schema_version(&db).await, 8);
+        let plan: Vec<serde_json::Value> = db
+            .query("SELECT from_file FROM raw_edge WHERE to_name = 'n1' EXPLAIN")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap_or_default()
+                .contains("idx_raw_edge_to_name"),
+            "the name expansion must be index-served: {plan:?}"
+        );
+    }
+
+    /// Crash between a full rebuild's index drop and rebuild on a v8 DB: the open
+    /// path rebuilds it, like the other droppable indexes.
+    #[tokio::test]
+    async fn v8_db_missing_raw_edge_name_index_is_rebuilt_on_ensure() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/v8_recovery", 0)
+            .await
+            .expect("open");
+        insert_raw_edges(&db, 50).await;
+        ops::set_meta(&db, DB_SCHEMA_VERSION_KEY, "8")
+            .await
+            .unwrap();
+        db.query("REMOVE INDEX IF EXISTS idx_raw_edge_to_name ON raw_edge;")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        super::ensure_secondary_indexes(&db).await.unwrap();
+        assert!(
+            table_index_names(&db, "raw_edge")
+                .await
+                .contains(&"idx_raw_edge_to_name".to_string())
         );
     }
 }

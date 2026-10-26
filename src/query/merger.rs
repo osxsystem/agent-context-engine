@@ -32,13 +32,16 @@ impl MergeChunk {
 ///
 /// Steps (as specified):
 /// 1. Dedup by (file, line_start, line_end) — keep highest score.
-/// 2. Group by file.
-/// 3. Sort within each group by line_start ASC.
-/// 4. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
+/// 2. Collapse chunks whose content is identical across files — keep the best one
+///    and record the other files on it. Runs before the merge pass, which
+///    concatenates neighbour content, so the key sees one chunk's own text.
+/// 3. Group by file.
+/// 4. Sort within each group by line_start ASC.
+/// 5. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
 ///    capping merged range at 60 lines.
-/// 5. Drop contained: within each file group, sort by width DESC, skip any chunk
+/// 6. Drop contained: within each file group, sort by width DESC, skip any chunk
 ///    fully inside a wider one.
-/// 6. Collect all groups, sort by score DESC, cap to top_k.
+/// 7. Collect all groups, sort by score DESC, cap to top_k.
 pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
     if chunks.is_empty() {
         return vec![];
@@ -58,19 +61,31 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             .or_insert(chunk);
     }
 
-    // Step 2: group by file.
+    // Step 2: one chunk per distinct content.
+    let collapsed = {
+        let mut deduped: Vec<MergeChunk> = dedup_map.into_values().collect();
+        deduped.sort_unstable_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.line_start.cmp(&b.line_start))
+                .then(a.line_end.cmp(&b.line_end))
+        });
+        collapse_identical_content(deduped)
+    };
+
+    // Step 3: group by file.
     let mut by_file: HashMap<String, Vec<MergeChunk>> = HashMap::new();
-    for chunk in dedup_map.into_values() {
+    for chunk in collapsed {
         by_file.entry(chunk.file.clone()).or_default().push(chunk);
     }
 
     let mut result = Vec::new();
 
     for (_file, mut file_chunks) in by_file {
-        // Step 3: sort by line_start ASC.
+        // Step 4: sort by line_start ASC.
         file_chunks.sort_unstable_by_key(|c| c.line_start);
 
-        // Step 4: merge pass.
+        // Step 5: merge pass.
         let mut merged: Vec<MergeChunk> = Vec::new();
         for next in file_chunks {
             if let Some(current) = merged.last_mut() {
@@ -115,6 +130,9 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
                         if current.symbol_kind.is_none() && next.symbol_kind.is_some() {
                             current.symbol_kind = next.symbol_kind;
                         }
+                        current.duplicates.extend(next.duplicates);
+                        current.duplicates.sort();
+                        current.duplicates.dedup();
                     }
                 } else {
                     merged.push(next);
@@ -124,7 +142,7 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             }
         }
 
-        // Step 5: drop contained chunks.
+        // Step 6: drop contained chunks.
         // Sort by width DESC (wider chunks survive).
         merged.sort_unstable_by(|a, b| {
             let wa = a.line_end.saturating_sub(a.line_start);
@@ -146,13 +164,76 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         result.extend(survivors);
     }
 
-    // Step 6: sort by score DESC and cap to top_k.
+    // Step 7: sort by score DESC and cap to top_k. Equal scores break on the
+    // file path then the start line, so the same candidates always rank alike.
     result.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line_start.cmp(&b.line_start))
     });
     result.truncate(top_k);
+    result
+}
+
+/// Key under which two chunks count as the same code: the text with CRLF folded
+/// to LF and each line's trailing whitespace removed. A reindented copy does not
+/// match, so only copies that differ in nothing but line endings collapse.
+fn content_key(content: &str) -> Option<String> {
+    let normalized: String = content
+        .replace("\r\n", "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.trim().is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Keep one chunk per distinct content and record the other files holding it.
+///
+/// The kept chunk is the highest scoring one; an equal score goes to the smaller
+/// file path, so the choice never depends on input order. A repeat inside the
+/// kept chunk's own file stays in place: collapsing it would name the file it
+/// already is, and same-file overlap belongs to the merge pass.
+fn collapse_identical_content(chunks: Vec<MergeChunk>) -> Vec<MergeChunk> {
+    let mut by_content: HashMap<String, Vec<MergeChunk>> = HashMap::new();
+    let mut result: Vec<MergeChunk> = Vec::new();
+    for chunk in chunks {
+        match content_key(&chunk.content) {
+            Some(key) => by_content.entry(key).or_default().push(chunk),
+            None => result.push(chunk),
+        }
+    }
+
+    for (_, mut group) in by_content {
+        group.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line_start.cmp(&b.line_start))
+        });
+        let mut group = group.into_iter();
+        let Some(mut kept) = group.next() else {
+            continue;
+        };
+        let mut others: Vec<String> = Vec::new();
+        for chunk in group {
+            if chunk.file == kept.file {
+                result.push(chunk);
+            } else {
+                others.push(chunk.file);
+            }
+        }
+        others.sort();
+        others.dedup();
+        kept.duplicates = others;
+        result.push(kept);
+    }
     result
 }
 
@@ -271,6 +352,27 @@ mod tests {
                 ("d.rs".to_owned(), 269),
                 ("e.rs".to_owned(), 269),
             ]
+        );
+    }
+
+    #[test]
+    fn adjacent_chunks_merged_in_one_file_keep_both_duplicate_lists() {
+        let mut first = chunk_at("a.rs", 1, "fn one() {}");
+        first.score = 0.9;
+        let mut second = chunk_at("a.rs", 4, "fn two() {}");
+        second.score = 0.7;
+        let mut first_copy = chunk_at("z.rs", 1, "fn one() {}");
+        first_copy.score = 0.8;
+        let mut second_copy = chunk_at("y.rs", 4, "fn two() {}");
+        second_copy.score = 0.6;
+
+        let merged = merge_chunks(vec![first, second, first_copy, second_copy], 10);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].line_start, merged[0].line_end), (1, 6));
+        assert_eq!(
+            merged[0].duplicates,
+            vec!["y.rs".to_owned(), "z.rs".to_owned()]
         );
     }
 }

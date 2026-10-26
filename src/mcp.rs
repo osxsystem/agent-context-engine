@@ -418,10 +418,6 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
 /// the earliest block in its file group. Blocks from different files pass
 /// through unchanged.
 fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
-    if blocks.len() <= 1 {
-        return blocks;
-    }
-
     // Group by file. Normalize path separators for grouping on Windows
     // (the index stores native `\` but sub-query paths may use `/`).
     let normalize_key = |file: &str| -> String {
@@ -444,12 +440,6 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
     let mut positioned: Vec<(usize, OutputBlock)> = Vec::new();
 
     for (_file, mut group) in by_file {
-        if group.len() == 1 {
-            let (idx, block) = group.remove(0);
-            positioned.push((idx, block));
-            continue;
-        }
-
         // Sort by line_start within file.
         group.sort_unstable_by_key(|(_, b)| b.line_start);
 
@@ -483,6 +473,7 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                     // Carry the absorbed block's symbols so the grep hint can still
                     // name them; the block itself is gone after this merge.
                     current.symbols.append(&mut next.symbols);
+                    current.duplicates.append(&mut next.duplicates);
                     originals.push(next.content);
                 } else {
                     let content_snapshot = next.content.clone();
@@ -511,15 +502,9 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                     }
                 }
             }
-            // Rebuild header with updated range, duplicate note, and tags.
-            let duplicate_tag = format_duplicate_tag(&block.duplicates);
-            let caller_tag =
-                format_enriched_caller_tag(block.callers, &block.caller_names, block.caller_files);
-            let callee_tag = format_enriched_callee_tag(block.callees, &block.callee_names);
-            block.header = format!(
-                "{}#L{}-{}{}{}{}",
-                block.file, block.line_start, block.line_end, duplicate_tag, caller_tag, callee_tag
-            );
+            block.duplicates.sort();
+            block.duplicates.dedup();
+            block.header = output_header(block);
         }
 
         // Use the tracked min_orig_idx for output ordering.
@@ -1251,9 +1236,40 @@ fn format_enriched_callee_tag(count: Option<u32>, names: &[String]) -> String {
     }
 }
 
-/// Render the note naming the other files that hold this block's code.
-fn format_duplicate_tag(_duplicates: &[String]) -> String {
-    String::new()
+/// Render the note naming the other files that hold this block's code, as a
+/// count plus the first three paths. `duplicates` arrives sorted.
+fn format_duplicate_tag(duplicates: &[String]) -> String {
+    const SHOWN: usize = 3;
+    if duplicates.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<&str> = duplicates.iter().take(SHOWN).map(String::as_str).collect();
+    let more = if duplicates.len() > SHOWN {
+        ", …"
+    } else {
+        ""
+    };
+    format!(
+        " (+{} identical: {}{})",
+        duplicates.len(),
+        shown.join(", "),
+        more
+    )
+}
+
+/// The block header: `path#Lstart-end`, then the duplicate note, then the
+/// caller and callee tags. One renderer, so a header rebuilt by the same-file
+/// merge cannot drop what the first pass put in it.
+fn output_header(block: &OutputBlock) -> String {
+    format!(
+        "{}#L{}-{}{}{}{}",
+        block.file,
+        block.line_start,
+        block.line_end,
+        format_duplicate_tag(&block.duplicates),
+        format_enriched_caller_tag(block.callers, &block.caller_names, block.caller_files),
+        format_enriched_callee_tag(block.callees, &block.callee_names),
+    )
 }
 
 /// Returns a string — never panics, never returns Err.
@@ -1351,15 +1367,8 @@ async fn do_query(
                 .iter()
                 .zip(hint_symbols)
                 .map(|(r, symbols)| {
-                    let duplicate_tag = format_duplicate_tag(&r.duplicates);
-                    let caller_tag =
-                        format_enriched_caller_tag(r.callers, &r.caller_names, r.caller_files);
-                    let callee_tag = format_enriched_callee_tag(r.callees, &r.callee_names);
-                    OutputBlock {
-                        header: format!(
-                            "{}#L{}-{}{}{}{}",
-                            r.file, r.line_start, r.line_end, duplicate_tag, caller_tag, callee_tag
-                        ),
+                    let mut block = OutputBlock {
+                        header: String::new(),
                         content: r.content.clone(),
                         file: r.file.clone(),
                         line_start: r.line_start,
@@ -1371,7 +1380,9 @@ async fn do_query(
                         callees: r.callees,
                         symbols,
                         duplicates: r.duplicates.clone(),
-                    }
+                    };
+                    block.header = output_header(&block);
+                    block
                 })
                 .collect();
             let blocks = merge_overlapping_blocks(blocks);

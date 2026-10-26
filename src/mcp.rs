@@ -335,7 +335,7 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
     assemble_with_budget_counted(blocks).0
 }
 
-/// Also returns how many leading blocks were emitted, stopping at the first the budget dropped.
+/// `assemble_with_budget`, plus how many leading blocks were emitted, stopping at the first the budget dropped.
 fn assemble_with_budget_counted(blocks: &[OutputBlock]) -> (String, usize) {
     // Reserve space for the truncation footer so it's never squeezed out, plus the
     // grep hint that `with_grep_hint` appends after it: the hint is appended

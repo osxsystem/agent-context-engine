@@ -1069,6 +1069,51 @@ fn grep_hint_ignores_blocks_ranked_below_the_top_five() {
 }
 
 #[test]
+fn grep_hint_takes_no_callee_from_a_block_ranked_below_the_top_five() {
+    let mut blocks: Vec<OutputBlock> = (0..5).map(|_| callee_block(&[], &[])).collect();
+    blocks.push(callee_block(&[], &["sixth_callee_fn"]));
+    assert_eq!(build_grep_hint(&blocks), None);
+}
+
+#[test]
+fn grep_hint_counts_truncated_blocks_and_stops_at_the_first_dropped_one() {
+    let budget = MAX_TOOL_OUTPUT_CHARS - 150 - GREP_HINT_MAX_CHARS;
+    let block = |file: &str, header: String, content: String, symbol: &str| OutputBlock {
+        header,
+        content,
+        file: file.to_string(),
+        line_start: 1,
+        line_end: 2,
+        symbols: vec![symbol.to_string()],
+        ..Default::default()
+    };
+    let blocks = vec![
+        block(
+            "a.rs",
+            "a.rs#L1-2".into(),
+            "x".repeat(budget - 400),
+            "full_fn",
+        ),
+        block("b.rs", "b.rs#L1-2".into(), "y".repeat(1000), "truncated_fn"),
+        block(
+            "c.rs",
+            format!("c.rs#L1-2 {}", "z".repeat(1000)),
+            "w".repeat(10),
+            "dropped_fn",
+        ),
+        block("d.rs", "d.rs#L1-2".into(), "v".repeat(10), "after_drop_fn"),
+    ];
+    let out = assemble_with_grep_hint(&blocks);
+    assert!(
+        out.contains("d.rs#L1-2"),
+        "the block after the drop is shown"
+    );
+    assert!(out.contains("rg 'full_fn|truncated_fn'"), "{out}");
+    assert!(!out.contains("dropped_fn"));
+    assert!(!out.contains("after_drop_fn"));
+}
+
+#[test]
 fn grep_hint_names_nothing_from_a_block_the_budget_dropped() {
     let header = "a.rs#L1-2";
     let fill = MAX_TOOL_OUTPUT_CHARS - 150 - GREP_HINT_MAX_CHARS - header.len() - 1 - 5;

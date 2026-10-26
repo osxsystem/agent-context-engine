@@ -312,6 +312,11 @@ fn with_grep_hint(mut assembled: String, blocks: &[OutputBlock]) -> String {
     assembled
 }
 
+/// The tool answer for `blocks`: the budgeted body plus the grep hint.
+fn assemble_with_grep_hint(blocks: &[OutputBlock]) -> String {
+    with_grep_hint(assemble_with_budget(blocks), blocks)
+}
+
 /// Assemble result blocks into a single string respecting `MAX_TOOL_OUTPUT_CHARS`.
 ///
 /// Results are in priority order (reranked). Full content is emitted until the
@@ -1369,7 +1374,7 @@ async fn do_query(
                 .partition(|b| !crate::parsing::generated::is_generated_file(&b.file));
             let mut blocks = hand_written;
             blocks.extend(generated);
-            let mut assembled = with_grep_hint(assemble_with_budget(&blocks), &blocks);
+            let mut assembled = assemble_with_grep_hint(&blocks);
             if result.scope_fallback
                 && let Some(served) = result
                     .scope

@@ -12,9 +12,10 @@ use crate::embedding::identity::EmbeddingIdentity;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::path_in_repo;
+use crate::query::chunk_weight::weighted_merge;
 use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
-use crate::query::merger::{MergeChunk, merge_chunks};
+use crate::query::merger::MergeChunk;
 use crate::query::reranker;
 use crate::query::scope_fallback::{Gathered, gather_with_fallback, retry_on_rerank_rejection};
 use crate::vector::ScopeFilter;
@@ -399,7 +400,17 @@ async fn run_query_once(
 
     // ── Step 5: Merge ─────────────────────────────────────────────────────
     let merge_start = Instant::now();
-    let merged = merge_chunks(all_chunks, top_k);
+    let repo_roots: Vec<&str> = match repo_filter {
+        Some(repo) => vec![repo],
+        None => db_map.keys().map(String::as_str).collect(),
+    };
+    let merged = weighted_merge(
+        all_chunks,
+        &[&parsed.text],
+        &parsed.filters,
+        &repo_roots,
+        top_k,
+    );
     let merge_ms = merge_start.elapsed().as_millis() as u64;
 
     // Read numbered content from disk ONCE per candidate. Bounded by top_k
@@ -758,7 +769,8 @@ async fn rerank_single_shot<R: reranker::Reranker>(
 /// into rerank because it has no `llm_client` and no rerank call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sub_query(
-    query: &str,
+    user_query: &str,
+    agent_query: &str,
     top_k: usize,
     repo_filter: &str,
     filters: &crate::query::filters::QueryFilters,
@@ -769,7 +781,7 @@ pub(crate) async fn run_sub_query(
     graph_mode: QueryGraphMode,
     class: Option<ScopeFilter>,
 ) -> Result<Vec<MergeChunk>> {
-    let embedding = voyage_client.embed_query(query).await?;
+    let embedding = voyage_client.embed_query(agent_query).await?;
     if embedding.is_empty() {
         bail!("embed_query returned an empty vector");
     }
@@ -838,7 +850,13 @@ pub(crate) async fn run_sub_query(
         }
     }
 
-    Ok(merge_chunks(all_chunks, top_k))
+    Ok(weighted_merge(
+        all_chunks,
+        &[user_query, agent_query],
+        filters,
+        &[repo_filter],
+        top_k,
+    ))
 }
 
 // ─── Query filter application ────────────────────────────────────────────

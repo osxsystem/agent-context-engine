@@ -1,3 +1,4 @@
+pub mod chunk_weight;
 pub mod content_fence;
 pub mod engine;
 pub mod filters;

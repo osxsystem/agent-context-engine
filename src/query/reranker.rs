@@ -116,13 +116,13 @@ pub trait Reranker {
 /// rank through this, so they cannot disagree about the provider.
 ///
 /// There is deliberately no fallback between the arms: when Jev is selected
-/// and fails, results come back in similarity order with a skip reason, never
+/// and fails, results come back in weighted merge order with a skip reason, never
 /// reranked by the LLM provider instead.
 pub enum RerankProvider {
-    /// Reranking was not requested: similarity order, saying so.
+    /// Reranking was not requested: weighted merge order, saying so.
     Off,
     /// An LLM provider (`google`/`openai`/`custom`). `None` when it has no key;
-    /// that degrades to similarity order.
+    /// that degrades to weighted merge order.
     Llm(Option<LlmClient>),
     Jev(JevReranker),
 }
@@ -188,7 +188,7 @@ impl Reranker for RerankProvider {
 /// Reranks by prompting a chat LLM for a JSON ordering plus line ranges.
 ///
 /// `client` is `None` when no API key is configured; that is not an error, it
-/// degrades to the incoming similarity order.
+/// degrades to the incoming weighted merge order.
 pub struct LlmReranker<'a> {
     pub client: Option<&'a LlmClient>,
 }
@@ -616,6 +616,7 @@ struct LiveBackend<'a> {
     llm_client: &'a LlmClient,
     prompt_cache_key: Option<String>,
     repo_filter: &'a str,
+    user_query: &'a str,
     /// The owner's kind/lang/path/name filters, applied to `query`-tool results
     /// exactly as to the base candidates.
     filters: &'a QueryFilters,
@@ -652,6 +653,7 @@ impl AgenticBackend for LiveBackend<'_> {
         information_request: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MergeChunk>>> + Send {
         run_sub_query(
+            self.user_query,
             information_request,
             30,
             self.repo_filter,
@@ -713,6 +715,7 @@ pub async fn rerank_agentic(
         llm_client,
         prompt_cache_key: Some(cache_key),
         repo_filter,
+        user_query: &query.text,
         filters: &query.filters,
         voyage_client,
         index_engine,
@@ -1948,7 +1951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn off_keeps_similarity_order_and_says_reranking_was_not_requested() {
+    async fn off_keeps_weighted_merge_order_and_says_reranking_was_not_requested() {
         let chunks = [chunk(1, 5), chunk(6, 9)];
         let spans = RerankRequest::no_spans(chunks.len());
         let out = RerankProvider::Off

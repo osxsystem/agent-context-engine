@@ -10,7 +10,7 @@
 //! accepts rare false positives (`latest.java`). A dropped hint symbol is cheap.
 
 /// Directory segments that mark everything below them as tests.
-const TEST_DIRS: &[&str] = &["test", "tests", "__tests__", "spec"];
+const TEST_DIRS: &[&str] = &["test", "tests", "__tests__", "__mocks__", "spec"];
 
 pub fn is_test_path(rel: &str) -> bool {
     let normalized = rel.replace('\\', "/");
@@ -24,6 +24,34 @@ pub fn is_test_path(rel: &str) -> bool {
         TEST_DIRS.contains(&dir.as_str()) || dir.ends_with(".tests")
     });
     in_test_dir || is_test_file_name(file)
+}
+
+/// Repo-relative, `/`-separated path of `file` under the longest matching root of
+/// `repos`, compared case-insensitively. Absolute paths must not reach the test-path
+/// check: a repo that lives under a `test/` directory would otherwise match on every
+/// chunk. When no root contains `file`, only the file name is returned, so no
+/// directory segment can produce a false positive.
+pub fn repo_relative_in(file: &str, repos: &[&str]) -> String {
+    let file = file.replace('\\', "/");
+    repos
+        .iter()
+        .filter_map(|repo| strip_repo(&file, repo))
+        .min_by_key(|rel| rel.len())
+        .unwrap_or_else(|| file.rsplit('/').next().unwrap_or("").to_string())
+}
+
+pub fn repo_relative(file: &str, repo: &str) -> String {
+    repo_relative_in(file, &[repo])
+}
+
+fn strip_repo(file: &str, repo: &str) -> Option<String> {
+    let repo = repo.replace('\\', "/");
+    let repo = repo.trim_end_matches('/');
+    let under_repo = file.len() > repo.len()
+        && file.is_char_boundary(repo.len())
+        && file[..repo.len()].eq_ignore_ascii_case(repo)
+        && file.as_bytes()[repo.len()] == b'/';
+    under_repo.then(|| file[repo.len() + 1..].to_string())
 }
 
 fn is_test_file_name(file: &str) -> bool {
@@ -117,6 +145,7 @@ mod tests {
                 "src/Button.test.svelte",
                 "src/__tests__/a.js",
                 "src/__tests__/deep/b.ts",
+                "src/components/__mocks__/Modal.jsx",
             ],
             true,
         );

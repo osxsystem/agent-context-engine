@@ -1033,6 +1033,19 @@ fn hint_fits_inside_budget_reserve_even_when_output_is_truncated() {
 }
 
 #[test]
+fn grep_hint_takes_at_most_three_callees_from_one_block() {
+    let blocks = vec![
+        callee_block(&[], &["one_fn", "two_fn", "three_fn", "four_fn"]),
+        callee_block(&[], &["five_fn"]),
+    ];
+    let hint = build_grep_hint(&blocks).unwrap();
+    assert!(
+        hint.contains("rg 'one_fn|two_fn|three_fn|five_fn'"),
+        "{hint}"
+    );
+}
+
+#[test]
 fn grep_hint_skips_a_name_that_overflows_the_pattern_cap_and_keeps_later_short_ones() {
     let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
     let blocks = vec![sym_block("a.rs", 1, 5, &[&a, &b, &c, "short_fn"])];

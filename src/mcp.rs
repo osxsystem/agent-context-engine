@@ -73,6 +73,9 @@ struct OutputBlock {
 // gives it nothing to run and tends to be ignored.
 
 const GREP_HINT_MAX_SYMBOLS: usize = 5;
+/// Only the top results carry the query's topic. A low-ranked block is one call
+/// site or a stray match, and its names (`TrainingPlanUI`) mislead the grep.
+const GREP_HINT_MAX_BLOCKS: usize = 5;
 /// Shorter names (`new`, `get`, `run`) would make the grep all noise.
 const GREP_HINT_MIN_NAME_LEN: usize = 4;
 const GREP_HINT_MAX_NAME_LEN: usize = 40;
@@ -136,6 +139,7 @@ struct DefinedSymbol {
 
 /// One block must not fill the whole hint on its own.
 const GREP_HINT_MAX_DEFINED_PER_BLOCK: usize = 3;
+const GREP_HINT_MAX_CALLEES_PER_BLOCK: usize = 3;
 
 /// Symbols that name a block which carries no `symbol_ref` of its own. Measured on
 /// real repos, MOST result chunks have none: `symbol_ref` is only set at index time
@@ -259,19 +263,25 @@ async fn block_hint_symbols(
         .collect()
 }
 
-/// Build the grep hint from the final, priority-ordered blocks, in two passes:
-/// first the symbols every block DEFINES (block order), then the callees of every
-/// block. Measured across five repos, defined symbols are on-topic while callees
-/// often drag in logging/util helpers (`maskUserID`, `CreatePendingLog`), so callees
-/// only fill what is left. They still matter: they come from the resolved call
+/// Build the grep hint from the shown, priority-ordered blocks, in two passes:
+/// first the symbols each of the top `GREP_HINT_MAX_BLOCKS` blocks DEFINES (block
+/// order), then their callees. Measured across five repos, defined symbols are
+/// on-topic while callees often drag in logging/util helpers (`maskUserID`,
+/// `CreatePendingLog`), so callees only fill what is left. They still matter: they come from the resolved call
 /// graph, so they always name real in-repo definitions, and for test blocks they
 /// are the production API under test.
 /// `None` when no usable symbol exists: no static fallback, nothing to grep for.
 fn build_grep_hint(blocks: &[OutputBlock]) -> Option<String> {
     let mut names: Vec<&str> = Vec::new();
     let mut pattern_len = 0usize;
-    let defined = blocks.iter().flat_map(|b| &b.symbols);
-    let callees = blocks.iter().flat_map(|b| &b.callee_names);
+    let top = &blocks[..blocks.len().min(GREP_HINT_MAX_BLOCKS)];
+    let defined = top.iter().flat_map(|b| &b.symbols);
+    let callees = top.iter().flat_map(|b| {
+        b.callee_names
+            .iter()
+            .filter(|n| is_greppable_symbol(n))
+            .take(GREP_HINT_MAX_CALLEES_PER_BLOCK)
+    });
     for symbol in defined.chain(callees) {
         if names.len() >= GREP_HINT_MAX_SYMBOLS {
             break;
@@ -282,7 +292,7 @@ fn build_grep_hint(blocks: &[OutputBlock]) -> Option<String> {
         }
         let added = name.len() + usize::from(!names.is_empty());
         if pattern_len + added > GREP_HINT_MAX_PATTERN_CHARS {
-            break;
+            continue;
         }
         pattern_len += added;
         names.push(name);
@@ -314,7 +324,8 @@ fn with_grep_hint(mut assembled: String, blocks: &[OutputBlock]) -> String {
 
 /// The tool answer for `blocks`: the budgeted body plus the grep hint.
 fn assemble_with_grep_hint(blocks: &[OutputBlock]) -> String {
-    with_grep_hint(assemble_with_budget(blocks), blocks)
+    let (assembled, shown) = assemble_with_budget_counted(blocks);
+    with_grep_hint(assembled, &blocks[..shown])
 }
 
 /// Assemble result blocks into a single string respecting `MAX_TOOL_OUTPUT_CHARS`.
@@ -323,6 +334,12 @@ fn assemble_with_grep_hint(blocks: &[OutputBlock]) -> String {
 /// budget would be exceeded; from that point, all remaining blocks are shown as
 /// header + first line (capped at 120 chars) + elision marker.
 fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
+    assemble_with_budget_counted(blocks).0
+}
+
+/// `assemble_with_budget` plus how many leading blocks it emitted, in full or
+/// truncated. The count stops at the first block the budget dropped.
+fn assemble_with_budget_counted(blocks: &[OutputBlock]) -> (String, usize) {
     // Reserve space for the truncation footer so it's never squeezed out, plus the
     // grep hint that `with_grep_hint` appends after it: the hint is appended
     // unconditionally, and dropping it only when it didn't fit would lose it
@@ -333,6 +350,8 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
     let mut out = String::new();
     let mut truncated_count = 0usize;
     let mut budget_exceeded = false;
+    let mut shown = 0usize;
+    let mut dropped = false;
 
     for block in blocks {
         let full_text = format!("{}\n{}", block.header, block.content);
@@ -343,6 +362,7 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
             if candidate_len <= effective_budget {
                 out.push_str(separator);
                 out.push_str(&full_text);
+                shown += usize::from(!dropped);
                 continue;
             }
             budget_exceeded = true;
@@ -381,6 +401,9 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
         if candidate_len <= effective_budget {
             out.push_str(separator);
             out.push_str(&truncated_text);
+            shown += usize::from(!dropped);
+        } else {
+            dropped = true;
         }
         truncated_count += 1;
     }
@@ -395,7 +418,7 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
         out.push_str(&footer);
     }
 
-    out
+    (out, shown)
 }
 
 /// Merge output blocks from the same file whose line ranges overlap or are

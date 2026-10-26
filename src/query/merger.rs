@@ -15,6 +15,9 @@ pub struct MergeChunk {
     /// Symbol kind (e.g. "function", "class", "struct") — populated from the
     /// symbol table during fetch_chunk_content. Used for kind: filter application.
     pub symbol_kind: Option<String>,
+    /// Other files holding this same code. `merge_chunks` fills it on the chunk
+    /// it keeps when it collapses identical copies.
+    pub duplicates: Vec<String>,
 }
 
 impl MergeChunk {
@@ -151,4 +154,123 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
     });
     result.truncate(top_k);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK: &str = "export function SaveAsUI() {\n  return <Modal open />;\n}";
+
+    fn chunk(file: &str, content: &str, score: f32) -> MergeChunk {
+        MergeChunk {
+            file: file.to_owned(),
+            line_start: 269,
+            line_end: 310,
+            score,
+            content: content.to_owned(),
+            symbol: None,
+            symbol_fqn: None,
+            symbol_kind: None,
+            duplicates: Vec::new(),
+        }
+    }
+
+    fn chunk_at(file: &str, line_start: u32, content: &str) -> MergeChunk {
+        MergeChunk {
+            line_start,
+            line_end: line_start + 2,
+            ..chunk(file, content, 0.5)
+        }
+    }
+
+    fn listed(chunks: &[MergeChunk]) -> Vec<(&str, f32)> {
+        chunks.iter().map(|c| (c.file.as_str(), c.score)).collect()
+    }
+
+    #[test]
+    fn identical_content_across_files_collapses_to_one_representative() {
+        let merged = merge_chunks(
+            vec![
+                chunk("b/forms/SaveAsUI.jsx", BLOCK, 0.9),
+                chunk("a/forms/SaveAsUI.jsx", BLOCK, 0.9),
+                chunk("c/forms/SaveAsUI.jsx", BLOCK, 0.8),
+                chunk("src/Modal.jsx", "export function Modal() {}", 0.7),
+                chunk("src/useSaveAs.js", "export function useSaveAs() {}", 0.6),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            listed(&merged),
+            vec![
+                ("a/forms/SaveAsUI.jsx", 0.9),
+                ("src/Modal.jsx", 0.7),
+                ("src/useSaveAs.js", 0.6),
+            ],
+            "the copy with the best score and, on a tie, the smallest path stands for all three"
+        );
+        assert_eq!(
+            merged[0].duplicates,
+            vec![
+                "b/forms/SaveAsUI.jsx".to_owned(),
+                "c/forms/SaveAsUI.jsx".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn copies_differing_only_by_line_endings_and_trailing_space_collapse() {
+        let merged = merge_chunks(
+            vec![
+                chunk("win/x.js", "fn a() {\r\n  b();  \r\n}\r\n", 0.9),
+                chunk("unix/x.js", "fn a() {\n  b();\n}\n", 0.8),
+            ],
+            10,
+        );
+
+        assert_eq!(merged.len(), 1, "the two copies are the same code");
+        assert_eq!(merged[0].file, "win/x.js");
+        assert_eq!(merged[0].duplicates, vec!["unix/x.js".to_owned()]);
+    }
+
+    #[test]
+    fn blank_content_never_collapses() {
+        let merged = merge_chunks(vec![chunk("a.rs", "", 0.9), chunk("b.rs", "", 0.8)], 10);
+
+        assert_eq!(merged.len(), 2, "two empty chunks are not the same code");
+    }
+
+    #[test]
+    fn equal_scores_are_ordered_by_file_then_start_line() {
+        let mut chunks = Vec::new();
+        for (file, line) in [
+            ("e.rs", 269u32),
+            ("a.rs", 900),
+            ("c.rs", 500),
+            ("b.rs", 269),
+            ("d.rs", 269),
+            ("a.rs", 269),
+        ] {
+            chunks.push(chunk_at(file, line, &format!("fn {file}_{line}() {{}}")));
+        }
+
+        let merged = merge_chunks(chunks, 10);
+        let order: Vec<(String, u32)> = merged
+            .iter()
+            .map(|c| (c.file.clone(), c.line_start))
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![
+                ("a.rs".to_owned(), 269),
+                ("a.rs".to_owned(), 900),
+                ("b.rs".to_owned(), 269),
+                ("c.rs".to_owned(), 500),
+                ("d.rs".to_owned(), 269),
+                ("e.rs".to_owned(), 269),
+            ]
+        );
+    }
 }

@@ -61,6 +61,8 @@ struct OutputBlock {
     callee_names: Vec<String>,
     callees: Option<u32>,
     symbols: Vec<String>,
+    /// Other files holding this same code, in the form `merge_chunks` recorded.
+    duplicates: Vec<String>,
 }
 
 // ─── Grep hint footer ────────────────────────────────────────────────────
@@ -509,13 +511,14 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                     }
                 }
             }
-            // Rebuild header with updated range + enriched caller/callee tags.
+            // Rebuild header with updated range, duplicate note, and tags.
+            let duplicate_tag = format_duplicate_tag(&block.duplicates);
             let caller_tag =
                 format_enriched_caller_tag(block.callers, &block.caller_names, block.caller_files);
             let callee_tag = format_enriched_callee_tag(block.callees, &block.callee_names);
             block.header = format!(
-                "{}#L{}-{}{}{}",
-                block.file, block.line_start, block.line_end, caller_tag, callee_tag
+                "{}#L{}-{}{}{}{}",
+                block.file, block.line_start, block.line_end, duplicate_tag, caller_tag, callee_tag
             );
         }
 
@@ -1248,6 +1251,11 @@ fn format_enriched_callee_tag(count: Option<u32>, names: &[String]) -> String {
     }
 }
 
+/// Render the note naming the other files that hold this block's code.
+fn format_duplicate_tag(_duplicates: &[String]) -> String {
+    String::new()
+}
+
 /// Returns a string — never panics, never returns Err.
 ///
 /// Note: neither `home_dir` nor `data_dir` is needed here — both DB opens and
@@ -1343,13 +1351,14 @@ async fn do_query(
                 .iter()
                 .zip(hint_symbols)
                 .map(|(r, symbols)| {
+                    let duplicate_tag = format_duplicate_tag(&r.duplicates);
                     let caller_tag =
                         format_enriched_caller_tag(r.callers, &r.caller_names, r.caller_files);
                     let callee_tag = format_enriched_callee_tag(r.callees, &r.callee_names);
                     OutputBlock {
                         header: format!(
-                            "{}#L{}-{}{}{}",
-                            r.file, r.line_start, r.line_end, caller_tag, callee_tag
+                            "{}#L{}-{}{}{}{}",
+                            r.file, r.line_start, r.line_end, duplicate_tag, caller_tag, callee_tag
                         ),
                         content: r.content.clone(),
                         file: r.file.clone(),
@@ -1361,6 +1370,7 @@ async fn do_query(
                         callee_names: r.callee_names.clone(),
                         callees: r.callees,
                         symbols,
+                        duplicates: r.duplicates.clone(),
                     }
                 })
                 .collect();
@@ -1548,6 +1558,7 @@ async fn run_file_retrieval_resolved(
             symbol: None,
             symbol_fqn: None,
             symbol_kind: None,
+            duplicates: Vec::new(),
         })
         .collect();
 

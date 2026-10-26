@@ -173,6 +173,7 @@ fn chunk(file: &str, symbol: &str) -> MergeChunk {
         symbol: Some(symbol.to_owned()),
         symbol_fqn: None,
         symbol_kind: Some("function".to_owned()),
+        duplicates: Vec::new(),
     }
 }
 

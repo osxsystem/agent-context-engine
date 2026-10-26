@@ -497,6 +497,7 @@ mod tests {
             symbol: None,
             symbol_fqn: None,
             symbol_kind: None,
+            duplicates: Vec::new(),
         }
     }
 

@@ -958,6 +958,8 @@ fn lang_matches_alias(filter: &str, detected: &str) -> bool {
     }
 }
 
+/// Enriched caller/callee stats for a single chunk's symbol.
+/// Counts are distinct names. The name lists are short names, de-duplicated.
 #[derive(Debug, Clone)]
 pub struct CallerCalleeStats {
     pub caller_count: u32,
@@ -1118,6 +1120,8 @@ pub(crate) async fn query_caller_callee_stats(
     })
 }
 
+/// Sort names by file proximity to target: same-file first, same-directory second,
+/// then alphabetical. Dedup by short name.
 fn proximity_sorted_names(entries: &[(String, String)], target_file: &str) -> Vec<String> {
     use std::path::Path;
 
@@ -1153,6 +1157,9 @@ fn proximity_sorted_names(entries: &[(String, String)], target_file: &str) -> Ve
         .collect()
 }
 
+/// Format a caller tag string for MCP output.
+/// `[callers: fn_a, fn_b +N more]`, showing up to 30 names; N is the distinct
+/// caller count minus the names shown.
 pub fn format_caller_tag(stats: &CallerCalleeStats) -> String {
     if stats.caller_count == 0 {
         return String::new();
@@ -1174,6 +1181,8 @@ pub fn format_caller_tag(stats: &CallerCalleeStats) -> String {
     }
 }
 
+/// Format a callee tag string for MCP output.
+/// `[calls: fn_x, fn_y +N more]`, showing up to 30 names.
 pub fn format_callee_tag(stats: &CallerCalleeStats) -> String {
     if stats.callee_count == 0 {
         return String::new();

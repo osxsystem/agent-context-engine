@@ -1,15 +1,14 @@
 //! React framework resolver: detects React and extracts component-rendering edges.
 //!
 //! Detection: `package.json` contains "react" in dependencies.
-//! Edge extraction: Capitalized JSX tag names in .tsx/.jsx files → Calls edge
-//! from containing function to the component name.
 
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use crate::indexing::frameworks::{DetectionContext, FrameworkResolver};
 use crate::parsing::relations::{EdgeKind, EdgeTarget, RawEdge};
-use crate::parsing::symbols::{QualifiedSymbol, Symbol};
+use crate::parsing::symbols::{QualifiedSymbol, Symbol, SymbolKind};
 
 pub struct ReactResolver;
 
@@ -47,37 +46,29 @@ impl FrameworkResolver for ReactResolver {
         }
 
         let mut edges = Vec::new();
-
-        // Find the enclosing function/component for context
-        let from_symbol = find_enclosing_component(symbols, file_path);
+        let mut seen = HashSet::new();
 
         for cap in JSX_TAG_RE.captures_iter(source) {
             let tag_name = &cap[1];
-            // Skip HTML-native tags (all lowercase won't match our regex anyway)
-            // Skip self-references
-            if let Some(ref from) = from_symbol
-                && from.qualified.name == tag_name
-            {
-                continue;
-            }
-
             let line = source[..cap.get(0).unwrap().start()]
                 .chars()
                 .filter(|&c| c == '\n')
                 .count() as u32
                 + 1;
 
-            let from_qualified = from_symbol
-                .as_ref()
+            let from = enclosing_scope(symbols, file_path, line)
                 .map(|s| s.qualified.clone())
                 .unwrap_or_else(|| QualifiedSymbol {
                     file: file_path.to_string(),
                     scope_path: vec![],
                     name: "<module>".to_string(),
                 });
+            if from.name == tag_name || !seen.insert((from.clone(), tag_name.to_string())) {
+                continue;
+            }
 
             edges.push(RawEdge {
-                from: from_qualified,
+                from,
                 to: EdgeTarget::Unresolved {
                     name: tag_name.to_string(),
                     import_path: None,
@@ -92,19 +83,19 @@ impl FrameworkResolver for ReactResolver {
     }
 }
 
-/// Find the first function/component symbol in the file (best-effort enclosing context).
-fn find_enclosing_component(symbols: &[Symbol], file_path: &str) -> Option<Symbol> {
+fn enclosing_scope<'a>(symbols: &'a [Symbol], file_path: &str, line: u32) -> Option<&'a Symbol> {
     symbols
         .iter()
-        .find(|s| {
+        .rev()
+        .filter(|s| {
             s.qualified.file == file_path
                 && matches!(
                     s.kind,
-                    crate::parsing::symbols::SymbolKind::Function
-                        | crate::parsing::symbols::SymbolKind::Method
+                    SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
                 )
+                && (s.line_start..=s.line_end).contains(&line)
         })
-        .cloned()
+        .min_by_key(|s| s.line_end - s.line_start)
 }
 
 #[cfg(test)]

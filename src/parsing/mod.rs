@@ -654,104 +654,99 @@ fn extract_js_node(
         Some(g) => g,
         None => return,
     };
-    match node.kind() {
-        "function_declaration" | "function" => {
-            let name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(&n, source).to_string())
-                .unwrap_or_else(|| "<anonymous>".to_string());
-            let kind = if !scope.is_empty() {
-                SymbolKind::Method
-            } else {
-                SymbolKind::Function
-            };
-            let sym = make_symbol(
+    let fn_kind = if scope.is_empty() {
+        SymbolKind::Function
+    } else {
+        SymbolKind::Method
+    };
+    let opened = match node.kind() {
+        "function_declaration" => Some((name_or_anonymous(node, source), fn_kind)),
+        "variable_declarator" if is_module_level(node) => {
+            declared_function_name(node, source).map(|n| (n, SymbolKind::Function))
+        }
+        "class_declaration" | "class" if node.is_named() => {
+            Some((name_or_anonymous(node, source), SymbolKind::Class))
+        }
+        _ => None,
+    };
+    if let Some((name, kind)) = opened {
+        let sym = make_symbol(
+            file,
+            &name,
+            scope.to_vec(),
+            kind,
+            node_line_start(node),
+            node_line_end(node),
+            None,
+            parent_fqn.map(|s| s.to_string()),
+        );
+        let fqn = sym.qualified.fqn();
+        symbols.push(sym);
+        let mut child_scope = scope.to_vec();
+        child_scope.push(name);
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            extract_js_node(
                 file,
-                &name,
-                scope.to_vec(),
-                kind,
-                node_line_start(node),
-                node_line_end(node),
-                None,
-                parent_fqn.map(|s| s.to_string()),
+                source,
+                &child,
+                &child_scope,
+                Some(&fqn),
+                symbols,
+                edges,
             );
-            let fqn = sym.qualified.fqn();
-            symbols.push(sym);
-            let mut child_scope = scope.to_vec();
-            child_scope.push(name);
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                extract_js_node(
-                    file,
-                    source,
-                    &child,
-                    &child_scope,
-                    Some(&fqn),
-                    symbols,
-                    edges,
-                );
-            }
         }
-        "class_declaration" | "class" => {
-            let name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(&n, source).to_string())
-                .unwrap_or_else(|| "<anonymous>".to_string());
-            let sym = make_symbol(
-                file,
-                &name,
-                scope.to_vec(),
-                SymbolKind::Class,
-                node_line_start(node),
-                node_line_end(node),
-                None,
-                parent_fqn.map(|s| s.to_string()),
-            );
-            let fqn = sym.qualified.fqn();
-            symbols.push(sym);
-            let mut child_scope = scope.to_vec();
-            child_scope.push(name);
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                extract_js_node(
-                    file,
-                    source,
-                    &child,
-                    &child_scope,
-                    Some(&fqn),
-                    symbols,
-                    edges,
-                );
-            }
-        }
-        "call_expression" => {
-            if let Some(func_node) = node.child_by_field_name("function") {
-                let callee_name = node_text(&func_node, source).to_string();
-                if let Some(from_sym) = scope_to_qualified(file, scope) {
-                    edges.push(RawEdge {
-                        from: from_sym,
-                        to: EdgeTarget::Unresolved {
-                            name: callee_name,
-                            import_path: None,
-                            qualifier: None,
-                        },
-                        kind: EdgeKind::Calls,
-                        line: node_line_start(node),
-                    });
-                }
-            }
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                extract_js_node(file, source, &child, scope, parent_fqn, symbols, edges);
-            }
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                extract_js_node(file, source, &child, scope, parent_fqn, symbols, edges);
-            }
-        }
+        return;
     }
+    if node.kind() == "call_expression"
+        && let Some(func_node) = node.child_by_field_name("function")
+        && let Some(from_sym) = scope_to_qualified(file, scope)
+    {
+        edges.push(RawEdge {
+            from: from_sym,
+            to: EdgeTarget::Unresolved {
+                name: node_text(&func_node, source).to_string(),
+                import_path: None,
+                qualifier: None,
+            },
+            kind: EdgeKind::Calls,
+            line: node_line_start(node),
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        extract_js_node(file, source, &child, scope, parent_fqn, symbols, edges);
+    }
+}
+
+fn name_or_anonymous(node: &Node, source: &str) -> String {
+    node.child_by_field_name("name")
+        .map(|n| node_text(&n, source).to_string())
+        .unwrap_or_else(|| "<anonymous>".to_string())
+}
+
+/// A declarator whose `const`, `let`, or `var` statement sits at the top of the
+/// file, exported or not. A closure inside any function, named or not, is not.
+fn is_module_level(declarator: &Node) -> bool {
+    let Some(statement) = declarator.parent() else {
+        return false;
+    };
+    let mut owner = statement.parent();
+    if owner.is_some_and(|n| n.kind() == "export_statement") {
+        owner = owner.and_then(|n| n.parent());
+    }
+    matches!(
+        statement.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) && owner.is_some_and(|n| n.kind() == "program")
+}
+
+fn declared_function_name(node: &Node, source: &str) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    let value = node.child_by_field_name("value")?;
+    (name.kind() == "identifier"
+        && matches!(value.kind(), "arrow_function" | "function_expression"))
+    .then(|| node_text(&name, source).to_string())
 }
 
 // ─── TypeScript extractor ─────────────────────────────────────────────────

@@ -39,7 +39,7 @@ impl MergeChunk {
 /// 4. Sort within each group by line_start ASC.
 /// 5. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
 ///    capping merged range at 60 lines. Chunks with different recorded copies
-///    never merge, so a copy note only ever describes its own lines.
+///    never merge.
 /// 6. Drop contained: within each file group, sort by width DESC, skip any chunk
 ///    fully inside a wider one, unless it carries recorded copies.
 /// 7. Collect all groups, sort by score DESC, cap to top_k.
@@ -62,8 +62,7 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             .or_insert(chunk);
     }
 
-    // Step 2: runs before the merge pass concatenates neighbour content,
-    // so the key sees one chunk's own text.
+    // Step 2: before step 5 concatenates neighbours' content.
     let collapsed = {
         let mut deduped: Vec<MergeChunk> = dedup_map.into_values().collect();
         deduped.sort_unstable_by(|a, b| {

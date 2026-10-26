@@ -411,11 +411,10 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
 }
 
 /// Merge output blocks from the same file whose line ranges overlap or are
-/// adjacent (next.line_start <= current.line_end + 1) and that list the same
-/// identical copies elsewhere. A copy note describes its own lines only, so
-/// blocks with different notes stay apart. Merged content is re-read from the
-/// filesystem; if the read fails, original content strings are concatenated
-/// with line-number dedup. Every block leaves with its header rebuilt.
+/// adjacent (next.line_start <= current.line_end + 1) and carry the same
+/// list of identical copies. Merged content is re-read from the filesystem;
+/// if the read fails, original content strings are concatenated with
+/// line-number dedup.
 ///
 /// Preserves first-occurrence position: the merged block occupies the slot of
 /// the earliest block in its file group. Blocks from different files pass

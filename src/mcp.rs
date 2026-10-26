@@ -73,8 +73,7 @@ struct OutputBlock {
 // gives it nothing to run and tends to be ignored.
 
 const GREP_HINT_MAX_SYMBOLS: usize = 5;
-/// Only the top results carry the query's topic. A low-ranked block is one call
-/// site or a stray match, and its names (`TrainingPlanUI`) mislead the grep.
+/// Names from lower-ranked blocks are incidental call sites, not the query's topic.
 const GREP_HINT_MAX_BLOCKS: usize = 5;
 /// Shorter names (`new`, `get`, `run`) would make the grep all noise.
 const GREP_HINT_MIN_NAME_LEN: usize = 4;
@@ -264,10 +263,10 @@ async fn block_hint_symbols(
 }
 
 /// Build the grep hint from the shown, priority-ordered blocks, in two passes:
-/// first the symbols each of the top `GREP_HINT_MAX_BLOCKS` blocks DEFINES (block
-/// order), then their callees. Measured across five repos, defined symbols are
-/// on-topic while callees often drag in logging/util helpers (`maskUserID`,
-/// `CreatePendingLog`), so callees only fill what is left. They still matter: they come from the resolved call
+/// first the symbols the top blocks DEFINE (block order), then their callees.
+/// Measured across five repos, defined symbols are on-topic while callees often
+/// drag in logging/util helpers (`maskUserID`, `CreatePendingLog`), so callees
+/// only fill what is left. They still matter: they come from the resolved call
 /// graph, so they always name real in-repo definitions, and for test blocks they
 /// are the production API under test.
 /// `None` when no usable symbol exists: no static fallback, nothing to grep for.
@@ -322,7 +321,6 @@ fn with_grep_hint(mut assembled: String, blocks: &[OutputBlock]) -> String {
     assembled
 }
 
-/// The tool answer for `blocks`: the budgeted body plus the grep hint.
 fn assemble_with_grep_hint(blocks: &[OutputBlock]) -> String {
     let (assembled, shown) = assemble_with_budget_counted(blocks);
     with_grep_hint(assembled, &blocks[..shown])
@@ -337,8 +335,7 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
     assemble_with_budget_counted(blocks).0
 }
 
-/// `assemble_with_budget` plus how many leading blocks it emitted, in full or
-/// truncated. The count stops at the first block the budget dropped.
+/// Also returns how many leading blocks were emitted, stopping at the first the budget dropped.
 fn assemble_with_budget_counted(blocks: &[OutputBlock]) -> (String, usize) {
     // Reserve space for the truncation footer so it's never squeezed out, plus the
     // grep hint that `with_grep_hint` appends after it: the hint is appended

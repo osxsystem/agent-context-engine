@@ -636,4 +636,61 @@ mod tests {
             assert_eq!(weight, 1.0, "{roots:?}");
         }
     }
+
+    #[test]
+    fn plain_rust_test_chunk_keeps_its_rank_above_plain_code() {
+        let pool = vec![
+            chunk(
+                "/repo/src/indexing/load_repos_tests.rs",
+                "#[test]\nfn loads_every_repo() {\n    assert_eq!(load(), 2);\n}",
+                0.747,
+            ),
+            chunk(
+                "/repo/src/indexing/load_repos.rs",
+                "pub fn load() -> usize {\n    2\n}",
+                0.738,
+            ),
+        ];
+
+        let kept = weighted_merge(
+            pool,
+            &["load repos from settings"],
+            &QueryFilters::default(),
+            &[REPO],
+            2,
+        );
+
+        assert_eq!(kept[0].file, "/repo/src/indexing/load_repos_tests.rs");
+    }
+
+    #[test]
+    fn test_chunk_without_a_mock_call_takes_no_penalty() {
+        assert_eq!(
+            weight_of(
+                "/repo/src/pages/Foo.test.jsx",
+                "it('renders', () => {\n  render(<Foo />);\n});"
+            ),
+            1.0
+        );
+        assert_eq!(
+            weight_of("/repo/tests/jev_wire.rs", "#[test]\nfn wire() {}"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn mock_calls_in_a_test_path_are_mocks() {
+        for call in [
+            "jest.mock('./a');",
+            "vi.mock('./a');",
+            "jest.doMock('./a');",
+        ] {
+            assert_eq!(weight_of("/repo/src/Foo.test.jsx", call), 0.90, "{call}");
+        }
+    }
+
+    #[test]
+    fn mock_call_outside_a_test_path_is_not_a_mock() {
+        assert_eq!(weight_of("/repo/src/setup.js", "jest.mock('./a');"), 1.0);
+    }
 }

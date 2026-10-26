@@ -1016,7 +1016,7 @@ fn hint_fits_inside_budget_reserve_even_when_output_is_truncated() {
             ..Default::default()
         })
         .collect();
-    let out = with_grep_hint(assemble_with_budget(&blocks), &blocks);
+    let out = assemble_with_grep_hint(&blocks);
     assert!(out.contains("truncated to fit output size limit"));
     assert!(
         out.contains("rg 'big_symbol'"),
@@ -1030,6 +1030,119 @@ fn hint_fits_inside_budget_reserve_even_when_output_is_truncated() {
     );
     // The truncation footer must come BEFORE the hint, never squeezed out by it.
     assert!(out.find("truncated to fit").unwrap() < out.find("rg 'big_symbol'").unwrap());
+}
+
+#[test]
+fn grep_hint_takes_at_most_three_callees_from_one_block() {
+    let blocks = vec![
+        callee_block(&[], &["one_fn", "two_fn", "three_fn", "four_fn"]),
+        callee_block(&[], &["five_fn"]),
+    ];
+    let hint = build_grep_hint(&blocks).unwrap();
+    assert!(
+        hint.contains("rg 'one_fn|two_fn|three_fn|five_fn'"),
+        "{hint}"
+    );
+}
+
+#[test]
+fn grep_hint_skips_a_name_that_overflows_the_pattern_cap_and_keeps_later_short_ones() {
+    let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let blocks = vec![sym_block("a.rs", 1, 5, &[&a, &b, &c, "short_fn"])];
+    let hint = build_grep_hint(&blocks).unwrap();
+    assert!(hint.contains(&format!("rg '{a}|{b}|short_fn'")), "{hint}");
+}
+
+#[test]
+fn grep_hint_ignores_blocks_ranked_below_the_top_five() {
+    let blocks = vec![
+        sym_block("a.rs", 1, 5, &["first_fn"]),
+        sym_block("b.rs", 1, 5, &[]),
+        sym_block("c.rs", 1, 5, &[]),
+        sym_block("d.rs", 1, 5, &[]),
+        sym_block("e.rs", 1, 5, &["fifth_fn"]),
+        sym_block("f.rs", 1, 5, &["TrainingPlanUI"]),
+    ];
+    let hint = build_grep_hint(&blocks).unwrap();
+    assert!(hint.contains("rg 'first_fn|fifth_fn'"), "{hint}");
+    assert!(!hint.contains("TrainingPlanUI"));
+}
+
+#[test]
+fn grep_hint_takes_no_callee_from_a_block_ranked_below_the_top_five() {
+    let mut blocks: Vec<OutputBlock> = (0..5).map(|_| callee_block(&[], &[])).collect();
+    blocks.push(callee_block(&[], &["sixth_callee_fn"]));
+    assert_eq!(build_grep_hint(&blocks), None);
+}
+
+#[test]
+fn grep_hint_counts_truncated_blocks_and_stops_at_the_first_dropped_one() {
+    let budget = MAX_TOOL_OUTPUT_CHARS - 150 - GREP_HINT_MAX_CHARS;
+    let block = |file: &str, header: String, content: String, symbol: &str| OutputBlock {
+        header,
+        content,
+        file: file.to_string(),
+        line_start: 1,
+        line_end: 2,
+        symbols: vec![symbol.to_string()],
+        ..Default::default()
+    };
+    let blocks = vec![
+        block(
+            "a.rs",
+            "a.rs#L1-2".into(),
+            "x".repeat(budget - 400),
+            "full_fn",
+        ),
+        block("b.rs", "b.rs#L1-2".into(), "y".repeat(1000), "truncated_fn"),
+        block(
+            "c.rs",
+            format!("c.rs#L1-2 {}", "z".repeat(1000)),
+            "w".repeat(10),
+            "dropped_fn",
+        ),
+        block("d.rs", "d.rs#L1-2".into(), "v".repeat(10), "after_drop_fn"),
+    ];
+    let out = assemble_with_grep_hint(&blocks);
+    assert!(
+        out.contains("d.rs#L1-2"),
+        "the block after the drop is shown"
+    );
+    assert!(out.contains("rg 'full_fn|truncated_fn'"), "{out}");
+    assert!(!out.contains("dropped_fn"));
+    assert!(!out.contains("after_drop_fn"));
+}
+
+#[test]
+fn grep_hint_names_nothing_from_a_block_the_budget_dropped() {
+    let header = "a.rs#L1-2";
+    let fill = MAX_TOOL_OUTPUT_CHARS - 150 - GREP_HINT_MAX_CHARS - header.len() - 1 - 5;
+    let blocks = vec![
+        OutputBlock {
+            header: header.to_string(),
+            content: "x".repeat(fill),
+            file: "a.rs".to_string(),
+            line_start: 1,
+            line_end: 2,
+            symbols: vec!["shown_fn".to_string()],
+            ..Default::default()
+        },
+        OutputBlock {
+            header: "b.rs#L1-2".to_string(),
+            content: "y".repeat(200),
+            file: "b.rs".to_string(),
+            line_start: 1,
+            line_end: 2,
+            symbols: vec!["TrainingPlanUI".to_string()],
+            ..Default::default()
+        },
+    ];
+    let out = assemble_with_grep_hint(&blocks);
+    assert!(out.contains("1 of 2 results truncated"));
+    assert!(!out.contains("b.rs#L1-2"), "block 2 must be dropped");
+    let footer = &out[out.rfind("\n\n---\n").unwrap()..];
+    assert!(footer.contains("rg 'shown_fn'"), "{footer}");
+    assert!(!footer.contains("TrainingPlanUI"), "{footer}");
 }
 
 #[test]

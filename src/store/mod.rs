@@ -37,7 +37,9 @@ use crate::store::schema::SCHEMA_DDL;
 ///      callers of newly-added names (`raw_edge WHERE to_name = …`); without the
 ///      index every incremental run full-scanned raw_edge. Built CONCURRENTLY by the
 ///      background migration so the first open after an upgrade is not blocked.
-pub const DB_SCHEMA_VERSION: u32 = 8;
+/// v9 = JS/TS/Svelte re-index. Arrow-function components became symbols that own
+///      their calls and JSX tags, so those files re-index once on the next walk.
+pub const DB_SCHEMA_VERSION: u32 = 9;
 
 /// key in index_meta for the DB schema version.
 pub const DB_SCHEMA_VERSION_KEY: &str = "db_schema_version";
@@ -350,6 +352,9 @@ pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: 
             }
             if stored_version < 8 {
                 run_migration_v7_to_v8(&db).await.context("v7→v8")?;
+            }
+            if stored_version < 9 {
+                run_migration_v8_to_v9(&db).await.context("v8→v9")?;
             }
             Ok(())
         }
@@ -904,6 +909,54 @@ pub async fn run_migration_v7_to_v8(db: &Surreal<Db>) -> Result<()> {
         .await
         .context("migration v7→v8: stamp db_schema_version=8")?;
     info!("migration v7→v8 complete");
+    Ok(())
+}
+
+/// v8→v9: mark every JS/TS/Svelte file stale so the next walk re-indexes it.
+///
+/// WHY not the v7 edge heal: the extractor change moves JS symbol FQNs, so `calls`
+/// rebuilt against the stored symbols would name callers and targets that do not
+/// exist. A stale `chunker_version` sends each file through the normal Modified
+/// path instead. cAST chunk text does not depend on symbols, so the re-embed is
+/// served from the embedding cache.
+pub async fn run_migration_v8_to_v9(db: &Surreal<Db>) -> Result<()> {
+    use crate::parsing::{Lang, detect_language};
+    #[derive(serde::Deserialize)]
+    struct Row {
+        path: String,
+    }
+    let rows: Vec<Row> = db
+        .query("SELECT path FROM file_meta")
+        .await
+        .context("migration v8→v9: read file_meta paths")?
+        .take(0)
+        .context("migration v8→v9: decode file_meta paths")?;
+    let paths: Vec<String> = rows
+        .into_iter()
+        .map(|r| r.path)
+        .filter(|p| {
+            matches!(
+                detect_language(Path::new(p)),
+                Lang::JavaScript | Lang::TypeScript | Lang::Tsx | Lang::Svelte
+            )
+        })
+        .collect();
+    info!(
+        files = paths.len(),
+        "migration v8→v9: marking JS/TS files for re-index"
+    );
+    for batch in paths.chunks(1000) {
+        db.query("UPDATE file_meta SET chunker_version = 0 WHERE path IN $paths")
+            .bind(("paths", batch.to_vec()))
+            .await
+            .context("migration v8→v9: reset chunker_version")?
+            .check()
+            .context("migration v8→v9: reset chunker_version (check)")?;
+    }
+    ops::set_meta(db, DB_SCHEMA_VERSION_KEY, "9")
+        .await
+        .context("migration v8→v9: stamp db_schema_version=9")?;
+    info!("migration v8→v9 complete");
     Ok(())
 }
 

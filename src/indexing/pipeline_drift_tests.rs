@@ -455,6 +455,136 @@ async fn framework_edges_survive_single_file_incremental() {
     .await;
 }
 
+async fn symbol_snapshot(db: &Surreal<Db>) -> Vec<(String, String, i64)> {
+    #[derive(Deserialize)]
+    struct Row {
+        file: String,
+        name: String,
+        line_start: i64,
+    }
+    let rows: Vec<Row> = db
+        .query("SELECT file, name, line_start FROM symbol")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    let mut v: Vec<_> = rows
+        .into_iter()
+        .map(|r| (r.file, r.name, r.line_start))
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn upgrade_reindexes_js_files_from_the_embedding_cache() {
+    let home = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let repo = repo_path(&dir);
+    write(
+        &dir,
+        "package.json",
+        "{\"dependencies\": {\"react\": \"18.0.0\"}}\n",
+    );
+    write(&dir, "Modal.jsx", "export const Modal = () => null;\n");
+    write(&dir, "lib.rs", "fn helper() {}\n");
+    write(
+        &dir,
+        "util.js",
+        "export function check() {\n  return 1;\n}\n",
+    );
+    write(
+        &dir,
+        "Doc.jsx",
+        "import { check } from './util';\nconst Doc = () => {\n  function handleCheckAgent() {\n    return check();\n  }\n  return <Modal />;\n};\n",
+    );
+    let cache =
+        || crate::embedding::cache::EmbeddingCache::new(cache_dir.path(), "test-model", None);
+    let repo_dbs: crate::store::RepoDbMap =
+        std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let db = crate::store::get_or_open(&repo_dbs, home.path(), &repo, 0)
+        .await
+        .unwrap();
+    let ok = scripted_voyage(|_, n| (axum::http::StatusCode::OK, ok_embeddings(n))).await;
+    IndexPipeline::new_with_concurrency(repo.clone(), Some(ok), 1, cache())
+        .run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("initial full rebuild");
+    let fresh_symbols = symbol_snapshot(&db).await;
+
+    // Rewrite Doc.jsx and Modal.jsx to what the v8 extractor stored: no arrow
+    // symbols, and every JSX tag credited to the file's first function.
+    let doc = stored_key(&db, &repo, "Doc.jsx").await;
+    let modal = stored_key(&db, &repo, "Modal.jsx").await;
+    let util = stored_key(&db, &repo, "util.js").await;
+    let old_handler = format!("{doc}::handleCheckAgent");
+    db.query(
+        "DELETE symbol WHERE file IN [$doc, $modal]; \
+         CREATE type::thing('symbol', $old) SET name = 'handleCheckAgent', kind = 'function', \
+           file = $doc, line_start = 3, line_end = 5, signature = NONE, parent = NONE; \
+         DELETE calls WHERE in_file = $doc; \
+         CREATE calls SET in_file = $doc, out_file = $util, in_name = $old, \
+           out_name = $check, line = 4; \
+         UPDATE raw_edge SET from_fqn = $old WHERE from_file = $doc;",
+    )
+    .bind(("doc", doc.clone()))
+    .bind(("modal", modal.clone()))
+    .bind(("util", util.clone()))
+    .bind(("old", old_handler))
+    .bind(("check", format!("{util}::check")))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    set_meta(&db, crate::store::DB_SCHEMA_VERSION_KEY, "8")
+        .await
+        .unwrap();
+
+    crate::store::maybe_spawn_migration(
+        repo_dbs.clone(),
+        crate::store::normalize_repo_path(&repo),
+        8,
+    );
+    crate::store::wait_migration(&repo).await;
+    let stamped = crate::store::read_db_schema_version(&db).await;
+    let versions: HashMap<String, i64> = get_all_file_meta(&db, &repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.path, m.chunker_version))
+        .collect();
+    let dead = rejecting_voyage(axum::http::StatusCode::FORBIDDEN).await;
+    IndexPipeline::new_with_concurrency(repo.clone(), Some(dead), 1, cache())
+        .run(&db, None, false, None, None, None, &[], None)
+        .await
+        .expect("post-upgrade walk re-indexes without an embedding request");
+
+    assert_eq!(symbol_snapshot(&db).await, fresh_symbols);
+    let mut expected = vec![
+        (
+            doc.clone(),
+            modal.clone(),
+            format!("{doc}::Doc"),
+            format!("{modal}::Modal"),
+        ),
+        (
+            doc.clone(),
+            util.clone(),
+            format!("{doc}::Doc::handleCheckAgent"),
+            format!("{util}::check"),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(calls_snapshot(&db).await, expected);
+    assert_eq!(stamped, 9);
+    assert_eq!(versions[&doc], 0);
+    assert_eq!(
+        versions[&stored_key(&db, &repo, "lib.rs").await],
+        crate::parsing::chunker::CHUNKER_VERSION
+    );
+}
+
 /// D5: a brand-new DB is stamped with the current schema version on open, so no
 /// v1→current migration chain runs in the background against its first index.
 #[tokio::test]

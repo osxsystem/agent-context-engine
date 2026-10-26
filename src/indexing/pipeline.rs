@@ -9678,3 +9678,124 @@ mod transient_embed_resilience_tests {
 #[cfg(test)]
 #[path = "pipeline_drift_tests.rs"]
 mod drift_tests;
+
+#[cfg(test)]
+mod jsx_caller_tests {
+    use super::*;
+
+    fn callers_of(file: &str, source: &str, tag: &str) -> Vec<String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(file);
+        std::fs::write(&path, source).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        let mut registry = crate::indexing::frameworks::FrameworkRegistry::new();
+        registry.activate_names(&["react", "express"]);
+        let ParseOutput::Parsed(parsed) = parse_one_file_with_frameworks(&path, &registry) else {
+            panic!("{file} did not parse");
+        };
+        let prefix = format!("{path}::");
+        parsed
+            .raw_edges
+            .iter()
+            .filter(|e| e.to_name == tag)
+            .map(|e| {
+                e.from_fqn
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&e.from_fqn)
+                    .to_string()
+            })
+            .collect()
+    }
+
+    const DOCUMENTATION_UI: &str = "\
+import Modal from './Modal';
+
+const DocumentationUI = ({ props }) => {
+  const [open, setOpen] = useState(false);
+
+  function handleCheckAgent(agent) {
+    setOpen(true);
+    return <Toast agent={agent} />;
+  }
+
+  return (
+    <div>
+      <Modal open={open}>
+        <Modal.Body />
+      </Modal>
+      <Modal open={!open} />
+    </div>
+  );
+};
+
+export default DocumentationUI;
+";
+
+    #[test]
+    fn tag_in_arrow_component_return_goes_to_the_component() {
+        assert_eq!(
+            callers_of("DocumentationUI.jsx", DOCUMENTATION_UI, "Modal"),
+            vec!["DocumentationUI"]
+        );
+    }
+
+    #[test]
+    fn tag_in_nested_handler_goes_to_the_handler() {
+        assert_eq!(
+            callers_of("DocumentationUI.jsx", DOCUMENTATION_UI, "Toast"),
+            vec!["DocumentationUI::handleCheckAgent"]
+        );
+    }
+
+    #[test]
+    fn sibling_components_each_get_their_own_tags() {
+        let source = "\
+function getComparator(order) {
+  return order;
+}
+
+const Table = () => {
+  return <Modal />;
+};
+
+function Page() {
+  return <Modal />;
+}
+";
+        assert_eq!(
+            callers_of("Page.jsx", source, "Modal"),
+            vec!["Table", "Page"]
+        );
+    }
+
+    #[test]
+    fn express_routes_go_to_the_function_that_registers_them() {
+        let source = "\
+const validate = (req, res, next) => {
+  next();
+};
+router.post('/users', createUser);
+
+function mount(app) {
+  app.get('/health', health);
+}
+";
+        assert_eq!(
+            callers_of("users.js", source, "createUser"),
+            vec!["<module>"]
+        );
+        assert_eq!(callers_of("users.js", source, "health"), vec!["mount"]);
+    }
+
+    #[test]
+    fn tag_outside_any_function_goes_to_module() {
+        let source = "\
+function helper() {
+  return 1;
+}
+
+export const element = <Modal />;
+";
+        assert_eq!(callers_of("element.jsx", source, "Modal"), vec!["<module>"]);
+    }
+}

@@ -4802,3 +4802,115 @@ mod recursion_guard_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod javascript_tests {
+    use super::*;
+
+    fn symbol_summary(result: &ParseResult) -> Vec<(String, SymbolKind)> {
+        result
+            .symbols
+            .iter()
+            .map(|s| (s.qualified.fqn(), s.kind.clone()))
+            .collect()
+    }
+
+    fn call_edges(result: &ParseResult) -> Vec<(String, String)> {
+        result
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Calls))
+            .map(|e| match &e.to {
+                EdgeTarget::Unresolved { name, .. } => (e.from.fqn(), name.clone()),
+                EdgeTarget::Resolved(q) => (e.from.fqn(), q.name.clone()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keyword_tokens_are_not_symbols() {
+        let result = parse_file("src/a.js", "function App() {}\nclass Store {}\n");
+        assert_eq!(
+            symbol_summary(&result),
+            vec![
+                ("src/a.js::App".to_string(), SymbolKind::Function),
+                ("src/a.js::Store".to_string(), SymbolKind::Class),
+            ]
+        );
+    }
+
+    #[test]
+    fn closures_declared_inside_a_component_stay_in_its_scope() {
+        let src = "\
+const Page = () => {
+  const handleClick = () => {
+    save();
+  };
+  return null;
+};
+";
+        let result = parse_file("src/Page.jsx", src);
+        assert_eq!(
+            symbol_summary(&result),
+            vec![("src/Page.jsx::Page".to_string(), SymbolKind::Function)]
+        );
+        assert_eq!(
+            call_edges(&result),
+            vec![("src/Page.jsx::Page".to_string(), "save".to_string())]
+        );
+    }
+
+    #[test]
+    fn closures_inside_anonymous_callbacks_are_not_module_symbols() {
+        let src = "\
+describe('Page', () => {
+  const setup = () => {
+    render();
+  };
+});
+export const Card = () => {
+  load();
+};
+";
+        let result = parse_file("src/Card.jsx", src);
+        assert_eq!(
+            symbol_summary(&result),
+            vec![("src/Card.jsx::Card".to_string(), SymbolKind::Function)]
+        );
+        assert_eq!(
+            call_edges(&result),
+            vec![("src/Card.jsx::Card".to_string(), "load".to_string())]
+        );
+    }
+
+    #[test]
+    fn declared_arrow_and_function_expressions_are_symbols_with_scope() {
+        let src = "\
+const List = () => {
+  load();
+};
+const Item = function () {
+  render();
+};
+";
+        for file in ["src/a.jsx", "src/a.ts"] {
+            let result = parse_file(file, src);
+            assert_eq!(
+                symbol_summary(&result),
+                vec![
+                    (format!("{file}::List"), SymbolKind::Function),
+                    (format!("{file}::Item"), SymbolKind::Function),
+                ],
+                "{file}"
+            );
+            assert_eq!(
+                call_edges(&result),
+                vec![
+                    (format!("{file}::List"), "load".to_string()),
+                    (format!("{file}::Item"), "render".to_string()),
+                ],
+                "{file}"
+            );
+        }
+    }
+}

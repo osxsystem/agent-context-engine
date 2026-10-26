@@ -1016,7 +1016,7 @@ struct CalleeRow {
     out_name: Option<String>,
 }
 
-async fn query_caller_callee_stats(
+pub(crate) async fn query_caller_callee_stats(
     db: &Surreal<Db>,
     fqn: &str,
     target_file: &str,

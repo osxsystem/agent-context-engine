@@ -489,6 +489,8 @@ async fn upgrade_reindexes_js_files_from_the_embedding_cache() {
     );
     write(&dir, "Modal.jsx", "export const Modal = () => null;\n");
     write(&dir, "lib.rs", "fn helper() {}\n");
+    write(&dir, "types.ts", "export const ID = 1;\n");
+    write(&dir, "Panel.tsx", "export const Panel = () => null;\n");
     write(
         &dir,
         "util.js",
@@ -579,6 +581,8 @@ async fn upgrade_reindexes_js_files_from_the_embedding_cache() {
     assert_eq!(calls_snapshot(&db).await, expected);
     assert_eq!(stamped, 9);
     assert_eq!(versions[&doc], 0);
+    assert_eq!(versions[&stored_key(&db, &repo, "types.ts").await], 0);
+    assert_eq!(versions[&stored_key(&db, &repo, "Panel.tsx").await], 0);
     assert_eq!(
         versions[&stored_key(&db, &repo, "lib.rs").await],
         crate::parsing::chunker::CHUNKER_VERSION

@@ -406,7 +406,7 @@ async fn run_query_once(
     };
     let merged = weighted_merge(
         all_chunks,
-        &parsed.text,
+        &[&parsed.text],
         &parsed.filters,
         &repo_roots,
         top_k,
@@ -851,7 +851,7 @@ pub(crate) async fn run_sub_query(
 
     Ok(weighted_merge(
         all_chunks,
-        query,
+        &[query],
         filters,
         &[repo_filter],
         top_k,

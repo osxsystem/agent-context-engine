@@ -115,12 +115,12 @@ fn rank_weight(chunk: &MergeChunk, repo_roots: &[&str], intent: QueryIntent) -> 
 /// repo-relative.
 pub fn weighted_merge(
     chunks: Vec<MergeChunk>,
-    query_text: &str,
+    query_texts: &[&str],
     filters: &QueryFilters,
     repo_roots: &[&str],
     top_k: usize,
 ) -> Vec<MergeChunk> {
-    let intent = QueryIntent::of(query_text, filters);
+    let intent = QueryIntent::of(query_texts.last().copied().unwrap_or(""), filters);
     let weighted = chunks
         .into_iter()
         .map(|chunk| {
@@ -297,7 +297,7 @@ mod tests {
     }
 
     fn ranked(query: &str, top_k: usize) -> Vec<(String, f32)> {
-        weighted_merge(pool(), query, &QueryFilters::default(), &[REPO], top_k)
+        weighted_merge(pool(), &[query], &QueryFilters::default(), &[REPO], top_k)
             .into_iter()
             .map(|c| (c.file, c.score))
             .collect()
@@ -331,7 +331,7 @@ mod tests {
 
         let kept = weighted_merge(
             only_noise,
-            "Modal component and its usages",
+            &["Modal component and its usages"],
             &QueryFilters::default(),
             &[REPO],
             3,
@@ -373,7 +373,7 @@ mod tests {
         let src_copy = "/repo/src/components/modalProps.js";
         let pool = vec![chunk(mock_copy, body, 0.70), chunk(src_copy, body, 0.70)];
 
-        let kept = weighted_merge(pool, "modal props", &QueryFilters::default(), &[REPO], 5);
+        let kept = weighted_merge(pool, &["modal props"], &QueryFilters::default(), &[REPO], 5);
 
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].file, src_copy);
@@ -387,7 +387,7 @@ mod tests {
             ..QueryFilters::default()
         };
         let weighted = |filters: &QueryFilters| {
-            weighted_merge(pool(), "Modal usages", filters, &[REPO], 4)
+            weighted_merge(pool(), &["Modal usages"], filters, &[REPO], 4)
                 .into_iter()
                 .map(|c| c.file)
                 .collect::<Vec<_>>()
@@ -506,5 +506,100 @@ mod tests {
         assert!(!import_only(
             "jest.mock('@components/modal', () => () => null);"
         ));
+    }
+
+    #[test]
+    fn real_code_around_a_require_is_not_import_only() {
+        assert!(!import_only(
+            "const server = require('http').createServer((req, res) => {\n  res.end('ok');\n});"
+        ));
+        assert!(!import_only(
+            "require('dotenv').config({\n  path: env,\n});"
+        ));
+        assert!(!import_only("import Foo = Bar.Baz;\nfoo(bar);"));
+        assert!(!import_only("const x = require('a'); foo('y');"));
+        assert!(!import_only("const x = require('a').default;"));
+        assert!(!import_only("export default 'x';"));
+    }
+
+    #[test]
+    fn directive_lines_do_not_stop_a_header_being_import_only() {
+        assert!(import_only("'use client';\nimport React from 'react';"));
+        assert!(import_only("\"use client\";\nimport React from 'react';"));
+        assert!(import_only("'use strict';\nconst fs = require('fs');"));
+        assert!(import_only("\"use strict\";\nimport a from 'a';"));
+        assert!(!import_only("'use client';"));
+        assert!(!import_only("'use client';\nrender();"));
+    }
+
+    #[test]
+    fn a_sub_query_keeps_the_exemptions_the_user_query_asked_for() {
+        let kept = weighted_merge(
+            pool(),
+            &["tests for Modal", "Modal render assertions"],
+            &QueryFilters::default(),
+            &[REPO],
+            4,
+        );
+
+        assert_eq!(kept[0].file, MOCK);
+    }
+
+    #[test]
+    fn a_sub_query_can_ask_for_an_exemption_the_user_query_did_not() {
+        let kept = weighted_merge(
+            pool(),
+            &["Modal usages", "modal styles"],
+            &QueryFilters::default(),
+            &[REPO],
+            4,
+        );
+
+        let position = |file: &str| kept.iter().position(|c| c.file == file).unwrap();
+        assert!(position(STYLESHEET) < position(DEFINITION));
+    }
+
+    #[test]
+    fn a_stylesheet_language_filter_lifts_the_stylesheet_penalty() {
+        for lang in ["css", "scss", "sass", "less"] {
+            let parsed =
+                crate::query::filters::parse_query(&format!("Modal usages lang:{lang}"), None);
+
+            let kept = weighted_merge(pool(), &[&parsed.text], &parsed.filters, &[REPO], 4);
+
+            assert_eq!(kept[0].file, STYLESHEET, "lang:{lang}");
+        }
+    }
+
+    #[test]
+    fn a_code_language_filter_keeps_the_stylesheet_penalty() {
+        let parsed = crate::query::filters::parse_query("Modal usages lang:javascript", None);
+
+        let kept = weighted_merge(pool(), &[&parsed.text], &parsed.filters, &[REPO], 4);
+
+        assert_eq!(kept[0].file, DEFINITION);
+    }
+
+    #[test]
+    fn repo_root_matching_ignores_case() {
+        let weight = |file: &str| {
+            let intent = QueryIntent::of("Modal usages", &QueryFilters::default());
+            rank_weight(&chunk(file, "x", 0.5), &["/HOME/ME/APP"], intent)
+        };
+
+        assert_eq!(weight("/home/me/app/tests/a.js"), 0.90);
+        assert_eq!(weight("/home/me/app/src/a.js"), 1.0);
+    }
+
+    #[test]
+    fn a_repo_nested_under_another_repos_tests_dir_is_judged_against_its_own_root() {
+        let file = "/p/tests/app/src/a.js";
+        let intent = QueryIntent::of("Modal usages", &QueryFilters::default());
+
+        for roots in [["/p", "/p/tests/app"], ["/p/tests/app", "/p"]] {
+            let weight = rank_weight(&chunk(file, "x", 0.5), &roots, intent);
+
+            assert_eq!(weight, 1.0, "{roots:?}");
+        }
     }
 }

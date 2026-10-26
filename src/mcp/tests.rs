@@ -1696,3 +1696,116 @@ fn grep_hint_render_normalizes_crlf_templates() {
     assert_eq!(render_grep_hint(crlf, "a|b"), expected);
     assert_eq!(render_grep_hint(lf, "a|b"), expected);
 }
+
+async fn calls_db(home: &tempfile::TempDir, sites: &[(&str, &str, &str, &str)]) -> Surreal<Db> {
+    let db = crate::store::open_db(home.path(), "/r", 0).await.unwrap();
+    for (line, (in_file, in_name, out_file, out_name)) in sites.iter().enumerate() {
+        db.query(
+            "CREATE calls SET in_file = $if, in_name = $in, out_file = $of, \
+             out_name = $on, line = $l",
+        )
+        .bind(("if", in_file.to_string()))
+        .bind(("in", in_name.to_string()))
+        .bind(("of", out_file.to_string()))
+        .bind(("on", out_name.to_string()))
+        .bind(("l", line as i64 + 1))
+        .await
+        .unwrap();
+    }
+    db
+}
+
+async fn rendered_tags(db: &Surreal<Db>, fqn: &str, file: &str) -> (String, String) {
+    let stats = crate::query::engine::query_caller_callee_stats(
+        db,
+        fqn,
+        file,
+        crate::store::DB_SCHEMA_VERSION,
+    )
+    .await
+    .expect("stats");
+    (
+        format_enriched_caller_tag(
+            Some(stats.caller_count),
+            &stats.caller_names,
+            Some(stats.caller_file_count),
+        ),
+        format_enriched_callee_tag(Some(stats.callee_count), &stats.callee_names),
+    )
+}
+
+#[tokio::test]
+async fn caller_tag_counts_a_caller_once_across_its_call_sites() {
+    let home = tempfile::TempDir::new().unwrap();
+    let db = calls_db(
+        &home,
+        &[
+            (
+                "/r/src/a.js",
+                "/r/src/a.js::Page",
+                "/r/src/Modal.js",
+                "/r/src/Modal.js::Modal",
+            ),
+            (
+                "/r/src/a.js",
+                "/r/src/a.js::Page",
+                "/r/src/Modal.js",
+                "/r/src/Modal.js::Modal",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        rendered_tags(&db, "/r/src/Modal.js::Modal", "/r/src/Modal.js")
+            .await
+            .0,
+        " [callers: Page]"
+    );
+    assert_eq!(
+        rendered_tags(&db, "/r/src/a.js::Page", "/r/src/a.js")
+            .await
+            .1,
+        " [calls: Modal]"
+    );
+}
+
+#[tokio::test]
+async fn caller_tag_counts_same_named_callers_in_different_files_apart() {
+    let home = tempfile::TempDir::new().unwrap();
+    let db = calls_db(
+        &home,
+        &[
+            (
+                "/r/one/Doc.js",
+                "/r/one/Doc.js::handleCheckAgent",
+                "/r/src/Modal.js",
+                "/r/src/Modal.js::Modal",
+            ),
+            (
+                "/r/one/Doc.js",
+                "/r/one/Doc.js::handleCheckAgent",
+                "/r/src/Modal.js",
+                "/r/src/Modal.js::Modal",
+            ),
+            (
+                "/r/two/Doc.js",
+                "/r/two/Doc.js::handleCheckAgent",
+                "/r/src/Modal.js",
+                "/r/src/Modal.js::Modal",
+            ),
+            (
+                "/r/src/Page.js",
+                "/r/src/Page.js::Page",
+                "/r/src/Modal.js",
+                "/r/src/Modal.js::Modal",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        rendered_tags(&db, "/r/src/Modal.js::Modal", "/r/src/Modal.js")
+            .await
+            .0,
+        " [callers: Page, handleCheckAgent +1 more]"
+    );
+}

@@ -34,17 +34,17 @@ pub struct CodeResult {
     /// consumers drop module-like symbols that are poor grep targets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_kind: Option<String>,
-    /// Number of direct callers (depth-1) from the call graph. Lower bound.
+    /// Number of distinct direct callers (depth-1) from the call graph.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callers: Option<u32>,
     /// Number of distinct files containing direct callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_files: Option<u32>,
-    /// Short names of callers, sorted by proximity (max 3 for display).
+    /// Short names of callers, sorted by proximity.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub caller_names: Vec<String>,
-    /// Short names of callees, sorted by proximity (max 3 for display).
+    /// Short names of callees, sorted by proximity.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub callee_names: Vec<String>,
@@ -959,7 +959,7 @@ fn lang_matches_alias(filter: &str, detected: &str) -> bool {
 }
 
 /// Enriched caller/callee stats for a single chunk's symbol.
-/// Contains counts, file counts, and up to 3 short names for display.
+/// Counts are distinct names. The name lists are short names, de-duplicated.
 #[derive(Debug, Clone)]
 pub struct CallerCalleeStats {
     pub caller_count: u32,
@@ -1016,7 +1016,7 @@ struct CalleeRow {
     out_name: Option<String>,
 }
 
-async fn query_caller_callee_stats(
+pub(crate) async fn query_caller_callee_stats(
     db: &Surreal<Db>,
     fqn: &str,
     target_file: &str,
@@ -1049,7 +1049,11 @@ async fn query_caller_callee_stats(
         .filter(|r| r.in_name.as_deref().is_some_and(|n| !n.is_empty()))
         .collect();
 
-    let caller_count = caller_rows.len() as u32;
+    let caller_count = caller_rows
+        .iter()
+        .filter_map(|r| r.in_name.as_deref())
+        .collect::<HashSet<_>>()
+        .len() as u32;
     let distinct_caller_files: HashSet<&str> =
         caller_rows.iter().map(|r| r.in_file.as_str()).collect();
     let caller_file_count = distinct_caller_files.len() as u32;
@@ -1089,7 +1093,11 @@ async fn query_caller_callee_stats(
         .filter(|r| r.out_name.as_deref().is_some_and(|n| !n.is_empty()))
         .collect();
 
-    let callee_count = callee_rows.len() as u32;
+    let callee_count = callee_rows
+        .iter()
+        .filter_map(|r| r.out_name.as_deref())
+        .collect::<HashSet<_>>()
+        .len() as u32;
     let distinct_callee_files: HashSet<&str> =
         callee_rows.iter().map(|r| r.out_file.as_str()).collect();
     let callee_file_count = distinct_callee_files.len() as u32;
@@ -1113,7 +1121,7 @@ async fn query_caller_callee_stats(
 }
 
 /// Sort names by file proximity to target: same-file first, same-directory second,
-/// then alphabetical. Dedup and cap at the first unique entries.
+/// then alphabetical. Dedup by short name.
 fn proximity_sorted_names(entries: &[(String, String)], target_file: &str) -> Vec<String> {
     use std::path::Path;
 
@@ -1150,8 +1158,8 @@ fn proximity_sorted_names(entries: &[(String, String)], target_file: &str) -> Ve
 }
 
 /// Format a caller tag string for MCP output.
-/// `[callers: fn_a, fn_b, fn_c +N more]` when callers > 3
-/// `[callers: fn_a, fn_b]` when callers <= 3
+/// `[callers: fn_a, fn_b +N more]`, showing up to 30 names; N is the distinct
+/// caller count minus the names shown.
 pub fn format_caller_tag(stats: &CallerCalleeStats) -> String {
     if stats.caller_count == 0 {
         return String::new();
@@ -1174,7 +1182,7 @@ pub fn format_caller_tag(stats: &CallerCalleeStats) -> String {
 }
 
 /// Format a callee tag string for MCP output.
-/// `[calls: fn_x, fn_y +N more]` when callees > 3
+/// `[calls: fn_x, fn_y +N more]`, showing up to 30 names.
 pub fn format_callee_tag(stats: &CallerCalleeStats) -> String {
     if stats.callee_count == 0 {
         return String::new();

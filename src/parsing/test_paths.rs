@@ -10,7 +10,7 @@
 //! accepts rare false positives (`latest.java`). A dropped hint symbol is cheap.
 
 /// Directory segments that mark everything below them as tests.
-const TEST_DIRS: &[&str] = &["test", "tests", "__tests__", "spec"];
+const TEST_DIRS: &[&str] = &["test", "tests", "__tests__", "__mocks__", "spec"];
 
 pub fn is_test_path(rel: &str) -> bool {
     let normalized = rel.replace('\\', "/");
@@ -117,6 +117,7 @@ mod tests {
                 "src/Button.test.svelte",
                 "src/__tests__/a.js",
                 "src/__tests__/deep/b.ts",
+                "src/components/__mocks__/Modal.jsx",
             ],
             true,
         );

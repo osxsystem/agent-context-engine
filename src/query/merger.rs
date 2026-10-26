@@ -28,8 +28,6 @@ impl MergeChunk {
     }
 }
 
-/// A chunk with the key the merge ranks it by: its score times a class weight.
-/// `chunk.score` stays the raw similarity that the rerankers and output show.
 struct Ranked {
     chunk: MergeChunk,
     rank: f32,

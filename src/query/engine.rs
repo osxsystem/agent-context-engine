@@ -12,9 +12,10 @@ use crate::embedding::identity::EmbeddingIdentity;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::path_in_repo;
+use crate::query::chunk_weight::weighted_merge;
 use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
-use crate::query::merger::{MergeChunk, merge_chunks};
+use crate::query::merger::MergeChunk;
 use crate::query::reranker;
 use crate::query::scope_fallback::{Gathered, gather_with_fallback, retry_on_rerank_rejection};
 use crate::vector::ScopeFilter;
@@ -399,7 +400,17 @@ async fn run_query_once(
 
     // ── Step 5: Merge ─────────────────────────────────────────────────────
     let merge_start = Instant::now();
-    let merged = merge_chunks(all_chunks, top_k);
+    let repo_roots: Vec<&str> = match repo_filter {
+        Some(repo) => vec![repo],
+        None => db_map.keys().map(String::as_str).collect(),
+    };
+    let merged = weighted_merge(
+        all_chunks,
+        &parsed.text,
+        &parsed.filters,
+        &repo_roots,
+        top_k,
+    );
     let merge_ms = merge_start.elapsed().as_millis() as u64;
 
     // Read numbered content from disk ONCE per candidate. Bounded by top_k
@@ -838,7 +849,13 @@ pub(crate) async fn run_sub_query(
         }
     }
 
-    Ok(merge_chunks(all_chunks, top_k))
+    Ok(weighted_merge(
+        all_chunks,
+        query,
+        filters,
+        &[repo_filter],
+        top_k,
+    ))
 }
 
 // ─── Query filter application ────────────────────────────────────────────

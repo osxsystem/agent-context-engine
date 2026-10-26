@@ -6,9 +6,9 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use crate::indexing::frameworks::{DetectionContext, FrameworkResolver};
+use crate::indexing::frameworks::{DetectionContext, FrameworkResolver, enclosing_caller};
 use crate::parsing::relations::{EdgeKind, EdgeTarget, RawEdge};
-use crate::parsing::symbols::{QualifiedSymbol, Symbol, SymbolKind};
+use crate::parsing::symbols::Symbol;
 
 pub struct ReactResolver;
 
@@ -56,13 +56,7 @@ impl FrameworkResolver for ReactResolver {
                 .count() as u32
                 + 1;
 
-            let from = enclosing_scope(symbols, file_path, line)
-                .map(|s| s.qualified.clone())
-                .unwrap_or_else(|| QualifiedSymbol {
-                    file: file_path.to_string(),
-                    scope_path: vec![],
-                    name: "<module>".to_string(),
-                });
+            let from = enclosing_caller(symbols, file_path, line);
             if from.name == tag_name || !seen.insert((from.clone(), tag_name.to_string())) {
                 continue;
             }
@@ -83,24 +77,10 @@ impl FrameworkResolver for ReactResolver {
     }
 }
 
-fn enclosing_scope<'a>(symbols: &'a [Symbol], file_path: &str, line: u32) -> Option<&'a Symbol> {
-    symbols
-        .iter()
-        .rev()
-        .filter(|s| {
-            s.qualified.file == file_path
-                && matches!(
-                    s.kind,
-                    SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
-                )
-                && (s.line_start..=s.line_end).contains(&line)
-        })
-        .min_by_key(|s| s.line_end - s.line_start)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parsing::symbols::QualifiedSymbol;
     use std::collections::HashSet;
 
     #[test]

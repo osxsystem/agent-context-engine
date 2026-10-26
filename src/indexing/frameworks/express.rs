@@ -7,9 +7,9 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-use crate::indexing::frameworks::{DetectionContext, FrameworkResolver};
+use crate::indexing::frameworks::{DetectionContext, FrameworkResolver, enclosing_caller};
 use crate::parsing::relations::{EdgeKind, EdgeTarget, RawEdge};
-use crate::parsing::symbols::{QualifiedSymbol, Symbol};
+use crate::parsing::symbols::Symbol;
 
 pub struct ExpressResolver;
 
@@ -55,7 +55,6 @@ impl FrameworkResolver for ExpressResolver {
         }
 
         let mut edges = Vec::new();
-        let from_qualified = find_module_symbol(symbols, file_path);
 
         // Route handlers with path
         for cap in ROUTE_RE.captures_iter(source) {
@@ -67,7 +66,7 @@ impl FrameworkResolver for ExpressResolver {
                 + 1;
 
             edges.push(RawEdge {
-                from: from_qualified.clone(),
+                from: enclosing_caller(symbols, file_path, line),
                 to: EdgeTarget::Unresolved {
                     name: handler_name.to_string(),
                     import_path: None,
@@ -89,7 +88,7 @@ impl FrameworkResolver for ExpressResolver {
                 + 1;
 
             edges.push(RawEdge {
-                from: from_qualified.clone(),
+                from: enclosing_caller(symbols, file_path, line),
                 to: EdgeTarget::Unresolved {
                     name: handler_name.to_string(),
                     import_path: None,
@@ -102,18 +101,6 @@ impl FrameworkResolver for ExpressResolver {
 
         edges
     }
-}
-
-fn find_module_symbol(symbols: &[Symbol], file_path: &str) -> QualifiedSymbol {
-    symbols
-        .iter()
-        .find(|s| s.qualified.file == file_path)
-        .map(|s| s.qualified.clone())
-        .unwrap_or_else(|| QualifiedSymbol {
-            file: file_path.to_string(),
-            scope_path: vec![],
-            name: "<module>".to_string(),
-        })
 }
 
 #[cfg(test)]

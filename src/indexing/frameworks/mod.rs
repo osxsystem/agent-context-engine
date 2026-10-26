@@ -15,7 +15,24 @@ pub mod spring;
 use std::collections::HashSet;
 
 use crate::parsing::relations::RawEdge;
-use crate::parsing::symbols::Symbol;
+use crate::parsing::symbols::{QualifiedSymbol, Symbol};
+
+/// The caller a framework edge found on `line` is credited to: the innermost
+/// symbol whose lines contain it, else `<module>`. On equal spans the symbol
+/// extracted later wins, because extractors emit a parent before its children.
+pub(crate) fn enclosing_caller(symbols: &[Symbol], file_path: &str, line: u32) -> QualifiedSymbol {
+    symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| (s.line_start..=s.line_end).contains(&line))
+        .min_by_key(|&(i, s)| (s.line_end - s.line_start, std::cmp::Reverse(i)))
+        .map(|(_, s)| s.qualified.clone())
+        .unwrap_or_else(|| QualifiedSymbol {
+            file: file_path.to_string(),
+            scope_path: vec![],
+            name: "<module>".to_string(),
+        })
+}
 
 /// Context provided to framework detection. Contains file listing and
 /// an optional file reader for inspecting manifest contents.

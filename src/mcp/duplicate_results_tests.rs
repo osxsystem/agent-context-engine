@@ -1,8 +1,3 @@
-//! Identical code in several files must reach the output as one block with a
-//! note naming the other copies. Each test indexes a real repo through the
-//! engine against a local embeddings endpoint, so no quota is spent, and reads
-//! the answer a client would get.
-
 use super::availability_tests::Harness;
 use super::*;
 
@@ -15,16 +10,16 @@ fn function(name: &str, salt: &str, lines: u32) -> String {
     text
 }
 
-/// The shared chunk is two short functions, so a span-narrowing reranker can
-/// pick one range per function. The unique function is long enough that the
-/// chunker gives it a chunk of its own.
-const FUNCTION_LINES: u32 = 43;
+const SHARED_BODY_LINES: u32 = 18;
+const UNIQUE_BODY_LINES: u32 = 40;
+const FUNCTION_FRAME_LINES: u32 = 3;
+const SHARED_CHUNK_LINES: u32 = 2 * (SHARED_BODY_LINES + FUNCTION_FRAME_LINES) + 1;
 
 fn fixture() -> Vec<(&'static str, String)> {
     let shared = format!(
         "{}\n{}",
-        function("shared_setup", "shared", 18),
-        function("shared_teardown", "shared", 18)
+        function("shared_setup", "shared", SHARED_BODY_LINES),
+        function("shared_teardown", "shared", SHARED_BODY_LINES)
     );
     ["a", "b", "c"]
         .into_iter()
@@ -37,7 +32,7 @@ fn fixture() -> Vec<(&'static str, String)> {
                 },
                 format!(
                     "{shared}\n{}",
-                    function(&format!("unique_{name}"), name, 40)
+                    function(&format!("unique_{name}"), name, UNIQUE_BODY_LINES)
                 ),
             )
         })
@@ -81,7 +76,7 @@ fn headers(answer: &str) -> Vec<&str> {
 
 fn shared_header(h: &Harness) -> String {
     format!(
-        "{}#L1-{FUNCTION_LINES} (+2 identical: {}, {})",
+        "{}#L1-{SHARED_CHUNK_LINES} (+2 identical: {}, {})",
         path(h, "copies/a.rs"),
         path(h, "copies/b.rs"),
         path(h, "copies/c.rs"),

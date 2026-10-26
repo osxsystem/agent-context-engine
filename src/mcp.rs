@@ -1198,9 +1198,6 @@ fn mcp_query_filters(
     (!filters.is_empty()).then_some(filters)
 }
 
-/// Format an enriched caller tag: `[callers: fn_a, fn_b, fn_c +N more]`
-/// When callers > 3, shows first 3 names + count of remaining.
-/// Returns empty string when no callers.
 fn format_enriched_caller_tag(
     count: Option<u32>,
     names: &[String],

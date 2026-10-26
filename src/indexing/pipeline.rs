@@ -9769,6 +9769,12 @@ function Page() {
     }
 
     #[test]
+    fn export_default_arrow_tags_go_to_the_module() {
+        let source = "export default () => <Modal />;\n";
+        assert_eq!(callers_of("Page.jsx", source, "Modal"), vec!["<module>"]);
+    }
+
+    #[test]
     fn express_routes_go_to_the_function_that_registers_them() {
         let source = "\
 const validate = (req, res, next) => {

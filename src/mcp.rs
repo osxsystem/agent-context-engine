@@ -24,6 +24,8 @@ use rmcp::{
 
 #[cfg(test)]
 mod availability_tests;
+#[cfg(test)]
+mod duplicate_results_tests;
 mod progress;
 pub(crate) mod query_gate;
 pub(crate) mod readiness;
@@ -61,6 +63,7 @@ struct OutputBlock {
     callee_names: Vec<String>,
     callees: Option<u32>,
     symbols: Vec<String>,
+    duplicates: Vec<String>,
 }
 
 // ─── Grep hint footer ────────────────────────────────────────────────────
@@ -408,18 +411,15 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
 }
 
 /// Merge output blocks from the same file whose line ranges overlap or are
-/// adjacent (next.line_start <= current.line_end + 1). Merged content is
-/// re-read from the filesystem; if the read fails, original content strings
-/// are concatenated with line-number dedup.
+/// adjacent (next.line_start <= current.line_end + 1) and carry the same
+/// list of identical copies. Merged content is re-read from the filesystem;
+/// if the read fails, original content strings are concatenated with
+/// line-number dedup.
 ///
 /// Preserves first-occurrence position: the merged block occupies the slot of
 /// the earliest block in its file group. Blocks from different files pass
 /// through unchanged.
 fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
-    if blocks.len() <= 1 {
-        return blocks;
-    }
-
     // Group by file. Normalize path separators for grouping on Windows
     // (the index stores native `\` but sub-query paths may use `/`).
     let normalize_key = |file: &str| -> String {
@@ -433,7 +433,9 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
     // Group by normalized file key. Collect (original_index, block).
     let mut by_file: std::collections::HashMap<String, Vec<(usize, OutputBlock)>> =
         std::collections::HashMap::new();
-    for (i, block) in blocks.into_iter().enumerate() {
+    for (i, mut block) in blocks.into_iter().enumerate() {
+        block.duplicates.sort();
+        block.duplicates.dedup();
         let key = normalize_key(&block.file);
         by_file.entry(key).or_default().push((i, block));
     }
@@ -442,12 +444,6 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
     let mut positioned: Vec<(usize, OutputBlock)> = Vec::new();
 
     for (_file, mut group) in by_file {
-        if group.len() == 1 {
-            let (idx, block) = group.remove(0);
-            positioned.push((idx, block));
-            continue;
-        }
-
         // Sort by line_start within file.
         group.sort_unstable_by_key(|(_, b)| b.line_start);
 
@@ -458,7 +454,8 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
 
         for (orig_idx, mut next) in group {
             if let Some((min_idx, current, originals)) = merged.last_mut() {
-                if next.line_start <= current.line_end + 1 {
+                if next.line_start <= current.line_end + 1 && next.duplicates == current.duplicates
+                {
                     current.line_end = current.line_end.max(next.line_end);
                     *min_idx = (*min_idx).min(orig_idx);
                     // Combine caller/callee stats: the two merged blocks usually
@@ -509,14 +506,7 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                     }
                 }
             }
-            // Rebuild header with updated range + enriched caller/callee tags.
-            let caller_tag =
-                format_enriched_caller_tag(block.callers, &block.caller_names, block.caller_files);
-            let callee_tag = format_enriched_callee_tag(block.callees, &block.callee_names);
-            block.header = format!(
-                "{}#L{}-{}{}{}",
-                block.file, block.line_start, block.line_end, caller_tag, callee_tag
-            );
+            block.header = output_header(block);
         }
 
         // Use the tracked min_orig_idx for output ordering.
@@ -1248,6 +1238,37 @@ fn format_enriched_callee_tag(count: Option<u32>, names: &[String]) -> String {
     }
 }
 
+fn format_duplicate_tag(duplicates: &[String]) -> String {
+    const SHOWN: usize = 3;
+    if duplicates.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<&str> = duplicates.iter().take(SHOWN).map(String::as_str).collect();
+    let more = if duplicates.len() > SHOWN {
+        ", …"
+    } else {
+        ""
+    };
+    format!(
+        " (+{} identical: {}{})",
+        duplicates.len(),
+        shown.join(", "),
+        more
+    )
+}
+
+fn output_header(block: &OutputBlock) -> String {
+    format!(
+        "{}#L{}-{}{}{}{}",
+        block.file,
+        block.line_start,
+        block.line_end,
+        format_duplicate_tag(&block.duplicates),
+        format_enriched_caller_tag(block.callers, &block.caller_names, block.caller_files),
+        format_enriched_callee_tag(block.callees, &block.callee_names),
+    )
+}
+
 /// Returns a string — never panics, never returns Err.
 ///
 /// Note: neither `home_dir` nor `data_dir` is needed here — both DB opens and
@@ -1342,26 +1363,19 @@ async fn do_query(
                 .results
                 .iter()
                 .zip(hint_symbols)
-                .map(|(r, symbols)| {
-                    let caller_tag =
-                        format_enriched_caller_tag(r.callers, &r.caller_names, r.caller_files);
-                    let callee_tag = format_enriched_callee_tag(r.callees, &r.callee_names);
-                    OutputBlock {
-                        header: format!(
-                            "{}#L{}-{}{}{}",
-                            r.file, r.line_start, r.line_end, caller_tag, callee_tag
-                        ),
-                        content: r.content.clone(),
-                        file: r.file.clone(),
-                        line_start: r.line_start,
-                        line_end: r.line_end,
-                        callers: r.callers,
-                        caller_files: r.caller_files,
-                        caller_names: r.caller_names.clone(),
-                        callee_names: r.callee_names.clone(),
-                        callees: r.callees,
-                        symbols,
-                    }
+                .map(|(r, symbols)| OutputBlock {
+                    content: r.content.clone(),
+                    file: r.file.clone(),
+                    line_start: r.line_start,
+                    line_end: r.line_end,
+                    callers: r.callers,
+                    caller_files: r.caller_files,
+                    caller_names: r.caller_names.clone(),
+                    callee_names: r.callee_names.clone(),
+                    callees: r.callees,
+                    symbols,
+                    duplicates: r.duplicates.clone(),
+                    ..Default::default()
                 })
                 .collect();
             let blocks = merge_overlapping_blocks(blocks);
@@ -1548,6 +1562,7 @@ async fn run_file_retrieval_resolved(
             symbol: None,
             symbol_fqn: None,
             symbol_kind: None,
+            duplicates: Vec::new(),
         })
         .collect();
 

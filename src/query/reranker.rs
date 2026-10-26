@@ -1557,6 +1557,7 @@ fn synth_pool_chunk(
         symbol: None,
         symbol_fqn: None,
         symbol_kind: None,
+        duplicates: Vec::new(),
     });
     extended_numbered.push(Some(numbered_text));
     Some(idx)
@@ -1923,6 +1924,7 @@ mod tests {
             symbol: None,
             symbol_fqn: None,
             symbol_kind: None,
+            duplicates: Vec::new(),
         }
     }
 
@@ -2808,6 +2810,7 @@ mod tests {
             symbol: None,
             symbol_fqn: None,
             symbol_kind: None,
+            duplicates: Vec::new(),
         };
         let backend = MockBackend::with_sub_query(
             vec![

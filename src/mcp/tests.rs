@@ -1447,6 +1447,7 @@ fn code_result(
         caller_names: vec![],
         callee_names: vec![],
         callees: None,
+        duplicates: Vec::new(),
     }
 }
 
@@ -1807,5 +1808,154 @@ async fn caller_tag_counts_same_named_callers_in_different_files_apart() {
             .await
             .0,
         " [callers: Page, handleCheckAgent +1 more]"
+    );
+}
+
+fn block_with_duplicates(file: &str, duplicates: &[&str]) -> OutputBlock {
+    OutputBlock {
+        header: format!("{file}#L1-50"),
+        content: "1: aaa".into(),
+        file: file.into(),
+        line_start: 1,
+        line_end: 50,
+        duplicates: duplicates.iter().map(|path| path.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn header_names_three_duplicates_with_an_ellipsis_when_more_remain() {
+    let blocks = vec![block_with_duplicates(
+        "forms/SaveAsUI.jsx",
+        &[
+            "air/forms/SaveAsUI.jsx",
+            "rail/forms/SaveAsUI.jsx",
+            "road/forms/SaveAsUI.jsx",
+            "sea/forms/SaveAsUI.jsx",
+            "air2/forms/SaveAsUI.jsx",
+            "rail2/forms/SaveAsUI.jsx",
+            "road2/forms/SaveAsUI.jsx",
+            "sea2/forms/SaveAsUI.jsx",
+            "air3/forms/SaveAsUI.jsx",
+            "rail3/forms/SaveAsUI.jsx",
+        ],
+    )];
+
+    let merged = merge_overlapping_blocks(blocks);
+
+    assert_eq!(
+        assemble_with_budget(&merged),
+        "forms/SaveAsUI.jsx#L1-50 (+10 identical: air/forms/SaveAsUI.jsx, \
+         air2/forms/SaveAsUI.jsx, air3/forms/SaveAsUI.jsx, …)\n1: aaa"
+    );
+}
+
+#[test]
+fn header_names_every_duplicate_when_three_or_fewer_remain() {
+    let merged = merge_overlapping_blocks(vec![block_with_duplicates(
+        "forms/SaveAsUI.jsx",
+        &["air/forms/SaveAsUI.jsx", "sea/forms/SaveAsUI.jsx"],
+    )]);
+
+    assert_eq!(
+        assemble_with_budget(&merged),
+        "forms/SaveAsUI.jsx#L1-50 (+2 identical: air/forms/SaveAsUI.jsx, \
+         sea/forms/SaveAsUI.jsx)\n1: aaa"
+    );
+}
+
+#[test]
+fn header_without_duplicates_is_unchanged() {
+    let merged = merge_overlapping_blocks(vec![block_with_duplicates("forms/SaveAsUI.jsx", &[])]);
+
+    assert_eq!(
+        assemble_with_budget(&merged),
+        "forms/SaveAsUI.jsx#L1-50\n1: aaa"
+    );
+}
+
+#[test]
+fn duplicate_note_sits_before_the_caller_tag() {
+    let mut block = block_with_duplicates("forms/SaveAsUI.jsx", &["air/forms/SaveAsUI.jsx"]);
+    block.callers = Some(2);
+    block.caller_names = vec!["Page".into(), "Shell".into()];
+
+    let merged = merge_overlapping_blocks(vec![block]);
+
+    assert_eq!(
+        merged[0].header,
+        "forms/SaveAsUI.jsx#L1-50 (+1 identical: air/forms/SaveAsUI.jsx) \
+         [callers: Page, Shell]"
+    );
+}
+
+fn headers(blocks: &[OutputBlock]) -> Vec<&str> {
+    blocks.iter().map(|b| b.header.as_str()).collect()
+}
+
+#[test]
+fn adjacent_blocks_with_different_copies_keep_their_own_notes() {
+    let mut first = block_with_duplicates("a.rs", &["x.rs", "y.rs"]);
+    first.line_end = 10;
+    let mut second = block_with_duplicates("a.rs", &["y.rs", "z.rs"]);
+    second.line_start = 11;
+    second.line_end = 20;
+
+    let merged = merge_overlapping_blocks(vec![first, second]);
+
+    assert_eq!(
+        headers(&merged),
+        vec![
+            "a.rs#L1-10 (+2 identical: x.rs, y.rs)",
+            "a.rs#L11-20 (+2 identical: y.rs, z.rs)",
+        ]
+    );
+}
+
+#[test]
+fn block_with_copies_stays_apart_from_an_adjacent_block_without() {
+    let mut shared = block_with_duplicates("a.jsx", &["b.jsx", "c.jsx"]);
+    shared.line_end = 20;
+    let mut unique = block_with_duplicates("a.jsx", &[]);
+    unique.line_start = 21;
+    unique.line_end = 40;
+
+    let merged = merge_overlapping_blocks(vec![unique, shared]);
+
+    assert_eq!(
+        headers(&merged),
+        vec!["a.jsx#L21-40", "a.jsx#L1-20 (+2 identical: b.jsx, c.jsx)",]
+    );
+}
+
+#[test]
+fn overlapping_blocks_with_different_copies_stay_apart() {
+    let mut wide = block_with_duplicates("a.rs", &[]);
+    wide.line_end = 40;
+    let mut inner = block_with_duplicates("a.rs", &["b.rs"]);
+    inner.line_start = 10;
+    inner.line_end = 20;
+
+    let merged = merge_overlapping_blocks(vec![wide, inner]);
+
+    assert_eq!(
+        headers(&merged),
+        vec!["a.rs#L1-40", "a.rs#L10-20 (+1 identical: b.rs)"]
+    );
+}
+
+#[test]
+fn adjacent_blocks_with_the_same_copies_merge_and_keep_the_note_once() {
+    let mut first = block_with_duplicates("a.rs", &["y.rs", "x.rs"]);
+    first.line_end = 10;
+    let mut second = block_with_duplicates("a.rs", &["x.rs", "y.rs", "x.rs"]);
+    second.line_start = 11;
+    second.line_end = 20;
+
+    let merged = merge_overlapping_blocks(vec![first, second]);
+
+    assert_eq!(
+        headers(&merged),
+        vec!["a.rs#L1-20 (+2 identical: x.rs, y.rs)"]
     );
 }

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::parsing::generated::is_generated_file;
+
 /// A code chunk that participates in the merge pipeline.
 #[derive(Debug, Clone)]
 pub struct MergeChunk {
@@ -15,6 +17,7 @@ pub struct MergeChunk {
     /// Symbol kind (e.g. "function", "class", "struct") — populated from the
     /// symbol table during fetch_chunk_content. Used for kind: filter application.
     pub symbol_kind: Option<String>,
+    pub duplicates: Vec<String>,
 }
 
 impl MergeChunk {
@@ -29,13 +32,17 @@ impl MergeChunk {
 ///
 /// Steps (as specified):
 /// 1. Dedup by (file, line_start, line_end) — keep highest score.
-/// 2. Group by file.
-/// 3. Sort within each group by line_start ASC.
-/// 4. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
-///    capping merged range at 60 lines.
-/// 5. Drop contained: within each file group, sort by width DESC, skip any chunk
-///    fully inside a wider one.
-/// 6. Collect all groups, sort by score DESC, cap to top_k.
+/// 2. Collapse chunks whose content is identical across files — keep the best
+///    one (score, then hand-written over generated, then smallest path) and
+///    record the other files on it.
+/// 3. Group by file.
+/// 4. Sort within each group by line_start ASC.
+/// 5. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
+///    capping merged range at 60 lines. Chunks with different recorded copies
+///    never merge.
+/// 6. Drop contained: within each file group, sort by width DESC, skip any chunk
+///    fully inside a wider one, unless it carries recorded copies.
+/// 7. Collect all groups, sort by score DESC, cap to top_k.
 pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
     if chunks.is_empty() {
         return vec![];
@@ -55,24 +62,37 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             .or_insert(chunk);
     }
 
-    // Step 2: group by file.
+    // Step 2: collapse identical content across files, before step 5 joins neighbours.
+    let collapsed = {
+        let mut deduped: Vec<MergeChunk> = dedup_map.into_values().collect();
+        deduped.sort_unstable_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.line_start.cmp(&b.line_start))
+                .then(a.line_end.cmp(&b.line_end))
+        });
+        collapse_identical_content(deduped)
+    };
+
+    // Step 3: group by file.
     let mut by_file: HashMap<String, Vec<MergeChunk>> = HashMap::new();
-    for chunk in dedup_map.into_values() {
+    for chunk in collapsed {
         by_file.entry(chunk.file.clone()).or_default().push(chunk);
     }
 
     let mut result = Vec::new();
 
     for (_file, mut file_chunks) in by_file {
-        // Step 3: sort by line_start ASC.
+        // Step 4: sort by line_start ASC.
         file_chunks.sort_unstable_by_key(|c| c.line_start);
 
-        // Step 4: merge pass.
+        // Step 5: merge pass.
         let mut merged: Vec<MergeChunk> = Vec::new();
         for next in file_chunks {
             if let Some(current) = merged.last_mut() {
-                // Merge condition: next starts within gap of 1 line from current end.
-                if next.line_start <= current.line_end + 2 {
+                // Merge when next starts within one line of current and both carry the same copy list.
+                if next.line_start <= current.line_end + 2 && next.duplicates == current.duplicates
+                {
                     let new_end = current.line_end.max(next.line_end);
                     let new_start = current.line_start;
                     // Cap at 60 lines.
@@ -121,7 +141,7 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             }
         }
 
-        // Step 5: drop contained chunks.
+        // Step 6: drop contained chunks.
         // Sort by width DESC (wider chunks survive).
         merged.sort_unstable_by(|a, b| {
             let wa = a.line_end.saturating_sub(a.line_start);
@@ -130,11 +150,12 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         });
         let mut survivors: Vec<MergeChunk> = Vec::new();
         for candidate in merged {
-            let contained = survivors.iter().any(|s| {
-                s.file == candidate.file
-                    && s.line_start <= candidate.line_start
-                    && s.line_end >= candidate.line_end
-            });
+            let contained = candidate.duplicates.is_empty()
+                && survivors.iter().any(|s| {
+                    s.file == candidate.file
+                        && s.line_start <= candidate.line_start
+                        && s.line_end >= candidate.line_end
+                });
             if !contained {
                 survivors.push(candidate);
             }
@@ -143,12 +164,360 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         result.extend(survivors);
     }
 
-    // Step 6: sort by score DESC and cap to top_k.
+    // Step 7: sort by score DESC and cap to top_k.
     result.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line_start.cmp(&b.line_start))
     });
     result.truncate(top_k);
     result
+}
+
+fn content_key(content: &str) -> Option<String> {
+    let normalized: String = content
+        .replace("\r\n", "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.trim().is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn collapse_identical_content(chunks: Vec<MergeChunk>) -> Vec<MergeChunk> {
+    let mut by_content: HashMap<String, Vec<MergeChunk>> = HashMap::new();
+    let mut result: Vec<MergeChunk> = Vec::new();
+    for chunk in chunks {
+        match content_key(&chunk.content) {
+            Some(key) => by_content.entry(key).or_default().push(chunk),
+            None => result.push(chunk),
+        }
+    }
+
+    for (_, mut group) in by_content {
+        group.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| is_generated_file(&a.file).cmp(&is_generated_file(&b.file)))
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line_start.cmp(&b.line_start))
+        });
+        let mut group = group.into_iter();
+        let Some(mut kept) = group.next() else {
+            continue;
+        };
+        let mut others: Vec<String> = Vec::new();
+        for chunk in group {
+            // A repeat in the kept chunk's own file stays: same-file overlap belongs to the merge pass.
+            if chunk.file == kept.file {
+                result.push(chunk);
+            } else {
+                others.push(chunk.file);
+            }
+        }
+        others.sort();
+        others.dedup();
+        kept.duplicates = others;
+        result.push(kept);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK: &str = "export function SaveAsUI() {\n  return <Modal open />;\n}";
+
+    fn chunk(file: &str, content: &str, score: f32) -> MergeChunk {
+        MergeChunk {
+            file: file.to_owned(),
+            line_start: 269,
+            line_end: 310,
+            score,
+            content: content.to_owned(),
+            symbol: None,
+            symbol_fqn: None,
+            symbol_kind: None,
+            duplicates: Vec::new(),
+        }
+    }
+
+    fn chunk_at(file: &str, line_start: u32, content: &str) -> MergeChunk {
+        MergeChunk {
+            line_start,
+            line_end: line_start + 2,
+            ..chunk(file, content, 0.5)
+        }
+    }
+
+    fn listed(chunks: &[MergeChunk]) -> Vec<(&str, f32)> {
+        chunks.iter().map(|c| (c.file.as_str(), c.score)).collect()
+    }
+
+    #[test]
+    fn identical_content_across_files_collapses_to_one_representative() {
+        let merged = merge_chunks(
+            vec![
+                chunk("b/forms/SaveAsUI.jsx", BLOCK, 0.9),
+                chunk("a/forms/SaveAsUI.jsx", BLOCK, 0.9),
+                chunk("c/forms/SaveAsUI.jsx", BLOCK, 0.8),
+                chunk("src/Modal.jsx", "export function Modal() {}", 0.7),
+                chunk("src/useSaveAs.js", "export function useSaveAs() {}", 0.6),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            listed(&merged),
+            vec![
+                ("a/forms/SaveAsUI.jsx", 0.9),
+                ("src/Modal.jsx", 0.7),
+                ("src/useSaveAs.js", 0.6),
+            ],
+            "the copy with the best score and, on a tie, the smallest path stands for all three"
+        );
+        assert_eq!(
+            merged[0].duplicates,
+            vec![
+                "b/forms/SaveAsUI.jsx".to_owned(),
+                "c/forms/SaveAsUI.jsx".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn copies_differing_only_by_line_endings_and_trailing_space_collapse() {
+        let merged = merge_chunks(
+            vec![
+                chunk("win/x.js", "fn a() {\r\n  b();  \r\n}\r\n", 0.9),
+                chunk("unix/x.js", "fn a() {\n  b();\n}\n", 0.8),
+            ],
+            10,
+        );
+
+        assert_eq!(merged.len(), 1, "the two copies are the same code");
+        assert_eq!(merged[0].file, "win/x.js");
+        assert_eq!(merged[0].duplicates, vec!["unix/x.js".to_owned()]);
+    }
+
+    #[test]
+    fn blank_content_never_collapses() {
+        let merged = merge_chunks(vec![chunk("a.rs", "", 0.9), chunk("b.rs", "", 0.8)], 10);
+
+        assert_eq!(merged.len(), 2, "two empty chunks are not the same code");
+    }
+
+    #[test]
+    fn equal_scores_are_ordered_by_file_then_start_line() {
+        let mut chunks = Vec::new();
+        for (file, line) in [
+            ("e.rs", 269u32),
+            ("a.rs", 900),
+            ("c.rs", 500),
+            ("b.rs", 269),
+            ("d.rs", 269),
+            ("a.rs", 269),
+        ] {
+            chunks.push(chunk_at(file, line, &format!("fn {file}_{line}() {{}}")));
+        }
+
+        let merged = merge_chunks(chunks, 10);
+        let order: Vec<(String, u32)> = merged
+            .iter()
+            .map(|c| (c.file.clone(), c.line_start))
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![
+                ("a.rs".to_owned(), 269),
+                ("a.rs".to_owned(), 900),
+                ("b.rs".to_owned(), 269),
+                ("c.rs".to_owned(), 500),
+                ("d.rs".to_owned(), 269),
+                ("e.rs".to_owned(), 269),
+            ]
+        );
+    }
+
+    fn spanning(
+        file: &str,
+        line_start: u32,
+        line_end: u32,
+        content: &str,
+        score: f32,
+    ) -> MergeChunk {
+        MergeChunk {
+            line_start,
+            line_end,
+            ..chunk(file, content, score)
+        }
+    }
+
+    fn located(chunks: &[MergeChunk]) -> Vec<(&str, u32, u32, Vec<&str>)> {
+        chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.file.as_str(),
+                    c.line_start,
+                    c.line_end,
+                    c.duplicates.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adjacent_chunks_with_different_copies_stay_separate() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 3, "fn one() {}", 0.9),
+                spanning("a.rs", 4, 6, "fn two() {}", 0.7),
+                spanning("z.rs", 1, 3, "fn one() {}", 0.8),
+                spanning("y.rs", 4, 6, "fn two() {}", 0.6),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            located(&merged),
+            vec![("a.rs", 1, 3, vec!["z.rs"]), ("a.rs", 4, 6, vec!["y.rs"]),],
+            "each note names copies of its own lines only"
+        );
+    }
+
+    #[test]
+    fn chunk_with_copies_stays_apart_from_an_adjacent_chunk_without() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.jsx", 1, 20, "import shared", 0.9),
+                spanning("a.jsx", 21, 40, "function Unique() {}", 0.8),
+                spanning("b.jsx", 1, 20, "import shared", 0.7),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            located(&merged),
+            vec![("a.jsx", 1, 20, vec!["b.jsx"]), ("a.jsx", 21, 40, vec![]),]
+        );
+    }
+
+    #[test]
+    fn adjacent_chunks_with_the_same_copies_still_merge() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 3, "fn one() {}", 0.9),
+                spanning("a.rs", 4, 6, "fn two() {}", 0.7),
+                spanning("z.rs", 1, 3, "fn one() {}", 0.8),
+                spanning("z.rs", 4, 6, "fn two() {}", 0.6),
+            ],
+            10,
+        );
+
+        assert_eq!(located(&merged), vec![("a.rs", 1, 6, vec!["z.rs"])]);
+    }
+
+    #[test]
+    fn overlapping_chunk_with_copies_is_not_folded_into_one_without() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 50, "fn wide() {}", 0.9),
+                spanning("a.rs", 10, 20, "fn inner() {}", 0.8),
+                spanning("b.rs", 10, 20, "fn inner() {}", 0.7),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            located(&merged),
+            vec![("a.rs", 1, 50, vec![]), ("a.rs", 10, 20, vec!["b.rs"]),]
+        );
+    }
+
+    #[test]
+    fn chunk_with_copies_beyond_the_merge_cap_is_not_dropped_as_contained() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 80, "fn wide() {}", 0.9),
+                spanning("a.rs", 10, 20, "fn inner() {}", 0.8),
+                spanning("b.rs", 10, 20, "fn inner() {}", 0.7),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            located(&merged),
+            vec![("a.rs", 1, 80, vec![]), ("a.rs", 10, 20, vec!["b.rs"]),],
+            "the copy in b.rs must stay reachable from the output"
+        );
+    }
+
+    #[test]
+    fn contained_chunk_without_copies_is_still_dropped() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 80, "fn wide() {}", 0.9),
+                spanning("a.rs", 10, 20, "fn inner() {}", 0.8),
+            ],
+            10,
+        );
+
+        assert_eq!(located(&merged), vec![("a.rs", 1, 80, vec![])]);
+    }
+
+    #[test]
+    fn a_generated_copy_never_stands_for_a_hand_written_one_on_a_tie() {
+        for generated in ["__generated__/app.js", "dist/app.js", ".next/server/app.js"] {
+            let merged = merge_chunks(
+                vec![
+                    chunk(generated, BLOCK, 0.9),
+                    chunk("src/app.js", BLOCK, 0.9),
+                ],
+                10,
+            );
+
+            assert_eq!(listed(&merged), vec![("src/app.js", 0.9)], "{generated}");
+            assert_eq!(merged[0].duplicates, vec![generated.to_owned()]);
+        }
+    }
+
+    #[test]
+    fn a_generated_copy_with_a_better_score_still_stands_for_the_group() {
+        let merged = merge_chunks(
+            vec![
+                chunk("dist/app.js", BLOCK, 0.95),
+                chunk("src/app.js", BLOCK, 0.9),
+            ],
+            10,
+        );
+
+        assert_eq!(listed(&merged), vec![("dist/app.js", 0.95)]);
+    }
+
+    #[test]
+    fn among_hand_written_copies_a_tie_still_takes_the_smallest_path() {
+        let merged = merge_chunks(
+            vec![
+                chunk("src/z.js", BLOCK, 0.9),
+                chunk("dist/a.js", BLOCK, 0.9),
+                chunk("src/b.js", BLOCK, 0.9),
+            ],
+            10,
+        );
+
+        assert_eq!(listed(&merged), vec![("src/b.js", 0.9)]);
+        assert_eq!(
+            merged[0].duplicates,
+            vec!["dist/a.js".to_owned(), "src/z.js".to_owned()]
+        );
+    }
 }

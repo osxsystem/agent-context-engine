@@ -55,6 +55,9 @@ pub struct CodeResult {
     /// came from. Absent when the reranker yields no probabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relevance: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub duplicates: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -388,6 +391,7 @@ async fn run_query_once(
                 symbol: e.symbol,
                 symbol_fqn: e.symbol_fqn,
                 symbol_kind: e.symbol_kind,
+                duplicates: Vec::new(),
             });
         }
     }
@@ -531,6 +535,7 @@ async fn run_query_once(
                         callee_names: callee_names.clone(),
                         callees,
                         relevance,
+                        duplicates: chunk.duplicates.clone(),
                     });
                 }
             }
@@ -548,6 +553,7 @@ async fn run_query_once(
                 callee_names: callee_names.clone(),
                 callees,
                 relevance,
+                duplicates: chunk.duplicates.clone(),
             }),
             (None, _) => results.push(CodeResult {
                 file: chunk.file.clone(),
@@ -563,6 +569,7 @@ async fn run_query_once(
                 callee_names: callee_names.clone(),
                 callees,
                 relevance,
+                duplicates: chunk.duplicates.clone(),
             }),
         }
     }
@@ -598,6 +605,7 @@ async fn run_query_once(
             callee_names: stats.map(|s| s.callee_names.clone()).unwrap_or_default(),
             callees: stats.map(|s| s.callee_count),
             relevance: rerank_output.relevance.get(i).copied(),
+            duplicates: chunk.duplicates.clone(),
         });
     }
 
@@ -825,6 +833,7 @@ pub(crate) async fn run_sub_query(
                 symbol: e.symbol,
                 symbol_fqn: e.symbol_fqn,
                 symbol_kind: e.symbol_kind,
+                duplicates: Vec::new(),
             });
         }
     }
@@ -1239,6 +1248,7 @@ pub(crate) async fn hydrate_candidates(
             symbol,
             symbol_fqn,
             symbol_kind,
+            duplicates: Vec::new(),
         });
     }
     crate::query::content_fence::apply(chunks)

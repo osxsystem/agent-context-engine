@@ -166,6 +166,7 @@ mod tests {
             symbol: None,
             symbol_fqn: None,
             symbol_kind: None,
+            duplicates: Vec::new(),
         }
     }
 
@@ -354,6 +355,7 @@ mod retry_tests {
             content: String::new(),
             symbol: None,
             symbol_kind: None,
+            duplicates: Vec::new(),
             callers: None,
             caller_files: None,
             caller_names: vec![],

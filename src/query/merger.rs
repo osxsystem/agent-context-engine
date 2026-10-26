@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::parsing::generated::is_generated_file;
+
 /// A code chunk that participates in the merge pipeline.
 #[derive(Debug, Clone)]
 pub struct MergeChunk {
@@ -31,7 +33,8 @@ impl MergeChunk {
 /// Steps (as specified):
 /// 1. Dedup by (file, line_start, line_end) — keep highest score.
 /// 2. Collapse chunks whose content is identical across files — keep the best
-///    one and record the other files on it.
+///    one (score, then hand-written over generated, then smallest path) and
+///    record the other files on it.
 /// 3. Group by file.
 /// 4. Sort within each group by line_start ASC.
 /// 5. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
@@ -202,6 +205,7 @@ fn collapse_identical_content(chunks: Vec<MergeChunk>) -> Vec<MergeChunk> {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| is_generated_file(&a.file).cmp(&is_generated_file(&b.file)))
                 .then_with(|| a.file.cmp(&b.file))
                 .then_with(|| a.line_start.cmp(&b.line_start))
         });

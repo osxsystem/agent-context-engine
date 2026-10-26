@@ -6,17 +6,17 @@ use crate::query::merger::{MergeChunk, merge_weighted};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChunkClass {
-    Test,
+    Mock,
     Stylesheet,
     ImportOnly,
 }
 
 impl ChunkClass {
-    const ALL: [ChunkClass; 3] = [Self::Test, Self::Stylesheet, Self::ImportOnly];
+    const ALL: [ChunkClass; 3] = [Self::Mock, Self::Stylesheet, Self::ImportOnly];
 
     const fn weight(self) -> f32 {
         match self {
-            Self::Test => 0.90,
+            Self::Mock => 0.90,
             Self::Stylesheet => 0.90,
             Self::ImportOnly => 0.85,
         }
@@ -24,7 +24,7 @@ impl ChunkClass {
 
     fn matches(self, rel_path: &str, content: &str) -> bool {
         match self {
-            Self::Test => is_test_path(rel_path),
+            Self::Mock => is_mock(rel_path, content),
             Self::Stylesheet => {
                 extension(rel_path).is_some_and(|e| STYLE_EXTENSIONS.contains(&e.as_str()))
             }
@@ -37,6 +37,7 @@ impl ChunkClass {
 }
 
 const STYLE_EXTENSIONS: &[&str] = &["css", "scss", "sass", "less"];
+const MOCK_CALLS: &[&str] = &["jest.mock(", "vi.mock(", "jest.doMock("];
 const SCRIPT_EXTENSIONS: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
 const TEST_WORDS: &[&str] = &[
     "test", "tests", "spec", "specs", "mock", "mocks", "jest", "fixture", "fixtures",
@@ -52,6 +53,13 @@ const STYLE_WORDS: &[&str] = &[
     "theme",
 ];
 
+fn is_mock(rel_path: &str, content: &str) -> bool {
+    let in_mocks_dir = rel_path
+        .split('/')
+        .any(|dir| dir.eq_ignore_ascii_case("__mocks__"));
+    in_mocks_dir || (is_test_path(rel_path) && MOCK_CALLS.iter().any(|c| content.contains(c)))
+}
+
 fn extension(path: &str) -> Option<String> {
     Path::new(path)
         .extension()
@@ -60,7 +68,7 @@ fn extension(path: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Copy)]
 struct QueryIntent {
-    tests: bool,
+    mocks: bool,
     styles: bool,
 }
 
@@ -77,14 +85,14 @@ impl QueryIntent {
             .iter()
             .any(|l| STYLE_EXTENSIONS.contains(&l.to_ascii_lowercase().as_str()));
         Self {
-            tests: texts().any(|t| mentions(t, TEST_WORDS)),
+            mocks: texts().any(|t| mentions(t, TEST_WORDS)),
             styles: style_language || texts().any(|t| mentions(t, STYLE_WORDS)),
         }
     }
 
     fn asks_for(self, class: ChunkClass) -> bool {
         match class {
-            ChunkClass::Test => self.tests,
+            ChunkClass::Mock => self.mocks,
             ChunkClass::Stylesheet => self.styles,
             ChunkClass::ImportOnly => false,
         }
@@ -434,7 +442,7 @@ mod tests {
     fn query_words_match_whole_words_only() {
         let intent = |q: &str| {
             let i = QueryIntent::of(&[q], &QueryFilters::default());
-            (i.tests, i.styles)
+            (i.mocks, i.styles)
         };
 
         assert_eq!(intent("Modal component and its usages"), (false, false));
@@ -472,7 +480,8 @@ mod tests {
         let imports = "import a from 'a';";
 
         assert_eq!(weight_of("/repo/src/a.js", "export const a = 1;"), 1.0);
-        assert_eq!(weight_of("/repo/src/a.test.js", "it('x', () => {});"), 0.90);
+        assert_eq!(weight_of("/repo/src/a.test.js", "it('x', () => {});"), 1.0);
+        assert_eq!(weight_of("/repo/src/a.test.js", "jest.mock('a');"), 0.90);
         assert_eq!(weight_of("/repo/src/a.less", ".a {}"), 0.90);
         assert_eq!(weight_of("/repo/src/a.js", imports), 0.85);
         assert_eq!(weight_of("/repo/src/a.test.js", imports), 0.85);
@@ -480,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn mocks_directory_counts_as_tests() {
+    fn mocks_directory_counts_as_mocks() {
         assert_eq!(
             weight_of("/repo/src/__mocks__/api.js", "export default {};"),
             0.90
@@ -621,7 +630,7 @@ mod tests {
             rank_weight(&chunk(file, "x", 0.5), &["/HOME/ME/APP"], intent)
         };
 
-        assert_eq!(weight("/home/me/app/tests/a.js"), 0.90);
+        assert_eq!(weight("/home/me/app/__MOCKS__/a.js"), 0.90);
         assert_eq!(weight("/home/me/app/src/a.js"), 1.0);
     }
 

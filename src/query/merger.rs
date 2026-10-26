@@ -62,7 +62,7 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             .or_insert(chunk);
     }
 
-    // Step 2: before step 5 concatenates neighbours' content.
+    // Step 2: collapse identical content across files, before step 5 joins neighbours.
     let collapsed = {
         let mut deduped: Vec<MergeChunk> = dedup_map.into_values().collect();
         deduped.sort_unstable_by(|a, b| {
@@ -90,7 +90,7 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         let mut merged: Vec<MergeChunk> = Vec::new();
         for next in file_chunks {
             if let Some(current) = merged.last_mut() {
-                // Merge condition: next starts within gap of 1 line from current end.
+                // Merge when next starts within one line of current and both carry the same copy list.
                 if next.line_start <= current.line_end + 2 && next.duplicates == current.duplicates
                 {
                     let new_end = current.line_end.max(next.line_end);

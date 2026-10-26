@@ -61,7 +61,6 @@ struct OutputBlock {
     callee_names: Vec<String>,
     callees: Option<u32>,
     symbols: Vec<String>,
-    /// Other files holding this same code, in the form `merge_chunks` recorded.
     duplicates: Vec<String>,
 }
 
@@ -1236,8 +1235,6 @@ fn format_enriched_callee_tag(count: Option<u32>, names: &[String]) -> String {
     }
 }
 
-/// Render the note naming the other files that hold this block's code, as a
-/// count plus the first three paths. `duplicates` arrives sorted.
 fn format_duplicate_tag(duplicates: &[String]) -> String {
     const SHOWN: usize = 3;
     if duplicates.is_empty() {
@@ -1257,9 +1254,6 @@ fn format_duplicate_tag(duplicates: &[String]) -> String {
     )
 }
 
-/// The block header: `path#Lstart-end`, then the duplicate note, then the
-/// caller and callee tags. One renderer, so a header rebuilt by the same-file
-/// merge cannot drop what the first pass put in it.
 fn output_header(block: &OutputBlock) -> String {
     format!(
         "{}#L{}-{}{}{}{}",

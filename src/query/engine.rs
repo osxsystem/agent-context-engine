@@ -55,7 +55,6 @@ pub struct CodeResult {
     /// came from. Absent when the reranker yields no probabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relevance: Option<f64>,
-    /// Other files holding this same code, sorted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub duplicates: Vec<String>,

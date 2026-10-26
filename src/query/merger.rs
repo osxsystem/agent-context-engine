@@ -15,8 +15,6 @@ pub struct MergeChunk {
     /// Symbol kind (e.g. "function", "class", "struct") — populated from the
     /// symbol table during fetch_chunk_content. Used for kind: filter application.
     pub symbol_kind: Option<String>,
-    /// Other files holding this same code. `merge_chunks` fills it on the chunk
-    /// it keeps when it collapses identical copies.
     pub duplicates: Vec<String>,
 }
 
@@ -33,8 +31,7 @@ impl MergeChunk {
 /// Steps (as specified):
 /// 1. Dedup by (file, line_start, line_end) — keep highest score.
 /// 2. Collapse chunks whose content is identical across files — keep the best one
-///    and record the other files on it. Runs before the merge pass, which
-///    concatenates neighbour content, so the key sees one chunk's own text.
+///    and record the other files on it.
 /// 3. Group by file.
 /// 4. Sort within each group by line_start ASC.
 /// 5. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
@@ -61,7 +58,7 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             .or_insert(chunk);
     }
 
-    // Step 2: one chunk per distinct content.
+    // Before the merge pass concatenates neighbour content, so the key sees one chunk's own text.
     let collapsed = {
         let mut deduped: Vec<MergeChunk> = dedup_map.into_values().collect();
         deduped.sort_unstable_by(|a, b| {
@@ -164,8 +161,7 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         result.extend(survivors);
     }
 
-    // Step 7: sort by score DESC and cap to top_k. Equal scores break on the
-    // file path then the start line, so the same candidates always rank alike.
+    // Step 7: sort by score DESC and cap to top_k.
     result.sort_unstable_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -177,9 +173,6 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
     result
 }
 
-/// Key under which two chunks count as the same code: the text with CRLF folded
-/// to LF and each line's trailing whitespace removed. A reindented copy does not
-/// match, so only copies that differ in nothing but line endings collapse.
 fn content_key(content: &str) -> Option<String> {
     let normalized: String = content
         .replace("\r\n", "\n")
@@ -193,12 +186,6 @@ fn content_key(content: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// Keep one chunk per distinct content and record the other files holding it.
-///
-/// The kept chunk is the highest scoring one; an equal score goes to the smaller
-/// file path, so the choice never depends on input order. A repeat inside the
-/// kept chunk's own file stays in place: collapsing it would name the file it
-/// already is, and same-file overlap belongs to the merge pass.
 fn collapse_identical_content(chunks: Vec<MergeChunk>) -> Vec<MergeChunk> {
     let mut by_content: HashMap<String, Vec<MergeChunk>> = HashMap::new();
     let mut result: Vec<MergeChunk> = Vec::new();
@@ -223,6 +210,7 @@ fn collapse_identical_content(chunks: Vec<MergeChunk>) -> Vec<MergeChunk> {
         };
         let mut others: Vec<String> = Vec::new();
         for chunk in group {
+            // A repeat in the kept chunk's own file stays: same-file overlap belongs to the merge pass.
             if chunk.file == kept.file {
                 result.push(chunk);
             } else {

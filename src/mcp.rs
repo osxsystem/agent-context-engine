@@ -24,6 +24,8 @@ use rmcp::{
 
 #[cfg(test)]
 mod availability_tests;
+#[cfg(test)]
+mod duplicate_results_tests;
 mod progress;
 pub(crate) mod query_gate;
 pub(crate) mod readiness;

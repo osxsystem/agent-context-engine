@@ -343,24 +343,177 @@ mod tests {
         );
     }
 
+    fn spanning(
+        file: &str,
+        line_start: u32,
+        line_end: u32,
+        content: &str,
+        score: f32,
+    ) -> MergeChunk {
+        MergeChunk {
+            line_start,
+            line_end,
+            ..chunk(file, content, score)
+        }
+    }
+
+    fn located(chunks: &[MergeChunk]) -> Vec<(&str, u32, u32, Vec<&str>)> {
+        chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.file.as_str(),
+                    c.line_start,
+                    c.line_end,
+                    c.duplicates.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn adjacent_chunks_merged_in_one_file_keep_both_duplicate_lists() {
-        let mut first = chunk_at("a.rs", 1, "fn one() {}");
-        first.score = 0.9;
-        let mut second = chunk_at("a.rs", 4, "fn two() {}");
-        second.score = 0.7;
-        let mut first_copy = chunk_at("z.rs", 1, "fn one() {}");
-        first_copy.score = 0.8;
-        let mut second_copy = chunk_at("y.rs", 4, "fn two() {}");
-        second_copy.score = 0.6;
+    fn adjacent_chunks_with_different_copies_stay_separate() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 3, "fn one() {}", 0.9),
+                spanning("a.rs", 4, 6, "fn two() {}", 0.7),
+                spanning("z.rs", 1, 3, "fn one() {}", 0.8),
+                spanning("y.rs", 4, 6, "fn two() {}", 0.6),
+            ],
+            10,
+        );
 
-        let merged = merge_chunks(vec![first, second, first_copy, second_copy], 10);
+        assert_eq!(
+            located(&merged),
+            vec![("a.rs", 1, 3, vec!["z.rs"]), ("a.rs", 4, 6, vec!["y.rs"]),],
+            "each note names copies of its own lines only"
+        );
+    }
 
-        assert_eq!(merged.len(), 1);
-        assert_eq!((merged[0].line_start, merged[0].line_end), (1, 6));
+    #[test]
+    fn chunk_with_copies_stays_apart_from_an_adjacent_chunk_without() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.jsx", 1, 20, "import shared", 0.9),
+                spanning("a.jsx", 21, 40, "function Unique() {}", 0.8),
+                spanning("b.jsx", 1, 20, "import shared", 0.7),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            located(&merged),
+            vec![("a.jsx", 1, 20, vec!["b.jsx"]), ("a.jsx", 21, 40, vec![]),]
+        );
+    }
+
+    #[test]
+    fn adjacent_chunks_with_the_same_copies_still_merge() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 3, "fn one() {}", 0.9),
+                spanning("a.rs", 4, 6, "fn two() {}", 0.7),
+                spanning("z.rs", 1, 3, "fn one() {}", 0.8),
+                spanning("z.rs", 4, 6, "fn two() {}", 0.6),
+            ],
+            10,
+        );
+
+        assert_eq!(located(&merged), vec![("a.rs", 1, 6, vec!["z.rs"])]);
+    }
+
+    #[test]
+    fn overlapping_chunk_with_copies_is_not_folded_into_one_without() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 50, "fn wide() {}", 0.9),
+                spanning("a.rs", 10, 20, "fn inner() {}", 0.8),
+                spanning("b.rs", 10, 20, "fn inner() {}", 0.7),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            located(&merged),
+            vec![("a.rs", 1, 50, vec![]), ("a.rs", 10, 20, vec!["b.rs"]),]
+        );
+    }
+
+    #[test]
+    fn chunk_with_copies_beyond_the_merge_cap_is_not_dropped_as_contained() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 80, "fn wide() {}", 0.9),
+                spanning("a.rs", 10, 20, "fn inner() {}", 0.8),
+                spanning("b.rs", 10, 20, "fn inner() {}", 0.7),
+            ],
+            10,
+        );
+
+        assert_eq!(
+            located(&merged),
+            vec![("a.rs", 1, 80, vec![]), ("a.rs", 10, 20, vec!["b.rs"]),],
+            "the copy in b.rs must stay reachable from the output"
+        );
+    }
+
+    #[test]
+    fn contained_chunk_without_copies_is_still_dropped() {
+        let merged = merge_chunks(
+            vec![
+                spanning("a.rs", 1, 80, "fn wide() {}", 0.9),
+                spanning("a.rs", 10, 20, "fn inner() {}", 0.8),
+            ],
+            10,
+        );
+
+        assert_eq!(located(&merged), vec![("a.rs", 1, 80, vec![])]);
+    }
+
+    #[test]
+    fn a_generated_copy_never_stands_for_a_hand_written_one_on_a_tie() {
+        for generated in ["__generated__/app.js", "dist/app.js", ".next/server/app.js"] {
+            let merged = merge_chunks(
+                vec![
+                    chunk(generated, BLOCK, 0.9),
+                    chunk("src/app.js", BLOCK, 0.9),
+                ],
+                10,
+            );
+
+            assert_eq!(listed(&merged), vec![("src/app.js", 0.9)], "{generated}");
+            assert_eq!(merged[0].duplicates, vec![generated.to_owned()]);
+        }
+    }
+
+    #[test]
+    fn a_generated_copy_with_a_better_score_still_stands_for_the_group() {
+        let merged = merge_chunks(
+            vec![
+                chunk("dist/app.js", BLOCK, 0.95),
+                chunk("src/app.js", BLOCK, 0.9),
+            ],
+            10,
+        );
+
+        assert_eq!(listed(&merged), vec![("dist/app.js", 0.95)]);
+    }
+
+    #[test]
+    fn among_hand_written_copies_a_tie_still_takes_the_smallest_path() {
+        let merged = merge_chunks(
+            vec![
+                chunk("src/z.js", BLOCK, 0.9),
+                chunk("dist/a.js", BLOCK, 0.9),
+                chunk("src/b.js", BLOCK, 0.9),
+            ],
+            10,
+        );
+
+        assert_eq!(listed(&merged), vec![("src/b.js", 0.9)]);
         assert_eq!(
             merged[0].duplicates,
-            vec!["y.rs".to_owned(), "z.rs".to_owned()]
+            vec!["dist/a.js".to_owned(), "src/z.js".to_owned()]
         );
     }
 }

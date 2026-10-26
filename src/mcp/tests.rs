@@ -1889,8 +1889,12 @@ fn duplicate_note_sits_before_the_caller_tag() {
     );
 }
 
+fn headers(blocks: &[OutputBlock]) -> Vec<&str> {
+    blocks.iter().map(|b| b.header.as_str()).collect()
+}
+
 #[test]
-fn two_blocks_from_one_file_combine_their_duplicate_lists_without_repeats() {
+fn adjacent_blocks_with_different_copies_keep_their_own_notes() {
     let mut first = block_with_duplicates("a.rs", &["x.rs", "y.rs"]);
     first.line_end = 10;
     let mut second = block_with_duplicates("a.rs", &["y.rs", "z.rs"]);
@@ -1899,13 +1903,59 @@ fn two_blocks_from_one_file_combine_their_duplicate_lists_without_repeats() {
 
     let merged = merge_overlapping_blocks(vec![first, second]);
 
-    assert_eq!(merged.len(), 1);
     assert_eq!(
-        merged[0].header,
-        "a.rs#L1-20 (+3 identical: x.rs, y.rs, z.rs)"
+        headers(&merged),
+        vec![
+            "a.rs#L1-10 (+2 identical: x.rs, y.rs)",
+            "a.rs#L11-20 (+2 identical: y.rs, z.rs)",
+        ]
     );
+}
+
+#[test]
+fn block_with_copies_stays_apart_from_an_adjacent_block_without() {
+    let mut shared = block_with_duplicates("a.jsx", &["b.jsx", "c.jsx"]);
+    shared.line_end = 20;
+    let mut unique = block_with_duplicates("a.jsx", &[]);
+    unique.line_start = 21;
+    unique.line_end = 40;
+
+    let merged = merge_overlapping_blocks(vec![unique, shared]);
+
     assert_eq!(
-        merged[0].duplicates,
-        vec!["x.rs".to_owned(), "y.rs".to_owned(), "z.rs".to_owned()]
+        headers(&merged),
+        vec!["a.jsx#L21-40", "a.jsx#L1-20 (+2 identical: b.jsx, c.jsx)",]
+    );
+}
+
+#[test]
+fn overlapping_blocks_with_different_copies_stay_apart() {
+    let mut wide = block_with_duplicates("a.rs", &[]);
+    wide.line_end = 40;
+    let mut inner = block_with_duplicates("a.rs", &["b.rs"]);
+    inner.line_start = 10;
+    inner.line_end = 20;
+
+    let merged = merge_overlapping_blocks(vec![wide, inner]);
+
+    assert_eq!(
+        headers(&merged),
+        vec!["a.rs#L1-40", "a.rs#L10-20 (+1 identical: b.rs)"]
+    );
+}
+
+#[test]
+fn adjacent_blocks_with_the_same_copies_merge_and_keep_the_note_once() {
+    let mut first = block_with_duplicates("a.rs", &["y.rs", "x.rs"]);
+    first.line_end = 10;
+    let mut second = block_with_duplicates("a.rs", &["x.rs", "y.rs", "x.rs"]);
+    second.line_start = 11;
+    second.line_end = 20;
+
+    let merged = merge_overlapping_blocks(vec![first, second]);
+
+    assert_eq!(
+        headers(&merged),
+        vec!["a.rs#L1-20 (+2 identical: x.rs, y.rs)"]
     );
 }

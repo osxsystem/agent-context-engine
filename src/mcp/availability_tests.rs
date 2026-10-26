@@ -67,28 +67,38 @@ async fn gated_embeddings(gate: Arc<EmbedGate>) -> String {
     format!("http://{addr}/v1")
 }
 
-struct Harness {
+pub(super) struct Harness {
     _home: TempDir,
-    dir: TempDir,
-    home: std::path::PathBuf,
-    repo: String,
-    settings: Settings,
-    engine: Arc<IndexEngine>,
-    repo_dbs: RepoDbMap,
+    pub(super) dir: TempDir,
+    pub(super) home: std::path::PathBuf,
+    pub(super) repo: String,
+    pub(super) settings: Settings,
+    pub(super) engine: Arc<IndexEngine>,
+    pub(super) repo_dbs: RepoDbMap,
     gate: Arc<EmbedGate>,
 }
 
 impl Harness {
     /// A real repo, indexed to completion through the engine's consumer.
     async fn indexed() -> Self {
+        Self::indexed_with(&[
+            (
+                "lib.rs",
+                "pub fn parse_config() -> u32 {\n    42\n}\n\npub fn load() { parse_config(); }\n",
+            ),
+            ("main.rs", "fn main() {\n    load();\n}\n"),
+        ])
+        .await
+    }
+
+    pub(super) async fn indexed_with(files: &[(&str, &str)]) -> Self {
         let home_dir = TempDir::new().unwrap();
         let dir = TempDir::new().unwrap();
-        std::fs::write(
-            dir.path().join("lib.rs"),
-            "pub fn parse_config() -> u32 {\n    42\n}\n\npub fn load() { parse_config(); }\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("main.rs"), "fn main() {\n    load();\n}\n").unwrap();
+        for (name, text) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
         let repo = crate::store::normalize_repo_path(dir.path().to_str().unwrap());
         let home = home_dir.path().to_path_buf();
         let gate = Arc::new(EmbedGate::default());

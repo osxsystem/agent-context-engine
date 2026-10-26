@@ -640,7 +640,7 @@ mod tests {
         let intent = QueryIntent::of(&["Modal usages"], &QueryFilters::default());
 
         for roots in [["/p", "/p/tests/app"], ["/p/tests/app", "/p"]] {
-            let weight = rank_weight(&chunk(file, "x", 0.5), &roots, intent);
+            let weight = rank_weight(&chunk(file, "jest.mock('./a');", 0.5), &roots, intent);
 
             assert_eq!(weight, 1.0, "{roots:?}");
         }

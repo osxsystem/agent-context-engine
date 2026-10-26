@@ -27,8 +27,10 @@ pub fn is_test_path(rel: &str) -> bool {
 }
 
 /// Repo-relative, `/`-separated path of `file` under the longest matching root of
-/// `repos`, compared case-insensitively. When no root contains `file`, only the
-/// file name is returned.
+/// `repos`, compared case-insensitively. Absolute paths must not reach the test-path
+/// check: a repo that lives under a `test/` directory would otherwise match on every
+/// chunk. When no root contains `file`, only the file name is returned, so no
+/// directory segment can produce a false positive.
 pub fn repo_relative_in(file: &str, repos: &[&str]) -> String {
     let file = file.replace('\\', "/");
     repos

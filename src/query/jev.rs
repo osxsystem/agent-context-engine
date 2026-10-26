@@ -242,6 +242,7 @@ impl Reranker for JevReranker {
 
         let (relevance, replies): (Vec<f64>, Vec<Value>) = answers.into_iter().unzip();
         let mut reranked_indices: Vec<usize> = (0..n).collect();
+        // Stable: equal probabilities keep the weighted merge order.
         reranked_indices.sort_by(|&a, &b| relevance[b].total_cmp(&relevance[a]));
         // Selections align with the ranked order, as the engine reads them.
         let line_selections = reranked_indices

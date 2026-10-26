@@ -411,9 +411,11 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
 }
 
 /// Merge output blocks from the same file whose line ranges overlap or are
-/// adjacent (next.line_start <= current.line_end + 1). Merged content is
-/// re-read from the filesystem; if the read fails, original content strings
-/// are concatenated with line-number dedup.
+/// adjacent (next.line_start <= current.line_end + 1) and that list the same
+/// identical copies elsewhere. A copy note describes its own lines only, so
+/// blocks with different notes stay apart. Merged content is re-read from the
+/// filesystem; if the read fails, original content strings are concatenated
+/// with line-number dedup. Every block leaves with its header rebuilt.
 ///
 /// Preserves first-occurrence position: the merged block occupies the slot of
 /// the earliest block in its file group. Blocks from different files pass
@@ -432,7 +434,9 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
     // Group by normalized file key. Collect (original_index, block).
     let mut by_file: std::collections::HashMap<String, Vec<(usize, OutputBlock)>> =
         std::collections::HashMap::new();
-    for (i, block) in blocks.into_iter().enumerate() {
+    for (i, mut block) in blocks.into_iter().enumerate() {
+        block.duplicates.sort();
+        block.duplicates.dedup();
         let key = normalize_key(&block.file);
         by_file.entry(key).or_default().push((i, block));
     }
@@ -451,7 +455,8 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
 
         for (orig_idx, mut next) in group {
             if let Some((min_idx, current, originals)) = merged.last_mut() {
-                if next.line_start <= current.line_end + 1 {
+                if next.line_start <= current.line_end + 1 && next.duplicates == current.duplicates
+                {
                     current.line_end = current.line_end.max(next.line_end);
                     *min_idx = (*min_idx).min(orig_idx);
                     // Combine caller/callee stats: the two merged blocks usually
@@ -474,7 +479,6 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                     // Carry the absorbed block's symbols so the grep hint can still
                     // name them; the block itself is gone after this merge.
                     current.symbols.append(&mut next.symbols);
-                    current.duplicates.append(&mut next.duplicates);
                     originals.push(next.content);
                 } else {
                     let content_snapshot = next.content.clone();
@@ -503,8 +507,6 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                     }
                 }
             }
-            block.duplicates.sort();
-            block.duplicates.dedup();
             block.header = output_header(block);
         }
 
@@ -1362,23 +1364,19 @@ async fn do_query(
                 .results
                 .iter()
                 .zip(hint_symbols)
-                .map(|(r, symbols)| {
-                    let mut block = OutputBlock {
-                        header: String::new(),
-                        content: r.content.clone(),
-                        file: r.file.clone(),
-                        line_start: r.line_start,
-                        line_end: r.line_end,
-                        callers: r.callers,
-                        caller_files: r.caller_files,
-                        caller_names: r.caller_names.clone(),
-                        callee_names: r.callee_names.clone(),
-                        callees: r.callees,
-                        symbols,
-                        duplicates: r.duplicates.clone(),
-                    };
-                    block.header = output_header(&block);
-                    block
+                .map(|(r, symbols)| OutputBlock {
+                    content: r.content.clone(),
+                    file: r.file.clone(),
+                    line_start: r.line_start,
+                    line_end: r.line_end,
+                    callers: r.callers,
+                    caller_files: r.caller_files,
+                    caller_names: r.caller_names.clone(),
+                    callee_names: r.callee_names.clone(),
+                    callees: r.callees,
+                    symbols,
+                    duplicates: r.duplicates.clone(),
+                    ..Default::default()
                 })
                 .collect();
             let blocks = merge_overlapping_blocks(blocks);

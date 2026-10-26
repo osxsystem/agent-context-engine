@@ -30,14 +30,15 @@ impl MergeChunk {
 ///
 /// Steps (as specified):
 /// 1. Dedup by (file, line_start, line_end) — keep highest score.
-/// 2. Collapse chunks whose content is identical across files — keep the best one
-///    and record the other files on it.
+/// 2. Collapse chunks whose content is identical across files — keep the best
+///    one and record the other files on it.
 /// 3. Group by file.
 /// 4. Sort within each group by line_start ASC.
 /// 5. Merge pass: merge when next.line_start <= current.line_end + 2 (gap ≤ 1),
-///    capping merged range at 60 lines.
+///    capping merged range at 60 lines. Chunks with different recorded copies
+///    never merge, so a copy note only ever describes its own lines.
 /// 6. Drop contained: within each file group, sort by width DESC, skip any chunk
-///    fully inside a wider one.
+///    fully inside a wider one, unless it carries recorded copies.
 /// 7. Collect all groups, sort by score DESC, cap to top_k.
 pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
     if chunks.is_empty() {
@@ -58,7 +59,8 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
             .or_insert(chunk);
     }
 
-    // Before the merge pass concatenates neighbour content, so the key sees one chunk's own text.
+    // Step 2: runs before the merge pass concatenates neighbour content,
+    // so the key sees one chunk's own text.
     let collapsed = {
         let mut deduped: Vec<MergeChunk> = dedup_map.into_values().collect();
         deduped.sort_unstable_by(|a, b| {
@@ -87,7 +89,8 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         for next in file_chunks {
             if let Some(current) = merged.last_mut() {
                 // Merge condition: next starts within gap of 1 line from current end.
-                if next.line_start <= current.line_end + 2 {
+                if next.line_start <= current.line_end + 2 && next.duplicates == current.duplicates
+                {
                     let new_end = current.line_end.max(next.line_end);
                     let new_start = current.line_start;
                     // Cap at 60 lines.
@@ -127,9 +130,6 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
                         if current.symbol_kind.is_none() && next.symbol_kind.is_some() {
                             current.symbol_kind = next.symbol_kind;
                         }
-                        current.duplicates.extend(next.duplicates);
-                        current.duplicates.sort();
-                        current.duplicates.dedup();
                     }
                 } else {
                     merged.push(next);
@@ -148,11 +148,12 @@ pub fn merge_chunks(chunks: Vec<MergeChunk>, top_k: usize) -> Vec<MergeChunk> {
         });
         let mut survivors: Vec<MergeChunk> = Vec::new();
         for candidate in merged {
-            let contained = survivors.iter().any(|s| {
-                s.file == candidate.file
-                    && s.line_start <= candidate.line_start
-                    && s.line_end >= candidate.line_end
-            });
+            let contained = candidate.duplicates.is_empty()
+                && survivors.iter().any(|s| {
+                    s.file == candidate.file
+                        && s.line_start <= candidate.line_start
+                        && s.line_end >= candidate.line_end
+                });
             if !contained {
                 survivors.push(candidate);
             }

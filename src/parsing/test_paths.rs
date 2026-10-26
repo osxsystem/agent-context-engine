@@ -26,6 +26,32 @@ pub fn is_test_path(rel: &str) -> bool {
     in_test_dir || is_test_file_name(file)
 }
 
+/// Repo-relative, `/`-separated path of `file` under the longest matching root of
+/// `repos`, compared case-insensitively. When no root contains `file`, only the
+/// file name is returned.
+pub fn repo_relative_in(file: &str, repos: &[&str]) -> String {
+    let file = file.replace('\\', "/");
+    repos
+        .iter()
+        .filter_map(|repo| strip_repo(&file, repo))
+        .min_by_key(|rel| rel.len())
+        .unwrap_or_else(|| file.rsplit('/').next().unwrap_or("").to_string())
+}
+
+pub fn repo_relative(file: &str, repo: &str) -> String {
+    repo_relative_in(file, &[repo])
+}
+
+fn strip_repo(file: &str, repo: &str) -> Option<String> {
+    let repo = repo.replace('\\', "/");
+    let repo = repo.trim_end_matches('/');
+    let under_repo = file.len() > repo.len()
+        && file.is_char_boundary(repo.len())
+        && file[..repo.len()].eq_ignore_ascii_case(repo)
+        && file.as_bytes()[repo.len()] == b'/';
+    under_repo.then(|| file[repo.len() + 1..].to_string())
+}
+
 fn is_test_file_name(file: &str) -> bool {
     let Some((stem, ext)) = file.rsplit_once('.') else {
         return false;

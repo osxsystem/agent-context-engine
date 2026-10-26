@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use crate::parsing::test_paths::is_test_path;
-use crate::path_in_repo;
+use crate::parsing::test_paths::{is_test_path, repo_relative_in};
 use crate::query::filters::QueryFilters;
 use crate::query::merger::{MergeChunk, merge_weighted};
 
@@ -66,12 +65,20 @@ struct QueryIntent {
 }
 
 impl QueryIntent {
-    fn of(query_text: &str, filters: &QueryFilters) -> Self {
-        let texts =
-            || std::iter::once(query_text).chain(filters.path_filters.iter().map(String::as_str));
+    fn of(query_texts: &[&str], filters: &QueryFilters) -> Self {
+        let texts = || {
+            query_texts
+                .iter()
+                .copied()
+                .chain(filters.path_filters.iter().map(String::as_str))
+        };
+        let style_language = filters
+            .languages
+            .iter()
+            .any(|l| STYLE_EXTENSIONS.contains(&l.to_ascii_lowercase().as_str()));
         Self {
             tests: texts().any(|t| mentions(t, TEST_WORDS)),
-            styles: texts().any(|t| mentions(t, STYLE_WORDS)),
+            styles: style_language || texts().any(|t| mentions(t, STYLE_WORDS)),
         }
     }
 
@@ -89,20 +96,8 @@ fn mentions(text: &str, words: &[&str]) -> bool {
         .any(|token| words.iter().any(|w| token.eq_ignore_ascii_case(w)))
 }
 
-fn repo_relative_or_file_name(file: &str, repo_roots: &[&str]) -> String {
-    let owner = repo_roots.iter().find(|root| path_in_repo(file, root));
-    let rel = match owner {
-        Some(root) => {
-            let root = root.trim_end_matches(['/', '\\']);
-            &file[root.len()..]
-        }
-        None => file.rsplit(['/', '\\']).next().unwrap_or(""),
-    };
-    rel.trim_start_matches(['/', '\\']).replace('\\', "/")
-}
-
 fn rank_weight(chunk: &MergeChunk, repo_roots: &[&str], intent: QueryIntent) -> f32 {
-    let rel_path = repo_relative_or_file_name(&chunk.file, repo_roots);
+    let rel_path = repo_relative_in(&chunk.file, repo_roots);
     ChunkClass::ALL
         .into_iter()
         .filter(|class| !intent.asks_for(*class) && class.matches(&rel_path, &chunk.content))
@@ -120,7 +115,7 @@ pub fn weighted_merge(
     repo_roots: &[&str],
     top_k: usize,
 ) -> Vec<MergeChunk> {
-    let intent = QueryIntent::of(query_texts.last().copied().unwrap_or(""), filters);
+    let intent = QueryIntent::of(query_texts, filters);
     let weighted = chunks
         .into_iter()
         .map(|chunk| {
@@ -132,123 +127,158 @@ pub fn weighted_merge(
 }
 
 fn is_import_only(content: &str) -> bool {
-    let mut statement: Option<Statement> = None;
+    let mut cursor = Cursor {
+        tokens: tokenize(content),
+        pos: 0,
+    };
     let mut seen = false;
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-        if statement.is_none() {
-            if line.starts_with("/*") || line.starts_with('*') {
-                continue;
+    while let Some(token) = cursor.next() {
+        let is_directive = matches!(token.kind, Tok::Str(s) if DIRECTIVES.contains(&s));
+        let ok = match token.kind {
+            Tok::Punct(';') => continue,
+            Tok::Str(_) if is_directive && !seen => cursor.ends_statement(),
+            Tok::Word("import") => cursor.module_clause(),
+            Tok::Word("export") => {
+                cursor.take(Tok::Word("type"));
+                matches!(cursor.peek(), Some(Tok::Punct('{' | '*'))) && cursor.module_clause()
             }
-            let Some(kind) = StatementKind::starting(line) else {
-                return false;
-            };
-            statement = Some(Statement {
-                kind,
-                depth: 0,
-                quoted: false,
-            });
-        }
-        let open = statement.as_mut().expect("set above");
-        let scanned = scan(line);
-        open.depth += scanned.bracket_delta;
-        let last_quote_end = scanned.last_quote_end;
-        open.quoted |= last_quote_end.is_some();
-        if open.depth < 0
-            || (open.depth == 0 && !open.quoted && open.kind == StatementKind::ReExport)
-        {
+            Tok::Word("const" | "let" | "var") => cursor.binding_then_require(),
+            Tok::Word("require") => cursor.require_call(),
+            _ => false,
+        };
+        if !ok {
             return false;
         }
-        if open.depth == 0 && open.quoted {
-            if let Some(end) = last_quote_end {
-                let closer = if open.kind == StatementKind::Require {
-                    ')'
-                } else {
-                    ';'
-                };
-                let rest = line[end..]
-                    .trim_start_matches(|c: char| c == closer || c == ';' || c.is_whitespace());
-                if !(rest.is_empty() || rest.starts_with("//") || rest.starts_with("/*")) {
-                    return false;
-                }
-            }
-            statement = None;
-            seen = true;
-        }
+        seen |= !is_directive;
     }
-    seen || statement.is_some()
+    seen
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatementKind {
-    Import,
-    ReExport,
-    Require,
+const DIRECTIVES: &[&str] = &["use client", "use server", "use strict"];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tok<'a> {
+    Word(&'a str),
+    Str(&'a str),
+    Punct(char),
 }
 
-struct Statement {
-    kind: StatementKind,
-    depth: i32,
-    quoted: bool,
+struct Token<'a> {
+    kind: Tok<'a>,
+    after_newline: bool,
 }
 
-impl StatementKind {
-    fn starting(line: &str) -> Option<Self> {
-        if let Some(rest) = line.strip_prefix("import") {
-            let starts_clause =
-                rest.starts_with(|c: char| c.is_whitespace() || "{*'\"".contains(c));
-            return starts_clause.then_some(Self::Import);
-        }
-        if let Some(rest) = line.strip_prefix("export") {
-            let rest = rest.trim_start();
-            let rest = rest.strip_prefix("type ").map_or(rest, str::trim_start);
-            return (rest.starts_with('{') || rest.starts_with('*')).then_some(Self::ReExport);
-        }
-        let after_binding = ["const ", "let ", "var "]
-            .iter()
-            .find_map(|kw| line.strip_prefix(kw))
-            .map_or(line, |rest| {
-                rest.split_once('=').map_or("", |(_, rhs)| rhs.trim_start())
+fn tokenize(src: &str) -> Vec<Token<'_>> {
+    let mut tokens = Vec::new();
+    let mut after_newline = false;
+    let mut rest = src;
+    while let Some(c) = rest.chars().next() {
+        let (len, kind) = if rest.starts_with("//") {
+            (rest.find('\n').unwrap_or(rest.len()), None)
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            let len = comment.find("*/").map_or(rest.len(), |i| i + 4);
+            after_newline |= rest[..len].contains('\n');
+            (len, None)
+        } else if matches!(c, '\'' | '"' | '`') {
+            let mut escaped = false;
+            let close = rest.char_indices().skip(1).find(|&(_, ch)| {
+                let closes = !escaped && ch == c;
+                escaped = !escaped && ch == '\\';
+                closes
             });
-        after_binding
-            .starts_with("require(")
-            .then_some(Self::Require)
-    }
-}
-
-struct Scanned {
-    bracket_delta: i32,
-    last_quote_end: Option<usize>,
-}
-
-fn scan(line: &str) -> Scanned {
-    let mut quote: Option<char> = None;
-    let mut scanned = Scanned {
-        bracket_delta: 0,
-        last_quote_end: None,
-    };
-    let mut prev = '\0';
-    for (i, c) in line.char_indices() {
-        match quote {
-            Some(q) if c == q => {
-                quote = None;
-                scanned.last_quote_end = Some(i + c.len_utf8());
-            }
-            Some(_) => {}
-            None => match c {
-                '\'' | '"' | '`' => quote = Some(c),
-                '(' | '[' | '{' => scanned.bracket_delta += 1,
-                ')' | ']' | '}' => scanned.bracket_delta -= 1,
-                '/' if prev == '/' => break,
-                _ => {}
-            },
+            let len = close.map_or(rest.len(), |(i, _)| i + 1);
+            let body = &rest[1..len];
+            (len, Some(Tok::Str(body.strip_suffix(c).unwrap_or(body))))
+        } else if c.is_alphanumeric() || c == '_' || c == '$' {
+            let len = rest
+                .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+                .unwrap_or(rest.len());
+            (len, Some(Tok::Word(&rest[..len])))
+        } else if c.is_whitespace() {
+            after_newline |= c == '\n';
+            (c.len_utf8(), None)
+        } else {
+            (c.len_utf8(), Some(Tok::Punct(c)))
+        };
+        if let Some(kind) = kind {
+            tokens.push(Token {
+                kind,
+                after_newline: std::mem::take(&mut after_newline),
+            });
         }
-        prev = c;
+        rest = &rest[len..];
     }
-    scanned
+    tokens
+}
+
+struct Cursor<'a> {
+    tokens: Vec<Token<'a>>,
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn peek(&self) -> Option<Tok<'a>> {
+        self.tokens.get(self.pos).map(|t| t.kind)
+    }
+
+    fn next(&mut self) -> Option<&Token<'a>> {
+        self.pos += 1;
+        self.tokens.get(self.pos - 1)
+    }
+
+    fn take(&mut self, want: Tok) -> bool {
+        let found = self.peek() == Some(want);
+        self.pos += usize::from(found);
+        found
+    }
+
+    fn ends_statement(&mut self) -> bool {
+        match self.tokens.get(self.pos) {
+            Some(t) if t.kind == Tok::Punct(';') => {
+                self.pos += 1;
+                true
+            }
+            Some(t) => t.after_newline,
+            None => true,
+        }
+    }
+
+    fn module_clause(&mut self) -> bool {
+        let mut in_braces = false;
+        while let Some(kind) = self.next().map(|t| t.kind) {
+            match (kind, in_braces) {
+                (Tok::Str(_), false) => return self.ends_statement(),
+                (Tok::Punct('{'), false) => in_braces = true,
+                (Tok::Punct('}'), true) => {
+                    in_braces = false;
+                    if !matches!(self.peek(), None | Some(Tok::Word("from"))) {
+                        return false;
+                    }
+                }
+                (Tok::Word(_) | Tok::Str(_) | Tok::Punct(',' | '*'), _) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn binding_then_require(&mut self) -> bool {
+        loop {
+            match self.next().map(|t| t.kind) {
+                Some(Tok::Punct('=')) => break,
+                Some(Tok::Word(_) | Tok::Punct(',' | ':' | '{' | '}' | '[' | ']')) => {}
+                _ => return false,
+            }
+        }
+        self.take(Tok::Word("require")) && self.require_call()
+    }
+
+    fn require_call(&mut self) -> bool {
+        self.take(Tok::Punct('('))
+            && matches!(self.next().map(|t| t.kind), Some(Tok::Str(_)))
+            && self.take(Tok::Punct(')'))
+            && self.ends_statement()
+    }
 }
 
 #[cfg(test)]
@@ -403,7 +433,7 @@ mod tests {
     #[test]
     fn query_words_match_whole_words_only() {
         let intent = |q: &str| {
-            let i = QueryIntent::of(q, &QueryFilters::default());
+            let i = QueryIntent::of(&[q], &QueryFilters::default());
             (i.tests, i.styles)
         };
 
@@ -421,22 +451,19 @@ mod tests {
         let roots = ["/home/me/tests/app", "/other"];
 
         assert_eq!(
-            repo_relative_or_file_name("/home/me/tests/app/src/a.rs", &roots),
+            repo_relative_in("/home/me/tests/app/src/a.rs", &roots),
             "src/a.rs"
         );
+        assert_eq!(repo_relative_in("/elsewhere/tests/x.rs", &roots), "x.rs");
         assert_eq!(
-            repo_relative_or_file_name("/elsewhere/tests/x.rs", &roots),
-            "x.rs"
-        );
-        assert_eq!(
-            repo_relative_or_file_name(r"/other\src\a.rs", &roots),
+            repo_relative_in(r"/other\src\a.rs", &roots),
             "src/a.rs",
             "backslash separators are normalised"
         );
     }
 
     fn weight_of(file: &str, content: &str) -> f32 {
-        let intent = QueryIntent::of("Modal usages", &QueryFilters::default());
+        let intent = QueryIntent::of(&["Modal usages"], &QueryFilters::default());
         rank_weight(&chunk(file, content, 0.5), &[REPO], intent)
     }
 
@@ -506,6 +533,13 @@ mod tests {
         assert!(!import_only(
             "jest.mock('@components/modal', () => () => null);"
         ));
+    }
+
+    #[test]
+    fn quotes_and_comments_do_not_confuse_the_scan() {
+        assert!(import_only(r"import a from 'it\'s';"));
+        assert!(import_only("/* don't */ import a from 'a'; // it's"));
+        assert!(!import_only("import a from 'a';\n/* x */ run('b');"));
     }
 
     #[test]
@@ -583,7 +617,7 @@ mod tests {
     #[test]
     fn repo_root_matching_ignores_case() {
         let weight = |file: &str| {
-            let intent = QueryIntent::of("Modal usages", &QueryFilters::default());
+            let intent = QueryIntent::of(&["Modal usages"], &QueryFilters::default());
             rank_weight(&chunk(file, "x", 0.5), &["/HOME/ME/APP"], intent)
         };
 
@@ -594,7 +628,7 @@ mod tests {
     #[test]
     fn a_repo_nested_under_another_repos_tests_dir_is_judged_against_its_own_root() {
         let file = "/p/tests/app/src/a.js";
-        let intent = QueryIntent::of("Modal usages", &QueryFilters::default());
+        let intent = QueryIntent::of(&["Modal usages"], &QueryFilters::default());
 
         for roots in [["/p", "/p/tests/app"], ["/p/tests/app", "/p"]] {
             let weight = rank_weight(&chunk(file, "x", 0.5), &roots, intent);

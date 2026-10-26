@@ -769,7 +769,8 @@ async fn rerank_single_shot<R: reranker::Reranker>(
 /// into rerank because it has no `llm_client` and no rerank call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sub_query(
-    query: &str,
+    user_query: &str,
+    agent_query: &str,
     top_k: usize,
     repo_filter: &str,
     filters: &crate::query::filters::QueryFilters,
@@ -780,7 +781,7 @@ pub(crate) async fn run_sub_query(
     graph_mode: QueryGraphMode,
     class: Option<ScopeFilter>,
 ) -> Result<Vec<MergeChunk>> {
-    let embedding = voyage_client.embed_query(query).await?;
+    let embedding = voyage_client.embed_query(agent_query).await?;
     if embedding.is_empty() {
         bail!("embed_query returned an empty vector");
     }
@@ -851,7 +852,7 @@ pub(crate) async fn run_sub_query(
 
     Ok(weighted_merge(
         all_chunks,
-        &[query],
+        &[user_query, agent_query],
         filters,
         &[repo_filter],
         top_k,

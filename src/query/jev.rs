@@ -37,7 +37,7 @@ pub const MODEL: &str = "jev-latest";
 pub const MAX_CONCURRENT_REQUESTS: usize = 8;
 
 /// The whole fan-out must finish within this, or the query degrades to
-/// similarity order. It also bounds a client that failed to build with its
+/// weighted merge order. It also bounds a client that failed to build with its
 /// per-request timeouts.
 pub const RERANK_DEADLINE: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -242,7 +242,6 @@ impl Reranker for JevReranker {
 
         let (relevance, replies): (Vec<f64>, Vec<Value>) = answers.into_iter().unzip();
         let mut reranked_indices: Vec<usize> = (0..n).collect();
-        // Stable: equal probabilities keep their similarity order.
         reranked_indices.sort_by(|&a, &b| relevance[b].total_cmp(&relevance[a]));
         // Selections align with the ranked order, as the engine reads them.
         let line_selections = reranked_indices

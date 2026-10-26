@@ -37,6 +37,7 @@ pub use progress::{MCP_PROGRESS_HEARTBEAT, with_progress_heartbeat};
 use crate::config::Settings;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
+use crate::parsing::test_paths::repo_relative;
 use crate::query::engine::QueryGraphMode;
 use crate::query::filters::QueryFilters;
 use crate::query::reranker::RerankProvider;
@@ -93,24 +94,6 @@ fn is_greppable_symbol(name: &str) -> bool {
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Repo-relative, `/`-separated view of `file`. Absolute paths MUST NOT reach the
-/// test-path check: a repo that lives under a `test/` directory would otherwise lose
-/// its hint on every query. When `file` is not under `repo` (should not happen), only
-/// the file name is kept so no directory segment can produce a false positive.
-fn repo_relative(file: &str, repo: &str) -> String {
-    let file = file.replace('\\', "/");
-    let repo = repo.replace('\\', "/");
-    let repo = repo.trim_end_matches('/');
-    if file.len() > repo.len()
-        && file.is_char_boundary(repo.len())
-        && file[..repo.len()].eq_ignore_ascii_case(repo)
-        && file.as_bytes()[repo.len()] == b'/'
-    {
-        return file[repo.len() + 1..].to_string();
-    }
-    file.rsplit('/').next().unwrap_or("").to_string()
 }
 
 /// The own symbol of a result, if it is worth grepping for. Dropped: modules,

@@ -44,6 +44,15 @@ pub struct ProxyCodebaseRetrievalArgs {
     /// Full path to the workspace/repository to search. Selects which worker
     /// handles the call.
     pub workspace_full_path: String,
+    /// Optional: filter results to specific symbol kinds (e.g. ["function", "class"]).
+    #[serde(default)]
+    pub filter_kind: Option<Vec<String>>,
+    /// Optional: filter results to specific languages (e.g. ["rust", "typescript"]).
+    #[serde(default)]
+    pub filter_lang: Option<Vec<String>>,
+    /// Optional: filter results to files matching this path substring.
+    #[serde(default)]
+    pub filter_path: Option<String>,
     #[doc = include_str!("../prompts/mcp_scope_param.txt")]
     #[serde(default)]
     pub scope: Option<crate::vector::Scope>,
@@ -196,6 +205,9 @@ fn codebase_worker_body(args: &ProxyCodebaseRetrievalArgs) -> serde_json::Value 
     json!({
         "information_request": args.information_request,
         "workspace_full_path": args.workspace_full_path,
+        "filter_kind": args.filter_kind,
+        "filter_lang": args.filter_lang,
+        "filter_path": args.filter_path,
         "scope": args.scope.unwrap_or_default(),
     })
 }
@@ -219,6 +231,9 @@ mod tests {
         ProxyCodebaseRetrievalArgs {
             information_request: "where is auth".to_string(),
             workspace_full_path: "/repo".to_string(),
+            filter_kind: None,
+            filter_lang: None,
+            filter_path: None,
             scope,
         }
     }

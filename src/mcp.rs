@@ -711,6 +711,15 @@ impl ServerHandler for McpHandler {
 pub struct RepoCodebaseRetrievalArgs {
     /// Natural-language description of the code or information you are looking for.
     pub information_request: String,
+    /// Optional: filter results to specific symbol kinds (e.g. ["function", "class"]).
+    #[serde(default)]
+    pub filter_kind: Option<Vec<String>>,
+    /// Optional: filter results to specific languages (e.g. ["rust", "typescript"]).
+    #[serde(default)]
+    pub filter_lang: Option<Vec<String>>,
+    /// Optional: filter results to files matching this path substring.
+    #[serde(default)]
+    pub filter_path: Option<String>,
     #[doc = include_str!("prompts/mcp_scope_param.txt")]
     #[serde(default)]
     pub scope: Option<crate::vector::Scope>,
@@ -775,6 +784,11 @@ impl RepoMcpHandler {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let settings = self.settings.read().await.clone();
+        let filters = mcp_query_filters(
+            args.filter_kind.as_deref(),
+            args.filter_lang.as_deref(),
+            args.filter_path.as_deref(),
+        );
         let text = with_progress_heartbeat(
             ctx.peer,
             &ctx.meta,
@@ -787,7 +801,7 @@ impl RepoMcpHandler {
                 &self.repo_dbs,
                 &settings,
                 &args.information_request,
-                None,
+                filters,
                 &self.repo_path,
                 args.scope.unwrap_or_default(),
             ),
@@ -1174,7 +1188,7 @@ fn note_both_scopes_searched(
 /// Structured MCP filter params as engine filters, or `None` when none are set.
 /// Kinds and languages are lowercased the way the inline `kind:`/`lang:` parser
 /// lowercases them, so both routes narrow candidates identically.
-fn mcp_query_filters(
+pub(crate) fn mcp_query_filters(
     filter_kind: Option<&[String]>,
     filter_lang: Option<&[String]>,
     filter_path: Option<&str>,

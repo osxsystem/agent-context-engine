@@ -163,3 +163,133 @@ async fn global_mcp_preserves_worktree_scope_and_progress() {
         "linked checkout must not register another index"
     );
 }
+
+async fn mcp_text(
+    client: &Client,
+    endpoint: &str,
+    session: &str,
+    id: u64,
+    arguments: Value,
+) -> String {
+    let wire = client
+        .post(endpoint)
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session)
+        .header("mcp-protocol-version", "2024-11-05")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "codebase-retrieval", "arguments": arguments}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let message: Value = wire
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("data:")
+                .and_then(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        })
+        .find(|m| m["id"] == id)
+        .unwrap_or_else(|| panic!("no tool result in: {wire}"));
+    message["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in: {message}"))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn global_mcp_forwards_structured_filters_to_the_worker() {
+    let gateway = Router::new().route(
+        "/v1/embeddings",
+        post(|Json(body): Json<Value>| async move {
+            let inputs = body["input"].as_array().unwrap();
+            let data: Vec<Value> = (0..inputs.len())
+                .map(|i| json!({"index": i, "embedding": [1.0, 0.0, 0.0, 0.0]}))
+                .collect();
+            Json(json!({"data": data}))
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, gateway).await.unwrap() });
+
+    let home = TempDir::new().unwrap();
+    let repos = TempDir::new().unwrap();
+    let main = repos.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    let main = std::fs::canonicalize(main).unwrap();
+    std::fs::write(
+        main.join("probe.rs"),
+        "pub fn filter_probe() -> u32 { 42 }\n",
+    )
+    .unwrap();
+    let repo = context_engine_rs::store::normalize_repo_path(main.to_str().unwrap());
+    let mut settings = Settings {
+        repos: vec![repo.clone()],
+        machine_id: Some("filter-forwarding-test".to_owned()),
+        worker_idle_secs: 2,
+        mcp_index_wait_secs: 45,
+        ..Settings::default()
+    };
+    settings.embedding.api_keys = vec!["local-test-key".to_owned()];
+    settings.embedding.model = "filter-test-model".to_owned();
+    settings.embedding.voyage_base_url = Some(format!("http://{gateway_addr}/v1"));
+    write_settings_atomic(&config_path(home.path()), &settings).unwrap();
+    let addr = e2e_common::start_router(&home).await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let endpoint = format!("http://{addr}/mcp");
+    let initialized = client
+        .post(&endpoint)
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "filter-test", "version": "1"}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(initialized.status().is_success());
+    let session = initialized.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    initialized.text().await.unwrap();
+
+    let call = |id: u64, extra: Value| {
+        let mut arguments = json!({
+            "information_request": "where is filter_probe defined",
+            "workspace_full_path": repo,
+        });
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        mcp_text(&client, &endpoint, &session, id, arguments)
+    };
+
+    let control = call(2, json!({})).await;
+    assert!(
+        control.contains("probe.rs#L"),
+        "unfiltered control: {control}"
+    );
+
+    let matching = call(3, json!({"filter_path": "probe.rs"})).await;
+    assert!(
+        matching.contains("probe.rs#L"),
+        "matching filter: {matching}"
+    );
+
+    let missing = call(4, json!({"filter_path": "missing-directory/"})).await;
+    assert!(
+        missing.contains("No results found"),
+        "filter_path must reach the worker: {missing}"
+    );
+    assert!(!missing.contains("probe.rs#L"), "{missing}");
+}

@@ -235,6 +235,38 @@ mod tests {
     fn worker_body_defaults_an_omitted_scope_to_code() {
         assert_eq!(codebase_worker_body(&args(None))["scope"], "code");
     }
+
+    fn args_from_json(extra: serde_json::Value) -> ProxyCodebaseRetrievalArgs {
+        let mut value = json!({
+            "information_request": "where is auth",
+            "workspace_full_path": "/repo",
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).expect("valid args")
+    }
+
+    #[test]
+    fn worker_body_forwards_all_three_filters() {
+        let body = codebase_worker_body(&args_from_json(json!({
+            "filter_kind": ["function"],
+            "filter_lang": ["rust"],
+            "filter_path": "src/router/",
+        })));
+        assert_eq!(body["filter_kind"], json!(["function"]));
+        assert_eq!(body["filter_lang"], json!(["rust"]));
+        assert_eq!(body["filter_path"], "src/router/");
+    }
+
+    #[test]
+    fn worker_body_sends_null_for_omitted_filters() {
+        let body = codebase_worker_body(&args_from_json(json!({})));
+        for name in ["filter_kind", "filter_lang", "filter_path"] {
+            assert!(body[name].is_null(), "{name}: {body}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +289,16 @@ mod served_schema_tests {
         );
         let required = schema["required"].as_array().cloned().unwrap_or_default();
         assert!(!required.iter().any(|r| r == "scope"));
+    }
+
+    #[test]
+    fn proxy_served_tool_schema_exposes_filter_params() {
+        let tool = ProxyMcpHandler::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "codebase-retrieval")
+            .expect("registered");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        crate::mcp::tests::assert_filter_params_exposed("ProxyMcpHandler", &schema);
     }
 }

@@ -76,6 +76,7 @@ done
 [ -n "$LABEL" ] || die "usage: retrieval_bench.sh <label> [repo_path] [options]"
 REPO="${REPO:-$CRATE_DIR}"
 [ -d "$REPO" ] || die "repo path ${REPO} is not a directory"
+REPO="$(cd "$REPO" && pwd)"
 case "$LABEL" in *[!A-Za-z0-9._-]*|"") die "label ${LABEL} must be letters, digits, . _ -" ;; esac
 case "$PORT" in *[!0-9]*|"") die "port ${PORT} is not a number" ;; esac
 
@@ -109,7 +110,12 @@ refuse_live_dir() {
     "${got}/"*) die "--data-dir ${1} resolves to ${got}, which contains the live engine dir ${live}; use a private dir" ;;
   esac
 }
-if [ -n "$DATA_DIR" ]; then refuse_live_dir "$DATA_DIR"; fi
+if [ -n "$DATA_DIR" ]; then
+  case "/${DATA_DIR}/" in
+    */../*) die "--data-dir ${DATA_DIR} contains a '..' segment; pass a path without '..'" ;;
+  esac
+  refuse_live_dir "$DATA_DIR"
+fi
 [ "$PORT" != "6699" ] || die "port 6699 belongs to the live engine"
 
 TMP_ROOT="$(mktemp -d)"
@@ -120,6 +126,7 @@ if [ -z "$DATA_DIR" ]; then
   OWN_DATA_DIR=1
 fi
 mkdir -p "$DATA_DIR"
+DATA_DIR="$(cd "$DATA_DIR" && pwd)"
 if [ -z "$EMBEDDINGS_DIR" ]; then
   EMBEDDINGS_DIR="$(jq -r '.embeddings_dir // empty' "${REAL_CE}/settings.json")"
   EMBEDDINGS_DIR="${EMBEDDINGS_DIR:-${REAL_CE}/embeddings}"
@@ -139,7 +146,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+BUILT_HERE=""
 if [ -z "$SERVER_BIN" ]; then
+  BUILT_HERE=1
   echo "[retrieval_bench] building release binaries ..."
   (cd "$CRATE_DIR" && cargo build --release --locked --bin context-engine-rs --bin chunk_bench)
   TARGET_DIR="${CARGO_TARGET_DIR:-${CRATE_DIR}/target}"
@@ -148,6 +157,8 @@ fi
 BENCH_BIN="${BENCH_BIN:-$(dirname "$SERVER_BIN")/chunk_bench}"
 [ -x "$SERVER_BIN" ] || die "server binary ${SERVER_BIN} is not executable"
 [ -x "$BENCH_BIN" ] || die "chunk_bench binary ${BENCH_BIN} is not executable"
+SERVER_BIN="$(cd "$(dirname "$SERVER_BIN")" && pwd)/$(basename "$SERVER_BIN")"
+BENCH_BIN="$(cd "$(dirname "$BENCH_BIN")" && pwd)/$(basename "$BENCH_BIN")"
 
 # If something already listens on PORT, our server fails to bind but the
 # readiness probe below would still succeed against the stranger, and the run
@@ -205,16 +216,31 @@ set +e
 BENCH_CODE=$?
 set -e
 
-REPRODUCE="scripts/retrieval_bench.sh $(printf '%q ' "$LABEL" "$REPO")--sets $(printf '%q' "$SETS") --top-k ${TOP_K}"
+REPRODUCE="${CRATE_DIR}/scripts/retrieval_bench.sh $(printf '%q ' "$LABEL" "$REPO")--sets $(printf '%q' "$SETS") --top-k ${TOP_K} --port ${PORT}"
 for arm in ${ARMS[@]+"${ARMS[@]}"}; do REPRODUCE+=" --arm $(printf '%q' "$arm")"; done
 [ -n "$OWN_DATA_DIR" ] || REPRODUCE+=" --data-dir $(printf '%q' "$DATA_DIR")"
-[ "$OUT_DIR" = "${CRATE_DIR}/bench-results/retrieval" ] || REPRODUCE="OUT_DIR=$(printf '%q' "$OUT_DIR") ${REPRODUCE}"
-REPRODUCE+=" --server-bin $(printf '%q' "$SERVER_BIN") --bench-bin $(printf '%q' "$BENCH_BIN")"
+[ -z "$NOTE" ] || REPRODUCE+=" --note $(printf '%q' "$NOTE")"
+REPRODUCE+=" --embeddings-dir $(printf '%q' "$EMBEDDINGS_DIR") --server-bin $(printf '%q' "$SERVER_BIN") --bench-bin $(printf '%q' "$BENCH_BIN")"
+REPRODUCE="OUT_DIR=$(printf '%q' "$OUT_DIR") SETTINGS_HOME=$(printf '%q' "$REAL_HOME") ${REPRODUCE}"
+
+# Source commit of the binaries: this checkout's HEAD when the script built them
+# here ("-dirty" when tracked files have uncommitted changes), else the build.json
+# that install writes next to the server binary, else unknown.
+CHECKOUT_COMMIT="$(git -C "$CRATE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [ -n "$BUILT_HERE" ]; then
+  BINARY_COMMIT="$CHECKOUT_COMMIT"
+  if [ "$CHECKOUT_COMMIT" != unknown ] && [ -n "$(git -C "$CRATE_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    BINARY_COMMIT="${CHECKOUT_COMMIT}-dirty"
+  fi
+else
+  BINARY_COMMIT="$(jq -r '.git_commit // empty' "${SERVER_BIN}.build.json" 2>/dev/null || true)"
+  BINARY_COMMIT="${BINARY_COMMIT:-unknown}"
+fi
 
 sha() { if command -v shasum >/dev/null; then shasum -a 256 "$1"; else sha256sum "$1"; fi | cut -d' ' -f1; }
 if [ -f "$OUT_JSON" ]; then
   jq --arg cmd "$REPRODUCE" --arg note "$NOTE" \
-     --arg code_commit "$(git -C "$CRATE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)" \
+     --arg binary_commit "$BINARY_COMMIT" --arg script_commit "$CHECKOUT_COMMIT" \
      --arg corpus_commit "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)" \
      --arg server_bin "$SERVER_BIN" --arg server_sha "$(sha "$SERVER_BIN")" \
      --arg bench_bin "$BENCH_BIN" --arg bench_sha "$(sha "$BENCH_BIN")" \
@@ -223,7 +249,8 @@ if [ -f "$OUT_JSON" ]; then
     .reproduce_cmd = $cmd
     | .provenance = {
         date: $date,
-        code_commit: $code_commit,
+        binary_commit: $binary_commit,
+        script_checkout_commit: $script_commit,
         corpus_commit: $corpus_commit,
         server_bin: {path: $server_bin, sha256: $server_sha},
         bench_bin: {path: $bench_bin, sha256: $bench_sha},

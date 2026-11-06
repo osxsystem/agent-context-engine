@@ -269,7 +269,10 @@ mod tests {
         let mut t = RecallTally::default();
         t.observe("/r/a.rs", (10, 20), &[row("/r/a.rs", 12, 18)]);
         let s = t.finish("t");
-        assert_eq!((s.recall_at_1, s.recall_at_5, s.recall_at_10), (1.0, 1.0, 1.0));
+        assert_eq!(
+            (s.recall_at_1, s.recall_at_5, s.recall_at_10),
+            (1.0, 1.0, 1.0)
+        );
     }
 
     #[test]
@@ -281,7 +284,10 @@ mod tests {
         ranking.push(row("/r/a.rs", 12, 18));
         t.observe("/r/a.rs", (10, 20), &ranking);
         let s = t.finish("t");
-        assert_eq!((s.recall_at_1, s.recall_at_5, s.recall_at_10), (0.0, 0.0, 1.0));
+        assert_eq!(
+            (s.recall_at_1, s.recall_at_5, s.recall_at_10),
+            (0.0, 0.0, 1.0)
+        );
     }
 
     #[test]
@@ -367,7 +373,9 @@ mod tests {
 
     #[test]
     fn lines_at_5_sums_the_first_five_results_and_averages_over_cases() {
-        let five_by_ten: Vec<QueryResultRow> = (0..7).map(|i| row("/r/b.rs", i * 100 + 1, i * 100 + 10)).collect();
+        let five_by_ten: Vec<QueryResultRow> = (0..7)
+            .map(|i| row("/r/b.rs", i * 100 + 1, i * 100 + 10))
+            .collect();
         let t = tally_of(&[five_by_ten, vec![row("/r/b.rs", 1, 4)]]);
         assert!((t.detail().lines_at_5 - (50.0 + 4.0) / 2.0).abs() < 1e-12);
     }
@@ -396,22 +404,57 @@ mod tests {
         use CaseRank::{Hit, Miss};
         let a = [Miss, Hit(1), Hit(3), Miss, Hit(2)];
         let b = [Hit(1), Miss, Hit(2), Miss, Hit(4)];
-        assert_eq!(paired_at(&a, &b, 5), Paired { wins: 1, losses: 1, ties: 3 });
-        assert_eq!(paired_at(&a, &b, 1), Paired { wins: 1, losses: 1, ties: 3 });
+        assert_eq!(
+            paired_at(&a, &b, 5),
+            Paired {
+                wins: 1,
+                losses: 1,
+                ties: 3
+            }
+        );
+        assert_eq!(
+            paired_at(&a, &b, 1),
+            Paired {
+                wins: 1,
+                losses: 1,
+                ties: 3
+            }
+        );
     }
 
     #[test]
     fn paired_tie_counts_neither_a_win_nor_a_loss() {
         use CaseRank::Hit;
         let same = [Hit(1), Hit(4)];
-        assert_eq!(paired_at(&same, &same, 5), Paired { wins: 0, losses: 0, ties: 2 });
+        assert_eq!(
+            paired_at(&same, &same, 5),
+            Paired {
+                wins: 0,
+                losses: 0,
+                ties: 2
+            }
+        );
     }
 
     #[test]
     fn paired_cutoff_decides_what_counts_as_a_hit() {
         use CaseRank::Hit;
-        assert_eq!(paired_at(&[Hit(1)], &[Hit(3)], 1), Paired { wins: 0, losses: 1, ties: 0 });
-        assert_eq!(paired_at(&[Hit(1)], &[Hit(3)], 5), Paired { wins: 0, losses: 0, ties: 1 });
+        assert_eq!(
+            paired_at(&[Hit(1)], &[Hit(3)], 1),
+            Paired {
+                wins: 0,
+                losses: 1,
+                ties: 0
+            }
+        );
+        assert_eq!(
+            paired_at(&[Hit(1)], &[Hit(3)], 5),
+            Paired {
+                wins: 0,
+                losses: 0,
+                ties: 1
+            }
+        );
     }
 
     #[test]

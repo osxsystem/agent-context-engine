@@ -1,4 +1,3 @@
-
 use std::time::Instant;
 
 use serde_json::{Map, Value, json};
@@ -7,8 +6,10 @@ use crate::eval::{
     CaseSet, EvalCase, IDENT_LIMIT, ParaProvenance, derive_doc_set, derive_ident_set,
     derive_mixed_set, derive_para_set, para_provenance,
 };
+use context_engine_rs::parsing::test_paths::repo_relative;
+
 use crate::scoring::{
-    Paired, RankingDetail, RankingScore, RecallTally, lists_differing, paired_at,
+    CaseRank, Paired, RankingDetail, RankingScore, RecallTally, lists_differing, paired_at,
 };
 use crate::{EVAL_LIMIT, QueryOutcome, query_once, warm_up};
 
@@ -28,15 +29,22 @@ impl Arm {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         {
-            return Err(format!("--arm name {name:?} must be letters, digits, _ - ."));
+            return Err(format!(
+                "--arm name {name:?} must be letters, digits, _ - ."
+            ));
         }
         let Value::Object(body) = serde_json::from_str::<Value>(json)
             .map_err(|e| format!("--arm {name}: invalid JSON: {e}"))?
         else {
             return Err(format!("--arm {name}: JSON must be an object"));
         };
-        if let Some(key) = ["query", "repo"].into_iter().find(|k| body.contains_key(*k)) {
-            return Err(format!("--arm {name}: {key:?} belongs to the case, not the arm"));
+        if let Some(key) = ["query", "repo"]
+            .into_iter()
+            .find(|k| body.contains_key(*k))
+        {
+            return Err(format!(
+                "--arm {name}: {key:?} belongs to the case, not the arm"
+            ));
         }
         Ok(Self {
             name: name.to_owned(),
@@ -64,7 +72,11 @@ impl SetGroup {
                 "ident" => Self::Ident,
                 "mixed" => Self::Mixed,
                 "para" => Self::Para,
-                other => return Err(format!("--sets: unknown set {other:?} (doc, ident, mixed, para)")),
+                other => {
+                    return Err(format!(
+                        "--sets: unknown set {other:?} (doc, ident, mixed, para)"
+                    ));
+                }
             };
             if !out.contains(&group) {
                 out.push(group);
@@ -128,7 +140,10 @@ impl ArmRun {
                 self.tally.observe_unscored();
             }
             QueryOutcome::Failed(why) => {
-                eprintln!("[chunk_bench] arm {arm}: query {:?} failed: {why}", case.query);
+                eprintln!(
+                    "[chunk_bench] arm {arm}: query {:?} failed: {why}",
+                    case.query
+                );
                 self.failed += 1;
                 self.tally.observe_unscored();
             }
@@ -141,6 +156,55 @@ struct StaleCase {
     file: String,
     symbol: String,
     line_start: u32,
+}
+
+#[derive(serde::Serialize, Debug, PartialEq)]
+struct ArmRank {
+    arm: String,
+    rank: CaseRank,
+}
+
+/// One scored case: what was asked, the gold span, and where each arm ranked it.
+#[derive(serde::Serialize, Debug, PartialEq)]
+struct CaseReport {
+    set: String,
+    template: Option<String>,
+    query: String,
+    file: String,
+    symbol: String,
+    line_start: u32,
+    line_end: u32,
+    ranks: Vec<ArmRank>,
+}
+
+fn case_reports(
+    set: &CaseSet,
+    repo: &str,
+    arms: &[Arm],
+    details: &[RankingDetail],
+) -> Vec<CaseReport> {
+    let template = set.name.split_once(':').map(|(_, t)| t.to_owned());
+    set.cases
+        .iter()
+        .enumerate()
+        .map(|(i, case)| CaseReport {
+            set: set.name.clone(),
+            template: template.clone(),
+            query: case.query.clone(),
+            file: repo_relative(&case.file, repo),
+            symbol: case.symbol.clone(),
+            line_start: case.line_start,
+            line_end: case.line_end,
+            ranks: arms
+                .iter()
+                .zip(details)
+                .map(|(arm, d)| ArmRank {
+                    arm: arm.name.clone(),
+                    rank: d.ranks[i],
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -172,6 +236,7 @@ struct SetReport {
     stale: Vec<StaleCase>,
     arms: Vec<ArmReport>,
     paired: Option<PairedReport>,
+    case_ranks: Vec<CaseReport>,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -232,6 +297,7 @@ fn score_set(
         }),
         _ => None,
     };
+    let case_ranks = case_reports(set, repo, arms, &details);
     let arm_reports = arms
         .iter()
         .zip(runs)
@@ -258,6 +324,7 @@ fn score_set(
             .collect(),
         arms: arm_reports,
         paired,
+        case_ranks,
     }
 }
 
@@ -291,13 +358,8 @@ pub fn run(
         })
         .collect();
 
-    let total = |pick: fn(&ArmReport) -> u64| {
-        reports
-            .iter()
-            .flat_map(|s| &s.arms)
-            .map(pick)
-            .sum::<u64>()
-    };
+    let total =
+        |pick: fn(&ArmReport) -> u64| reports.iter().flat_map(|s| &s.arms).map(pick).sum::<u64>();
     SetsReport {
         label: label.to_owned(),
         repo: repo.to_owned(),
@@ -427,6 +489,50 @@ mod tests {
         run.record(&case(), "a", QueryOutcome::Warming);
         assert_eq!((run.failed, run.warming), (0, 1));
         assert_eq!(run.tally.observed(), 0);
+    }
+
+    #[test]
+    fn the_report_names_each_case_with_every_arms_rank() {
+        let mut win = RecallTally::default();
+        let mut lose = RecallTally::default();
+        let row = hit_row();
+        win.observe("/r/a.rs", (10, 20), std::slice::from_ref(&row));
+        lose.observe("/r/zzz.rs", (1, 2), std::slice::from_ref(&row));
+        let details = [win.detail(), lose.detail()];
+        let arms = [Arm::parse("base={}").unwrap(), Arm::parse("on={}").unwrap()];
+        let set = CaseSet {
+            name: "mixed:how".into(),
+            cases: vec![case()],
+            stale: Vec::new(),
+        };
+        let cases = case_reports(&set, "/r", &arms, &details);
+        assert_eq!(
+            cases,
+            [CaseReport {
+                set: "mixed:how".into(),
+                template: Some("how".into()),
+                query: "q".into(),
+                file: "a.rs".into(),
+                symbol: "s".into(),
+                line_start: 10,
+                line_end: 20,
+                ranks: vec![
+                    ArmRank {
+                        arm: "base".into(),
+                        rank: CaseRank::Hit(1)
+                    },
+                    ArmRank {
+                        arm: "on".into(),
+                        rank: CaseRank::Miss
+                    },
+                ],
+            }]
+        );
+        let doc = CaseSet {
+            name: "doc".into(),
+            ..set
+        };
+        assert_eq!(case_reports(&doc, "/r", &arms, &details)[0].template, None);
     }
 
     #[test]

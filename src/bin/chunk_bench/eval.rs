@@ -22,7 +22,8 @@ use std::path::Path;
 
 use context_engine_rs::indexing::walker::walk_repo;
 use context_engine_rs::parsing::parse_file;
-use context_engine_rs::parsing::symbols::SymbolKind;
+use context_engine_rs::parsing::symbols::{Symbol, SymbolKind};
+use context_engine_rs::parsing::test_paths::{is_test_path, repo_relative};
 
 /// One retrieval case: ask `query`, expect `symbol` at `file:line_start-line_end`.
 #[derive(Debug, Clone)]
@@ -82,6 +83,7 @@ struct SymbolRef {
     kind: SymbolKind,
     line_start: u32,
     line_end: u32,
+    in_test: bool,
 }
 
 pub fn derive_ident_set(repo: &str, limit: usize) -> CaseSet {
@@ -92,15 +94,64 @@ pub fn derive_ident_set(repo: &str, limit: usize) -> CaseSet {
         };
         let parsed = parse_file(&path, &source);
         let file = path.replace('\\', "/");
-        symbols.extend(parsed.symbols.into_iter().map(|s| SymbolRef {
-            file: file.clone(),
-            name: s.qualified.name,
-            kind: s.kind,
-            line_start: s.line_start,
-            line_end: s.line_end,
-        }));
+        let in_test = test_code_flags(
+            &parsed.symbols,
+            &source,
+            is_test_path(&repo_relative(&file, repo)),
+        );
+        symbols.extend(
+            parsed
+                .symbols
+                .into_iter()
+                .zip(in_test)
+                .map(|(s, in_test)| SymbolRef {
+                    in_test,
+                    file: file.clone(),
+                    name: s.qualified.name,
+                    kind: s.kind,
+                    line_start: s.line_start,
+                    line_end: s.line_end,
+                }),
+        );
     }
     CaseSet::new("ident", sample_evenly(unique_ident_cases(&symbols), limit))
+}
+
+/// Whether each symbol is test code: it sits in a test file, in a `mod tests` or
+/// `#[cfg(test)]` module, or carries `#[test]` itself. The parser emits a Module
+/// symbol per `mod` but drops attributes, so they are read from the source lines.
+fn test_code_flags(symbols: &[Symbol], source: &str, test_file: bool) -> Vec<bool> {
+    let lines: Vec<&str> = source.lines().collect();
+    let test_mods: Vec<(u32, u32)> = symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Module)
+        .filter(|s| {
+            matches!(s.qualified.name.as_str(), "tests" | "test")
+                || has_test_attr(&lines, s.line_start)
+        })
+        .map(|s| (s.line_start, s.line_end))
+        .collect();
+    symbols
+        .iter()
+        .map(|s| {
+            test_file
+                || has_test_attr(&lines, s.line_start)
+                || test_mods
+                    .iter()
+                    .any(|&(a, b)| a <= s.line_start && s.line_end <= b)
+        })
+        .collect()
+}
+
+/// True when the attribute lines directly above the 1-based `line` carry
+/// `#[test]` or `#[cfg(test)]`. Doc comments between the attribute and the item are skipped.
+fn has_test_attr(lines: &[&str], line: u32) -> bool {
+    lines[..(line as usize).saturating_sub(1).min(lines.len())]
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+        .any(|l| l == "#[test]" || l.contains("cfg(test)"))
 }
 
 fn unique_ident_cases(symbols: &[SymbolRef]) -> Vec<EvalCase> {
@@ -120,6 +171,7 @@ fn unique_ident_cases(symbols: &[SymbolRef]) -> Vec<EvalCase> {
                     | SymbolKind::Trait
             )
         })
+        .filter(|s| !s.in_test)
         .filter(|s| occurrences[&s.name.to_lowercase()] == 1)
         .filter(|s| s.name.chars().count() >= MIN_IDENT_CHARS)
         .filter(|s| s.line_end.saturating_sub(s.line_start) + 1 >= MIN_IDENT_LINES)
@@ -196,11 +248,7 @@ pub fn derive_para_set(repo: &str) -> CaseSet {
     })
 }
 
-fn split_stale(
-    cases: Vec<ParaCase>,
-    root: &str,
-    read: impl Fn(&str) -> Option<String>,
-) -> CaseSet {
+fn split_stale(cases: Vec<ParaCase>, root: &str, read: impl Fn(&str) -> Option<String>) -> CaseSet {
     let mut set = CaseSet::new("para", Vec::new());
     for c in cases {
         let path = Path::new(root)
@@ -401,7 +449,10 @@ mod tests {
     #[test]
     fn doc_block_skips_attributes_between_doc_and_symbol() {
         let lines = vec!["/// the description", "#[inline]", "fn thing() {}"];
-        assert_eq!(doc_block_above(&lines, 3).as_deref(), Some("the description"));
+        assert_eq!(
+            doc_block_above(&lines, 3).as_deref(),
+            Some("the description")
+        );
     }
 
     #[test]
@@ -412,9 +463,18 @@ mod tests {
 
     #[test]
     fn name_leaks_are_caught_in_every_spelling() {
-        assert!(leaks_symbol_name("run_retrieval scores the ranking", "run_retrieval"));
-        assert!(leaks_symbol_name("the runretrieval helper", "run_retrieval"));
-        assert!(leaks_symbol_name("we run retrieval over the set", "run_retrieval"));
+        assert!(leaks_symbol_name(
+            "run_retrieval scores the ranking",
+            "run_retrieval"
+        ));
+        assert!(leaks_symbol_name(
+            "the runretrieval helper",
+            "run_retrieval"
+        ));
+        assert!(leaks_symbol_name(
+            "we run retrieval over the set",
+            "run_retrieval"
+        ));
     }
 
     #[test]
@@ -428,7 +488,10 @@ mod tests {
     #[test]
     fn very_short_names_are_never_treated_as_leaks() {
         // "new"/"run" appear in ordinary prose constantly.
-        assert!(!leaks_symbol_name("create a new session for the user", "new"));
+        assert!(!leaks_symbol_name(
+            "create a new session for the user",
+            "new"
+        ));
     }
 
     #[test]
@@ -459,6 +522,7 @@ mod tests {
             kind,
             line_start: start,
             line_end: end,
+            in_test: false,
         }
     }
 
@@ -484,6 +548,71 @@ mod tests {
             sym("c.rs", "WalkerConfig", SymbolKind::Struct, 1, 9),
         ];
         assert_eq!(names(&unique_ident_cases(&symbols)), ["WalkerConfig"]);
+    }
+
+    #[test]
+    fn test_code_is_never_an_ident_case_but_still_blocks_uniqueness() {
+        let mut in_tests = sym("a.rs", "helper_in_tests", SymbolKind::Function, 40, 49);
+        in_tests.in_test = true;
+        let mut shadow = sym("a.rs", "shared_name", SymbolKind::Function, 50, 59);
+        shadow.in_test = true;
+        let symbols = vec![
+            in_tests,
+            shadow,
+            sym("b.rs", "shared_name", SymbolKind::Function, 1, 9),
+            sym("b.rs", "product_api", SymbolKind::Function, 20, 29),
+        ];
+        assert_eq!(names(&unique_ident_cases(&symbols)), ["product_api"]);
+    }
+
+    fn test_flags_by_name(path: &str, source: &str, test_file: bool) -> Vec<(String, bool)> {
+        let parsed = parse_file(path, source);
+        let flags = test_code_flags(&parsed.symbols, source, test_file);
+        parsed
+            .symbols
+            .into_iter()
+            .map(|s| s.qualified.name)
+            .zip(flags)
+            .collect()
+    }
+
+    #[test]
+    fn rust_cfg_test_modules_and_test_attributes_are_test_code() {
+        let source = "\
+pub fn product_api() {
+    let a = 1;
+}
+
+#[cfg(test)]
+mod checks {
+    fn inside_cfg_mod() {
+        let a = 1;
+    }
+}
+
+mod tests {
+    fn inside_tests_mod() {
+        let a = 1;
+    }
+}
+
+#[test]
+fn bare_test_fn() {
+    let a = 1;
+}
+";
+        let flags = test_flags_by_name("lib.rs", source, false);
+        let flag = |n: &str| flags.iter().find(|(name, _)| name == n).unwrap().1;
+        assert!(!flag("product_api"));
+        assert!(flag("inside_cfg_mod"));
+        assert!(flag("inside_tests_mod"));
+        assert!(flag("bare_test_fn"));
+        assert!(
+            test_flags_by_name("tests/it.rs", source, true)
+                .iter()
+                .all(|(_, in_test)| *in_test),
+            "every symbol in a test file is test code"
+        );
     }
 
     #[test]
@@ -527,7 +656,10 @@ mod tests {
         let symbols = vec![sym("src/a.rs", "only_here", SymbolKind::Function, 20, 29)];
         let case = &unique_ident_cases(&symbols)[0];
         assert_eq!(case.query, "only_here");
-        assert_eq!((case.file.as_str(), case.line_start, case.line_end), ("src/a.rs", 20, 29));
+        assert_eq!(
+            (case.file.as_str(), case.line_start, case.line_end),
+            ("src/a.rs", 20, 29)
+        );
     }
 
     #[test]
@@ -543,11 +675,17 @@ mod tests {
             }],
         );
         let sets = derive_mixed_set(&ident);
-        let queries: Vec<_> = sets.iter().map(|s| (s.name.as_str(), s.cases[0].query.as_str())).collect();
+        let queries: Vec<_> = sets
+            .iter()
+            .map(|s| (s.name.as_str(), s.cases[0].query.as_str()))
+            .collect();
         assert_eq!(
             queries,
             [
-                ("mixed:where", "where is merge_weighted defined and what does it do"),
+                (
+                    "mixed:where",
+                    "where is merge_weighted defined and what does it do"
+                ),
                 ("mixed:how", "how does merge_weighted work"),
                 ("mixed:show", "show me the implementation of merge_weighted"),
             ]
@@ -561,7 +699,10 @@ mod tests {
     fn item_start_matches_the_name_as_a_whole_word() {
         let src = "// header\npub fn resolve_alias(x: u8) {\n}\n";
         assert!(item_starts_at(src, "resolve_alias", 2));
-        assert!(!item_starts_at(src, "resolve", 2), "a prefix is not the item");
+        assert!(
+            !item_starts_at(src, "resolve", 2),
+            "a prefix is not the item"
+        );
         assert!(!item_starts_at(src, "resolve_alias", 1));
         assert!(!item_starts_at(src, "resolve_alias", 99));
         assert!(!item_starts_at(src, "resolve_alias", 0));

@@ -266,7 +266,9 @@ fn main() {
 
     if set_groups.is_some() || !arms.is_empty() {
         if ab || rerank_ab {
-            eprintln!("[chunk_bench] --sets and --arm are a different mode from --ab and --rerank-ab");
+            eprintln!(
+                "[chunk_bench] --sets and --arm are a different mode from --ab and --rerank-ab"
+            );
             std::process::exit(2);
         }
         if arms.is_empty() {
@@ -665,8 +667,7 @@ pub(crate) async fn query_once(
 fn classify_response(status: u16, body: &[u8]) -> QueryOutcome {
     let snippet = || String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned();
     if status == WARMING_STATUS
-        && serde_json::from_slice::<serde_json::Value>(body)
-            .is_ok_and(|v| v["status"] == "warming")
+        && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v["status"] == "warming")
     {
         return QueryOutcome::Warming;
     }
@@ -892,7 +893,12 @@ mod tests {
 
     async fn outcome(status: u16, body: &'static str) -> QueryOutcome {
         let url = stub(status, body).await;
-        query_once(&reqwest::Client::new(), &url, &serde_json::json!({"query": "q"})).await
+        query_once(
+            &reqwest::Client::new(),
+            &url,
+            &serde_json::json!({"query": "q"}),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -910,7 +916,11 @@ mod tests {
         let mut run = sets::ArmRun::new();
         run.record(&case, "a", out);
         assert_eq!(run.failed, 1);
-        assert_eq!(run.tally.observed(), 0, "a failure must not enter the denominator");
+        assert_eq!(
+            run.tally.observed(),
+            0,
+            "a failure must not enter the denominator"
+        );
     }
 
     #[tokio::test]
@@ -921,7 +931,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_undecodable_body_is_a_failure() {
-        assert!(matches!(outcome(200, "not json").await, QueryOutcome::Failed(_)));
+        assert!(matches!(
+            outcome(200, "not json").await,
+            QueryOutcome::Failed(_)
+        ));
     }
 
     #[tokio::test]
@@ -943,7 +956,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_200_with_the_graph_still_pending_is_warming() {
-        let out = outcome(200, r#"{"results":[],"warming":false,"graph_pending":true}"#).await;
+        let out = outcome(
+            200,
+            r#"{"results":[],"warming":false,"graph_pending":true}"#,
+        )
+        .await;
         assert!(matches!(out, QueryOutcome::Warming));
     }
 

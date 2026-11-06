@@ -897,13 +897,8 @@ fn served_tool_schema_keeps_scope_optional() {
     assert!(!served_scope_is_required(&RepoMcpHandler::tool_router()));
 }
 
-// ─── filter_kind / filter_lang / filter_path on every surface ───────────
-
 const FILTER_PARAMS: [&str; 3] = ["filter_kind", "filter_lang", "filter_path"];
 
-/// Agents on the router and per-repo surfaces can only narrow a search if the
-/// three structured filters are advertised there too, as flat optional params
-/// (some MCP clients reject `$ref` / `anyOf`).
 pub(crate) fn assert_filter_params_exposed(surface: &str, schema: &serde_json::Value) {
     let required = schema["required"].as_array().cloned().unwrap_or_default();
     for name in FILTER_PARAMS {

@@ -66,7 +66,7 @@ use crate::config::{
 };
 use crate::defender;
 use crate::indexing::IndexEngine;
-use crate::mcp::{McpHandler, RepoMcpHandler, run_codebase_retrieval};
+use crate::mcp::{McpHandler, RepoMcpHandler, mcp_query_filters, run_codebase_retrieval};
 use crate::path_in_repo;
 use crate::store;
 
@@ -1299,6 +1299,12 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
 struct McpToolRequest {
     information_request: String,
     workspace_full_path: String,
+    #[serde(default)]
+    filter_kind: Option<Vec<String>>,
+    #[serde(default)]
+    filter_lang: Option<Vec<String>>,
+    #[serde(default)]
+    filter_path: Option<String>,
     /// `code` (default when omitted) or `docs`; anything else is rejected by serde.
     #[serde(default)]
     scope: Option<crate::vector::Scope>,
@@ -1312,6 +1318,11 @@ struct McpToolRequest {
 async fn post_mcp_tool(State(state): State<AppState>, Json(req): Json<McpToolRequest>) -> Response {
     // Take an owned snapshot — guard dropped before the .await below.
     let settings = state.settings.read().await.clone();
+    let filters = mcp_query_filters(
+        req.filter_kind.as_deref(),
+        req.filter_lang.as_deref(),
+        req.filter_path.as_deref(),
+    );
     let result = run_codebase_retrieval(
         &state.home_dir,
         &state.data_dir,
@@ -1319,7 +1330,7 @@ async fn post_mcp_tool(State(state): State<AppState>, Json(req): Json<McpToolReq
         &state.repo_dbs,
         &settings,
         &req.information_request,
-        None,
+        filters,
         &req.workspace_full_path,
         req.scope.unwrap_or_default(),
     )

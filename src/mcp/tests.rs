@@ -897,6 +897,88 @@ fn served_tool_schema_keeps_scope_optional() {
     assert!(!served_scope_is_required(&RepoMcpHandler::tool_router()));
 }
 
+const FILTER_PARAMS: [&str; 3] = ["filter_kind", "filter_lang", "filter_path"];
+
+pub(crate) fn assert_filter_params_exposed(surface: &str, schema: &serde_json::Value) {
+    let required = schema["required"].as_array().cloned().unwrap_or_default();
+    for name in FILTER_PARAMS {
+        let prop = &schema["properties"][name];
+        assert!(!prop.is_null(), "{surface} must expose `{name}`");
+        assert!(
+            !required.iter().any(|r| r == name),
+            "{surface}: `{name}` must stay optional"
+        );
+        let text = prop.to_string();
+        for banned in ["$ref", "anyOf", "oneOf", "allOf"] {
+            assert!(
+                !text.contains(banned),
+                "{surface}: `{name}` schema has {banned}: {text}"
+            );
+        }
+        assert!(
+            prop["description"]
+                .as_str()
+                .is_some_and(|d| !d.trim().is_empty()),
+            "{surface}: `{name}` needs a description"
+        );
+    }
+}
+
+fn args_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes")
+}
+
+fn served_codebase_schema(router: &ToolRouter<impl Send + Sync + 'static>) -> serde_json::Value {
+    let tool = router
+        .list_all()
+        .into_iter()
+        .find(|t| t.name == "codebase-retrieval")
+        .expect("codebase-retrieval is registered");
+    serde_json::Value::Object((*tool.input_schema).clone())
+}
+
+#[test]
+fn filter_params_are_exposed_and_identical_on_every_mcp_surface() {
+    let schemas = [
+        (
+            "CodebaseRetrievalArgs",
+            args_schema::<CodebaseRetrievalArgs>(),
+        ),
+        (
+            "RepoCodebaseRetrievalArgs",
+            args_schema::<RepoCodebaseRetrievalArgs>(),
+        ),
+        (
+            "ProxyCodebaseRetrievalArgs",
+            args_schema::<crate::router::mcp_proxy::ProxyCodebaseRetrievalArgs>(),
+        ),
+    ];
+    for (name, schema) in &schemas {
+        assert_filter_params_exposed(name, schema);
+    }
+    let (_, monolith) = &schemas[0];
+    for param in FILTER_PARAMS {
+        for (name, schema) in &schemas[1..] {
+            assert_eq!(
+                schema["properties"][param], monolith["properties"][param],
+                "{name}: `{param}` must match the monolith's schema"
+            );
+        }
+    }
+}
+
+#[test]
+fn served_tool_schema_exposes_filter_params_on_global_and_repo_mcp() {
+    assert_filter_params_exposed(
+        "McpHandler",
+        &served_codebase_schema(&McpHandler::tool_router()),
+    );
+    assert_filter_params_exposed(
+        "RepoMcpHandler",
+        &served_codebase_schema(&RepoMcpHandler::tool_router()),
+    );
+}
+
 // ─── grep hint footer ─────────────────────────────────────────────────────
 
 fn sym_block(file: &str, line_start: u32, line_end: u32, symbols: &[&str]) -> OutputBlock {

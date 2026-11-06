@@ -17,6 +17,9 @@
 //! so ground truth remains independent of any chunk boundary and cannot favour
 //! one chunker or reranker over another.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use context_engine_rs::indexing::walker::walk_repo;
 use context_engine_rs::parsing::parse_file;
 use context_engine_rs::parsing::symbols::SymbolKind;
@@ -40,6 +43,227 @@ const MIN_QUERY_WORDS: usize = 8;
 const MAX_QUERY_WORDS: usize = 60;
 /// How far above a symbol to look for its doc block.
 const MAX_DOC_SCAN_LINES: usize = 12;
+/// A name shorter than this is too common to be a unique identifier query.
+const MIN_IDENT_CHARS: usize = 6;
+/// An item shorter than this has no body worth retrieving.
+const MIN_IDENT_LINES: u32 = 3;
+/// Cases per identifier set. The mixed set reuses these, so each template has
+/// the same count.
+pub const IDENT_LIMIT: usize = 60;
+
+/// The mixed set: each identifier case wrapped in one of these templates, scored
+/// as its own set so a retrieval change fitted to one phrasing shows up.
+const MIXED_TEMPLATES: [(&str, &str); 3] = [
+    ("where", "where is {} defined and what does it do"),
+    ("how", "how does {} work"),
+    ("show", "show me the implementation of {}"),
+];
+
+const PARA_FIXTURE: &str = include_str!("fixtures/para_cases.json");
+
+/// A named group of cases that is scored and reported on its own.
+#[derive(Debug, Clone)]
+pub struct CaseSet {
+    pub name: String,
+    pub cases: Vec<EvalCase>,
+    /// Cases whose gold range no longer matches the corpus. They are reported
+    /// but never scored, so a moved item is not mistaken for a retrieval miss.
+    pub stale: Vec<EvalCase>,
+}
+
+impl CaseSet {
+    fn new(name: &str, cases: Vec<EvalCase>) -> Self {
+        Self {
+            name: name.to_owned(),
+            cases,
+            stale: Vec::new(),
+        }
+    }
+}
+
+/// The doc-comment set, as a [`CaseSet`].
+pub fn derive_doc_set(repo: &str, limit: usize) -> CaseSet {
+    CaseSet::new("doc", derive_eval_set(repo, limit))
+}
+
+/// A symbol as the identifier set sees it: just enough to judge uniqueness.
+struct SymbolRef {
+    file: String,
+    name: String,
+    kind: SymbolKind,
+    line_start: u32,
+    line_end: u32,
+}
+
+/// Derive up to `limit` identifier cases from `repo`: the bare name of an item,
+/// expecting that item's own line range.
+pub fn derive_ident_set(repo: &str, limit: usize) -> CaseSet {
+    let mut symbols: Vec<SymbolRef> = Vec::new();
+    for path in walk_repo(repo) {
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let parsed = parse_file(&path, &source);
+        let file = path.replace('\\', "/");
+        symbols.extend(parsed.symbols.into_iter().map(|s| SymbolRef {
+            file: file.clone(),
+            name: s.qualified.name,
+            kind: s.kind,
+            line_start: s.line_start,
+            line_end: s.line_end,
+        }));
+    }
+    CaseSet::new("ident", sample_evenly(unique_ident_cases(&symbols), limit))
+}
+
+/// Keep the items whose name occurs exactly once across every symbol of any
+/// kind, compared case-insensitively. A name that is also a method on another
+/// type, or a function in another file, has no single right answer.
+fn unique_ident_cases(symbols: &[SymbolRef]) -> Vec<EvalCase> {
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    for s in symbols {
+        *occurrences.entry(s.name.to_lowercase()).or_default() += 1;
+    }
+    let mut cases: Vec<EvalCase> = symbols
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Trait
+            )
+        })
+        .filter(|s| occurrences[&s.name.to_lowercase()] == 1)
+        .filter(|s| s.name.chars().count() >= MIN_IDENT_CHARS)
+        .filter(|s| s.line_end.saturating_sub(s.line_start) + 1 >= MIN_IDENT_LINES)
+        .map(|s| EvalCase {
+            query: s.name.clone(),
+            file: s.file.clone(),
+            symbol: s.name.clone(),
+            line_start: s.line_start,
+            line_end: s.line_end,
+        })
+        .collect();
+    cases.sort_by(|a, b| a.file.cmp(&b.file).then(a.line_start.cmp(&b.line_start)));
+    cases
+}
+
+/// Wrap each identifier case in every mixed template. One set per template, in
+/// template order, each holding the same items as `ident`.
+pub fn derive_mixed_set(ident: &CaseSet) -> Vec<CaseSet> {
+    MIXED_TEMPLATES
+        .iter()
+        .map(|(label, template)| {
+            let cases = ident
+                .cases
+                .iter()
+                .map(|c| EvalCase {
+                    query: template.replace("{}", &c.symbol),
+                    ..c.clone()
+                })
+                .collect();
+            CaseSet::new(&format!("mixed:{label}"), cases)
+        })
+        .collect()
+}
+
+#[derive(serde::Deserialize)]
+struct ParaFixture {
+    model: String,
+    prompt: String,
+    corpus_commit: String,
+    cases: Vec<ParaCase>,
+}
+
+#[derive(serde::Deserialize)]
+struct ParaCase {
+    query: String,
+    /// Relative to the repo root.
+    file: String,
+    name: String,
+    start: u32,
+    end: u32,
+}
+
+/// Who wrote the paraphrases and against which commit, for the artifact.
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct ParaProvenance {
+    pub model: String,
+    pub prompt: String,
+    pub corpus_commit: String,
+}
+
+pub fn para_provenance() -> ParaProvenance {
+    let f = parse_para_fixture();
+    ParaProvenance {
+        model: f.model,
+        prompt: f.prompt,
+        corpus_commit: f.corpus_commit,
+    }
+}
+
+fn parse_para_fixture() -> ParaFixture {
+    serde_json::from_str(PARA_FIXTURE).expect("para_cases.json is embedded and must parse")
+}
+
+/// Load the paraphrase fixture against `repo`. A case whose named item no longer
+/// starts at its recorded line goes to `stale`.
+pub fn derive_para_set(repo: &str) -> CaseSet {
+    let root = repo.trim_end_matches('/');
+    split_stale(parse_para_fixture().cases, root, |path| {
+        std::fs::read_to_string(path).ok()
+    })
+}
+
+fn split_stale(
+    cases: Vec<ParaCase>,
+    root: &str,
+    read: impl Fn(&str) -> Option<String>,
+) -> CaseSet {
+    let mut set = CaseSet::new("para", Vec::new());
+    for c in cases {
+        let path = Path::new(root)
+            .join(&c.file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let fresh = read(&path).is_some_and(|src| item_starts_at(&src, &c.name, c.start));
+        let case = EvalCase {
+            query: c.query,
+            file: path,
+            symbol: c.name,
+            line_start: c.start,
+            line_end: c.end,
+        };
+        if fresh {
+            set.cases.push(case);
+        } else {
+            set.stale.push(case);
+        }
+    }
+    set
+}
+
+/// Whether line `start` (1-based) of `source` names `name` as a whole word.
+fn item_starts_at(source: &str, name: &str, start: u32) -> bool {
+    let Some(line) = (start as usize)
+        .checked_sub(1)
+        .and_then(|i| source.lines().nth(i))
+    else {
+        return false;
+    };
+    line.match_indices(name).any(|(at, _)| {
+        let before = line[..at].chars().next_back();
+        let after = line[at + name.len()..].chars().next();
+        !before.is_some_and(is_ident_char) && !after.is_some_and(is_ident_char)
+    })
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
 
 /// Derive up to `limit` retrieval cases from `repo`.
 ///
@@ -249,6 +473,161 @@ mod tests {
         let a_syms: Vec<_> = a.iter().map(|c| c.symbol.clone()).collect();
         let b_syms: Vec<_> = b.iter().map(|c| c.symbol.clone()).collect();
         assert_eq!(a_syms, b_syms, "sampling must be deterministic");
+    }
+
+    fn sym(file: &str, name: &str, kind: SymbolKind, start: u32, end: u32) -> SymbolRef {
+        SymbolRef {
+            file: file.to_owned(),
+            name: name.to_owned(),
+            kind,
+            line_start: start,
+            line_end: end,
+        }
+    }
+
+    fn names(cases: &[EvalCase]) -> Vec<&str> {
+        cases.iter().map(|c| c.symbol.as_str()).collect()
+    }
+
+    #[test]
+    fn a_name_defined_twice_is_never_an_ident_case() {
+        let symbols = vec![
+            sym("a.rs", "build_index", SymbolKind::Function, 1, 9),
+            sym("b.rs", "build_index", SymbolKind::Function, 1, 9),
+            sym("a.rs", "only_here", SymbolKind::Function, 20, 29),
+        ];
+        assert_eq!(names(&unique_ident_cases(&symbols)), ["only_here"]);
+    }
+
+    #[test]
+    fn uniqueness_counts_every_symbol_kind_and_ignores_case() {
+        let symbols = vec![
+            sym("a.rs", "Pipeline", SymbolKind::Struct, 1, 9),
+            sym("b.rs", "pipeline", SymbolKind::Module, 1, 9),
+            sym("c.rs", "WalkerConfig", SymbolKind::Struct, 1, 9),
+        ];
+        assert_eq!(names(&unique_ident_cases(&symbols)), ["WalkerConfig"]);
+    }
+
+    #[test]
+    fn ident_name_floor_is_six_characters() {
+        let symbols = vec![
+            sym("a.rs", "abcde", SymbolKind::Function, 1, 9),
+            sym("a.rs", "abcdef", SymbolKind::Function, 20, 29),
+        ];
+        assert_eq!(names(&unique_ident_cases(&symbols)), ["abcdef"]);
+    }
+
+    #[test]
+    fn ident_span_floor_is_three_lines() {
+        let symbols = vec![
+            sym("a.rs", "two_lines", SymbolKind::Function, 10, 11),
+            sym("a.rs", "three_lines", SymbolKind::Function, 20, 22),
+        ];
+        assert_eq!(names(&unique_ident_cases(&symbols)), ["three_lines"]);
+    }
+
+    #[test]
+    fn ident_covers_only_the_five_named_kinds() {
+        let symbols = vec![
+            sym("a.rs", "a_function", SymbolKind::Function, 1, 9),
+            sym("a.rs", "a_method", SymbolKind::Method, 11, 19),
+            sym("a.rs", "AStruct", SymbolKind::Struct, 21, 29),
+            sym("a.rs", "AnEnum", SymbolKind::Enum, 31, 39),
+            sym("a.rs", "ATrait", SymbolKind::Trait, 41, 49),
+            sym("a.rs", "AModule", SymbolKind::Module, 51, 59),
+            sym("a.rs", "AnImpl", SymbolKind::Impl, 61, 69),
+            sym("a.rs", "AClass", SymbolKind::Class, 71, 79),
+        ];
+        assert_eq!(
+            names(&unique_ident_cases(&symbols)),
+            ["a_function", "a_method", "AStruct", "AnEnum", "ATrait"]
+        );
+    }
+
+    #[test]
+    fn ident_gold_is_the_symbols_own_range() {
+        let symbols = vec![sym("src/a.rs", "only_here", SymbolKind::Function, 20, 29)];
+        let case = &unique_ident_cases(&symbols)[0];
+        assert_eq!(case.query, "only_here");
+        assert_eq!((case.file.as_str(), case.line_start, case.line_end), ("src/a.rs", 20, 29));
+    }
+
+    #[test]
+    fn mixed_wraps_each_ident_in_three_separate_templates() {
+        let ident = CaseSet::new(
+            "ident",
+            vec![EvalCase {
+                query: "merge_weighted".into(),
+                file: "src/query/merger.rs".into(),
+                symbol: "merge_weighted".into(),
+                line_start: 73,
+                line_end: 125,
+            }],
+        );
+        let sets = derive_mixed_set(&ident);
+        let queries: Vec<_> = sets.iter().map(|s| (s.name.as_str(), s.cases[0].query.as_str())).collect();
+        assert_eq!(
+            queries,
+            [
+                ("mixed:where", "where is merge_weighted defined and what does it do"),
+                ("mixed:how", "how does merge_weighted work"),
+                ("mixed:show", "show me the implementation of merge_weighted"),
+            ]
+        );
+        for set in &sets {
+            assert_eq!((set.cases[0].line_start, set.cases[0].line_end), (73, 125));
+        }
+    }
+
+    #[test]
+    fn item_start_matches_the_name_as_a_whole_word() {
+        let src = "// header\npub fn resolve_alias(x: u8) {\n}\n";
+        assert!(item_starts_at(src, "resolve_alias", 2));
+        assert!(!item_starts_at(src, "resolve", 2), "a prefix is not the item");
+        assert!(!item_starts_at(src, "resolve_alias", 1));
+        assert!(!item_starts_at(src, "resolve_alias", 99));
+        assert!(!item_starts_at(src, "resolve_alias", 0));
+    }
+
+    fn para(name: &str, file: &str, start: u32) -> ParaCase {
+        ParaCase {
+            query: format!("do {name}"),
+            file: file.to_owned(),
+            name: name.to_owned(),
+            start,
+            end: start + 9,
+        }
+    }
+
+    #[test]
+    fn a_shifted_paraphrase_target_is_stale_not_a_miss() {
+        let moved = "\n\nfn target_one() {}\n";
+        let intact = "fn target_two() {}\n";
+        let cases = vec![para("target_one", "a.rs", 1), para("target_two", "b.rs", 1)];
+        let set = split_stale(cases, "/repo", |path| match path {
+            "/repo/a.rs" => Some(moved.to_owned()),
+            "/repo/b.rs" => Some(intact.to_owned()),
+            _ => None,
+        });
+        assert_eq!(names(&set.stale), ["target_one"]);
+        assert_eq!(names(&set.cases), ["target_two"]);
+        assert_eq!(set.cases[0].file, "/repo/b.rs");
+    }
+
+    #[test]
+    fn a_missing_paraphrase_file_is_stale() {
+        let set = split_stale(vec![para("gone", "gone.rs", 1)], "/repo", |_| None);
+        assert!(set.cases.is_empty());
+        assert_eq!(set.stale.len(), 1);
+    }
+
+    #[test]
+    fn the_embedded_fixture_parses_and_uses_relative_paths() {
+        let fixture = parse_para_fixture();
+        assert_eq!(fixture.cases.len(), 60);
+        assert!(fixture.cases.iter().all(|c| !c.file.starts_with('/')));
+        assert!(!fixture.model.is_empty() && !fixture.prompt.is_empty());
     }
 
     #[test]

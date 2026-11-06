@@ -1,0 +1,427 @@
+{
+  "model": "haiku (subagent; the exact model id was not recorded)",
+  "prompt": "The prompt text was not saved with the prototype. Reconstructed from proto/README.md: given a Rust item (file, line range, name) from this repo at 5f7af8c, write a one-sentence intent paraphrase of what the item does, with no identifiers from its code and no words copied from its name or doc comment.",
+  "corpus_commit": "5f7af8c",
+  "cases": [
+    {
+      "query": "when a bare typescript module name must map to a project file via the compiler's path remapping rules",
+      "file": "src/indexing/import_resolver.rs",
+      "name": "resolve_tsconfig_alias",
+      "start": 93,
+      "end": 137
+    },
+    {
+      "query": "route serving a repo's call graph: proxy to a live worker, else an empty placeholder when unindexed",
+      "file": "src/router/repo_read_handlers.rs",
+      "name": "repo_graph_cold_or_proxy",
+      "start": 26,
+      "end": 47
+    },
+    {
+      "query": "fullest file-walker setup taking extra extensions plus separate ignored filename and ignored path sets",
+      "file": "src/indexing/walker.rs",
+      "name": "new_complete",
+      "start": 283,
+      "end": 297
+    },
+    {
+      "query": "decide whether structured JSON output mode is usable for the configured provider, else fall back to XML reranking",
+      "file": "src/llm/mod.rs",
+      "name": "structured_output_active",
+      "start": 107,
+      "end": 121
+    },
+    {
+      "query": "HTTP endpoint that answers a question about one file in a workspace, returning five results by default",
+      "file": "src/server.rs",
+      "name": "post_file_retrieval",
+      "start": 1341,
+      "end": 1357
+    },
+    {
+      "query": "in a call expression's function part, get the final name from qualified, member access, or template forms",
+      "file": "src/parsing/mod.rs",
+      "name": "callee_leaf_name",
+      "start": 1287,
+      "end": 1315
+    },
+    {
+      "query": "count distinct functions that invoke a symbol and those it invokes, sorting neighbor names by file proximity",
+      "file": "src/query/engine.rs",
+      "name": "query_caller_callee_stats",
+      "start": 1046,
+      "end": 1148
+    },
+    {
+      "query": "walk a Dart syntax tree collecting classes, enums, mixins, functions and call edges",
+      "file": "src/parsing/mod.rs",
+      "name": "extract_dart_node",
+      "start": 2997,
+      "end": 3223
+    },
+    {
+      "query": "test that the grep suggestion sits after the cut-off footer and survives when a huge result set is trimmed",
+      "file": "src/mcp/tests.rs",
+      "name": "hint_fits_inside_budget_reserve_even_when_output_is_truncated",
+      "start": 1003,
+      "end": 1033
+    },
+    {
+      "query": "walk a Luau syntax tree recording functions, method-style definitions, type aliases, and call edges",
+      "file": "src/parsing/mod.rs",
+      "name": "extract_luau_node",
+      "start": 3343,
+      "end": 3453
+    },
+    {
+      "query": "benchmark helper that emits symbol spans plus fifty-line sliding windows for source lines no symbol covers",
+      "file": "src/bin/chunk_bench/main.rs",
+      "name": "legacy_chunk_ranges",
+      "start": 375,
+      "end": 412
+    },
+    {
+      "query": "scan upward from a definition line collecting the comment lines immediately above it, skipping attributes and blanks",
+      "file": "src/bin/chunk_bench/eval.rs",
+      "name": "doc_block_above",
+      "start": 109,
+      "end": 142
+    },
+    {
+      "query": "router maps a linked git worktree path onto the main repository and adds a note about the redirect",
+      "file": "src/router/mcp_proxy.rs",
+      "name": "resolve_worktree",
+      "start": 167,
+      "end": 177
+    },
+    {
+      "query": "test that a code-only vector search excludes markdown and text files while docs-only search keeps them",
+      "file": "src/vector/scope_tests.rs",
+      "name": "scoped_search_returns_only_requested_class",
+      "start": 53,
+      "end": 76
+    },
+    {
+      "query": "test that cross-file React component links survive incremental re-index after one file is edited",
+      "file": "src/indexing/pipeline_drift_tests.rs",
+      "name": "framework_edges_survive_single_file_incremental",
+      "start": 407,
+      "end": 456
+    },
+    {
+      "query": "test that documentation extension list comes from the query filter, so editing it reclassifies files on a warm index",
+      "file": "src/vector/scope_tests.rs",
+      "name": "docs_set_is_taken_from_the_filter_not_baked_into_the_shard",
+      "start": 127,
+      "end": 158
+    },
+    {
+      "query": "race a long running task against a periodic timer that reports progress until the task finishes or is cancelled",
+      "file": "src/mcp/progress.rs",
+      "name": "heartbeat_loop",
+      "start": 74,
+      "end": 100
+    },
+    {
+      "query": "test helper that finds a file's metadata row by matching the end of its path, panicking when absent",
+      "file": "src/indexing/pipeline_drift_tests.rs",
+      "name": "stored_key",
+      "start": 59,
+      "end": 67
+    },
+    {
+      "query": "fetch up to twenty names of functions a given symbol invokes, with a slower fallback for older databases",
+      "file": "src/query/graph_expand.rs",
+      "name": "query_callees",
+      "start": 340,
+      "end": 372
+    },
+    {
+      "query": "registry answer when requesting a worker: already live, spawn it yourself, or wait for an in-flight spawn",
+      "file": "src/router/registry.rs",
+      "name": "Acquire",
+      "start": 93,
+      "end": 103
+    },
+    {
+      "query": "read a repo file by relative path with optional line bounds, refusing outside paths, binaries, and non-UTF-8 text",
+      "file": "src/fs_tools.rs",
+      "name": "run_read",
+      "start": 393,
+      "end": 471
+    },
+    {
+      "query": "test that during a full reindex, searches skip an old in-memory vector shard whose rows were just wiped",
+      "file": "src/indexing/load_repos_tests.rs",
+      "name": "full_rebuild_window_does_not_search_stale_resident_shard",
+      "start": 638,
+      "end": 711
+    },
+    {
+      "query": "one attempt to embed texts via the Voyage service with a chosen API key, reusing the pooled client",
+      "file": "src/embedding/voyage/http_transport.rs",
+      "name": "try_embed_with_key",
+      "start": 71,
+      "end": 79
+    },
+    {
+      "query": "pull a file's extension for matching, lowercasing only when needed, otherwise borrowing the original slice",
+      "file": "src/vector/scope.rs",
+      "name": "ext_key_cow",
+      "start": 78,
+      "end": 89
+    },
+    {
+      "query": "result record from the reranker: ordered indices, optional line ranges per chunk, raw transcripts, fallback flag, and relevance probabilities",
+      "file": "src/query/reranker.rs",
+      "name": "RerankOutput",
+      "start": 23,
+      "end": 38
+    },
+    {
+      "query": "test that concurrent preloads of one cold repository collapse into a single load and leave it resident",
+      "file": "src/indexing/load_repos_tests.rs",
+      "name": "warm_blocking_is_single_flight",
+      "start": 247,
+      "end": 296
+    },
+    {
+      "query": "case-insensitive typo distance between two strings that gives up early once a threshold is exceeded",
+      "file": "src/query/filters.rs",
+      "name": "bounded_edit_distance",
+      "start": 180,
+      "end": 228
+    },
+    {
+      "query": "test that connection-level or timeout failures to the embedding service count as retryable",
+      "file": "src/embedding/voyage/tests/retry_policy.rs",
+      "name": "transport_errors_are_transient",
+      "start": 58,
+      "end": 78
+    },
+    {
+      "query": "look up indexed symbols in one file whose line span intersects a given line range",
+      "file": "src/query/graph_expand.rs",
+      "name": "query_overlapping_symbols",
+      "start": 226,
+      "end": 243
+    },
+    {
+      "query": "check whether a user's language filter, including common abbreviations, matches the language detected for a file",
+      "file": "src/query/engine.rs",
+      "name": "lang_matches_alias",
+      "start": 967,
+      "end": 986
+    },
+    {
+      "query": "buffer a request, read the repository path from a JSON field, forward it to that repo's worker or reject",
+      "file": "src/router/repo_action_handlers.rs",
+      "name": "proxy_by_body_field",
+      "start": 105,
+      "end": 133
+    },
+    {
+      "query": "reload configuration from disk only when its timestamp advanced, keeping the current settings if reading fails",
+      "file": "src/config.rs",
+      "name": "maybe_reload_settings",
+      "start": 1035,
+      "end": 1059
+    },
+    {
+      "query": "test that merging overlapping result snippets keeps their relevance ranking rather than re-sorting by file",
+      "file": "src/mcp/tests.rs",
+      "name": "merge_blocks_preserves_priority_order",
+      "start": 516,
+      "end": 573
+    },
+    {
+      "query": "cumulative table of non-whitespace character counts indexed by byte position in a source string",
+      "file": "src/parsing/chunker.rs",
+      "name": "build_nonws_prefix",
+      "start": 50,
+      "end": 61
+    },
+    {
+      "query": "upgrade a stored database from schema version eight to nine by flagging javascript and typescript files for reindexing",
+      "file": "src/store/mod.rs",
+      "name": "run_migration_v8_to_v9",
+      "start": 922,
+      "end": 961
+    },
+    {
+      "query": "test that a scoped search over an index holding no matching files returns an empty result",
+      "file": "src/vector/scope_tests.rs",
+      "name": "scoped_search_with_zero_matching_rows_returns_empty",
+      "start": 110,
+      "end": 124
+    },
+    {
+      "query": "test that when all result blocks fit the size budget, none are dropped and no truncation notice appears",
+      "file": "src/mcp/tests.rs",
+      "name": "budget_all_fit",
+      "start": 159,
+      "end": 186
+    },
+    {
+      "query": "hand out an API key rotator whose round-robin position persists across every instance built from the same key list",
+      "file": "src/llm/keys.rs",
+      "name": "shared",
+      "start": 89,
+      "end": 103
+    },
+    {
+      "query": "test that query answers lose the stale-data warning once a paused background indexing run is released",
+      "file": "src/mcp/availability_tests.rs",
+      "name": "answers_are_live_again_after_the_run",
+      "start": 323,
+      "end": 331
+    },
+    {
+      "query": "convert a count word in English, Vietnamese, or Chinese into a number, accepting digits too",
+      "file": "src/chat.rs",
+      "name": "parse_count_token",
+      "start": 778,
+      "end": 791
+    },
+    {
+      "query": "test that a grep suggestion still names the underlying types when every chunk is an implementation block",
+      "file": "src/mcp/tests.rs",
+      "name": "captured_impl_only_chunks_still_yield_the_type_names",
+      "start": 1517,
+      "end": 1539
+    },
+    {
+      "query": "test that an identical-copies note on a kept result survives when the LLM reranker picks specific line ranges",
+      "file": "src/mcp/duplicate_results_tests.rs",
+      "name": "note_survives_when_the_reranker_selects_line_ranges",
+      "start": 183,
+      "end": 224
+    },
+    {
+      "query": "helper checking the search tool's input schema marks the scope argument as mandatory",
+      "file": "src/mcp/tests.rs",
+      "name": "served_scope_is_required",
+      "start": 883,
+      "end": 892
+    },
+    {
+      "query": "boot the always-on gateway that loads settings, proxies requests to per-project workers, and starts background sweeps",
+      "file": "src/router/mod.rs",
+      "name": "build_router_app",
+      "start": 96,
+      "end": 264
+    },
+    {
+      "query": "HTTP endpoint listing paths that a repository's index chose to skip",
+      "file": "src/server.rs",
+      "name": "get_ignored_files",
+      "start": 1069,
+      "end": 1088
+    },
+    {
+      "query": "test that a code slice with no direct symbol hit is labeled with the smallest enclosing function",
+      "file": "src/mcp/tests.rs",
+      "name": "pick_block_symbols_falls_back_to_the_innermost_enclosing_symbol",
+      "start": 1331,
+      "end": 1339
+    },
+    {
+      "query": "benchmark code that classifies a reranker response as not run, skipped with a reason, or ran",
+      "file": "src/bin/chunk_bench/rerank_ab.rs",
+      "name": "rerank_outcome",
+      "start": 273,
+      "end": 284
+    },
+    {
+      "query": "test that the grep suggestion lists only symbols from results actually shown, not from a result cut for size",
+      "file": "src/mcp/tests.rs",
+      "name": "grep_hint_names_nothing_from_a_block_the_budget_dropped",
+      "start": 1117,
+      "end": 1146
+    },
+    {
+      "query": "walk a Python syntax tree collecting class and function definitions, including async ones, plus call edges",
+      "file": "src/parsing/mod.rs",
+      "name": "extract_python_node",
+      "start": 504,
+      "end": 620
+    },
+    {
+      "query": "server-wide state record bundling data directories, indexing engine, open database handles, live settings, and session store",
+      "file": "src/server.rs",
+      "name": "AppState",
+      "start": 107,
+      "end": 140
+    },
+    {
+      "query": "HTTP endpoint returning a repository's file, chunk and symbol counts from a cache, or zeros when never indexed",
+      "file": "src/server.rs",
+      "name": "get_index_stats",
+      "start": 624,
+      "end": 711
+    },
+    {
+      "query": "test that embedding vectors returned out of order by the remote service come back matching input order",
+      "file": "src/indexing/pipeline_drift_tests.rs",
+      "name": "voyage_response_is_reordered_by_index",
+      "start": 788,
+      "end": 811
+    },
+    {
+      "query": "launch a repo's worker process, bind it to the parent's lifetime, and await its readiness handshake on stdout",
+      "file": "src/router/spawn.rs",
+      "name": "spawn_worker",
+      "start": 92,
+      "end": 162
+    },
+    {
+      "query": "benchmark tracing layer that captures the performance summary record for an incremental indexing run",
+      "file": "src/bin/bench_incremental/perf_layer.rs",
+      "name": "on_event",
+      "start": 113,
+      "end": 123
+    },
+    {
+      "query": "delete a repository's on-disk index for one generation while holding the open lock across retries",
+      "file": "src/store/mod.rs",
+      "name": "remove_index_dir",
+      "start": 1464,
+      "end": 1479
+    },
+    {
+      "query": "enumerate the secondary structures a database table reports in its schema info, as an ordered set",
+      "file": "src/store/mod.rs",
+      "name": "defined_index_names",
+      "start": 1031,
+      "end": 1048
+    },
+    {
+      "query": "local record of a bought proxy subscription: invoice number, API key, base URL, expiry, and free-trial flag",
+      "file": "src/config.rs",
+      "name": "PurchasedPlan",
+      "start": 562,
+      "end": 587
+    },
+    {
+      "query": "resolve a typescript or javascript import by trying aliases, then relative paths, then suffix matching",
+      "file": "src/indexing/import_resolver.rs",
+      "name": "resolve_ts_js",
+      "start": 71,
+      "end": 87
+    },
+    {
+      "query": "resolve a Rust import path by handling crate root, current module, and parent module prefixes",
+      "file": "src/indexing/import_resolver.rs",
+      "name": "resolve_rust",
+      "start": 242,
+      "end": 288
+    },
+    {
+      "query": "scan known repo files for one whose path ends with the import plus an extension, else a bare suffix",
+      "file": "src/indexing/import_resolver.rs",
+      "name": "probe_with_suffix_match",
+      "start": 341,
+      "end": 365
+    }
+  ]
+}

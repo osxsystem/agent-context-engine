@@ -99,8 +99,6 @@ struct Report {
     topk_results_total: u64,
     cut_through_results: u64,
     cut_through_rate: f64,
-    // Queries that errored, did not decode, or came back "warming". They are
-    // never scored as misses; a nonzero count fails the run.
     #[serde(default)]
     queries_failed: u64,
     #[serde(default)]
@@ -346,9 +344,6 @@ fn main() {
     exit_on_failures(report.queries_failed, report.queries_warming);
 }
 
-/// Exit 3 when any query failed or came back warming, after the artifact is
-/// written. A run with unanswered queries scored fewer cases than it claims, so
-/// it must not look like a clean result to a script that only checks the status.
 fn exit_on_failures(failed: u64, warming: u64) {
     if failed > 0 || warming > 0 {
         eprintln!(
@@ -627,38 +622,24 @@ struct QueryResp {
     graph_pending: bool,
 }
 
-/// A 2xx `/api/query` body. `results` is required, so an error body that
-/// arrives with a 200 fails to decode instead of reading as an empty ranking.
 #[derive(serde::Deserialize)]
 struct RankedBody {
     results: Vec<QueryResultRow>,
-    /// Set when the shard was not resident and `results` is empty for that
-    /// reason, not because nothing matched.
     #[serde(default)]
     warming: bool,
-    /// Set while call-graph edges are still resolving. The ranking is then
-    /// vector-only and changes once the graph lands, so it is not a stable
-    /// answer to score.
     #[serde(default)]
     graph_pending: bool,
 }
 
-/// What one `/api/query` call came to.
 pub(crate) enum QueryOutcome {
     Ranked(Vec<QueryResultRow>),
-    /// The server said the index is still loading. Not a ranking, not an error.
     Warming,
     Failed(String),
 }
 
-/// The status `post_query` answers with while an index is warming
-/// (`mcp::query_gate::WARMING_STATUS`, which this binary cannot reach).
+// Mirrors `mcp::query_gate::WARMING_STATUS`, which is pub(crate) and so out of reach here.
 const WARMING_STATUS: u16 = 503;
 
-/// Send one query and say what came back. Only a decoded ranking is scored; a
-/// transport error, any non-2xx other than the warming answer, and a body that
-/// does not decode are failures, so a dead or erroring server can never read as
-/// a run of misses.
 pub(crate) async fn query_once(
     client: &reqwest::Client,
     server: &str,
@@ -868,7 +849,6 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A server that answers every request with `status` and `body`.
     async fn stub(status: u16, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

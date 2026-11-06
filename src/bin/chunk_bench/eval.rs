@@ -43,16 +43,10 @@ const MIN_QUERY_WORDS: usize = 8;
 const MAX_QUERY_WORDS: usize = 60;
 /// How far above a symbol to look for its doc block.
 const MAX_DOC_SCAN_LINES: usize = 12;
-/// A name shorter than this is too common to be a unique identifier query.
 const MIN_IDENT_CHARS: usize = 6;
-/// An item shorter than this has no body worth retrieving.
 const MIN_IDENT_LINES: u32 = 3;
-/// Cases per identifier set. The mixed set reuses these, so each template has
-/// the same count.
 pub const IDENT_LIMIT: usize = 60;
 
-/// The mixed set: each identifier case wrapped in one of these templates, scored
-/// as its own set so a retrieval change fitted to one phrasing shows up.
 const MIXED_TEMPLATES: [(&str, &str); 3] = [
     ("where", "where is {} defined and what does it do"),
     ("how", "how does {} work"),
@@ -61,13 +55,10 @@ const MIXED_TEMPLATES: [(&str, &str); 3] = [
 
 const PARA_FIXTURE: &str = include_str!("fixtures/para_cases.json");
 
-/// A named group of cases that is scored and reported on its own.
 #[derive(Debug, Clone)]
 pub struct CaseSet {
     pub name: String,
     pub cases: Vec<EvalCase>,
-    /// Cases whose gold range no longer matches the corpus. They are reported
-    /// but never scored, so a moved item is not mistaken for a retrieval miss.
     pub stale: Vec<EvalCase>,
 }
 
@@ -81,12 +72,10 @@ impl CaseSet {
     }
 }
 
-/// The doc-comment set, as a [`CaseSet`].
 pub fn derive_doc_set(repo: &str, limit: usize) -> CaseSet {
     CaseSet::new("doc", derive_eval_set(repo, limit))
 }
 
-/// A symbol as the identifier set sees it: just enough to judge uniqueness.
 struct SymbolRef {
     file: String,
     name: String,
@@ -95,8 +84,6 @@ struct SymbolRef {
     line_end: u32,
 }
 
-/// Derive up to `limit` identifier cases from `repo`: the bare name of an item,
-/// expecting that item's own line range.
 pub fn derive_ident_set(repo: &str, limit: usize) -> CaseSet {
     let mut symbols: Vec<SymbolRef> = Vec::new();
     for path in walk_repo(repo) {
@@ -116,9 +103,6 @@ pub fn derive_ident_set(repo: &str, limit: usize) -> CaseSet {
     CaseSet::new("ident", sample_evenly(unique_ident_cases(&symbols), limit))
 }
 
-/// Keep the items whose name occurs exactly once across every symbol of any
-/// kind, compared case-insensitively. A name that is also a method on another
-/// type, or a function in another file, has no single right answer.
 fn unique_ident_cases(symbols: &[SymbolRef]) -> Vec<EvalCase> {
     let mut occurrences: HashMap<String, usize> = HashMap::new();
     for s in symbols {
@@ -151,8 +135,6 @@ fn unique_ident_cases(symbols: &[SymbolRef]) -> Vec<EvalCase> {
     cases
 }
 
-/// Wrap each identifier case in every mixed template. One set per template, in
-/// template order, each holding the same items as `ident`.
 pub fn derive_mixed_set(ident: &CaseSet) -> Vec<CaseSet> {
     MIXED_TEMPLATES
         .iter()
@@ -181,14 +163,12 @@ struct ParaFixture {
 #[derive(serde::Deserialize)]
 struct ParaCase {
     query: String,
-    /// Relative to the repo root.
     file: String,
     name: String,
     start: u32,
     end: u32,
 }
 
-/// Who wrote the paraphrases and against which commit, for the artifact.
 #[derive(serde::Serialize, Debug, Clone)]
 pub struct ParaProvenance {
     pub model: String,
@@ -209,8 +189,6 @@ fn parse_para_fixture() -> ParaFixture {
     serde_json::from_str(PARA_FIXTURE).expect("para_cases.json is embedded and must parse")
 }
 
-/// Load the paraphrase fixture against `repo`. A case whose named item no longer
-/// starts at its recorded line goes to `stale`.
 pub fn derive_para_set(repo: &str) -> CaseSet {
     let root = repo.trim_end_matches('/');
     split_stale(parse_para_fixture().cases, root, |path| {
@@ -246,7 +224,6 @@ fn split_stale(
     set
 }
 
-/// Whether line `start` (1-based) of `source` names `name` as a whole word.
 fn item_starts_at(source: &str, name: &str, start: u32) -> bool {
     let Some(line) = (start as usize)
         .checked_sub(1)

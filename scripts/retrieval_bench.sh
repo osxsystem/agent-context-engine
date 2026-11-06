@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# Retrieval benchmark — the one command behind bench-results/retrieval/.
-#
-# WHY: no retrieval change ships without a per-set A/B. This boots a PRIVATE
-# server from the binary under test, indexes the corpus into a private data dir,
-# and runs chunk_bench over four sets (doc comments, bare identifiers, identifiers
-# inside a sentence in three templates, intent paraphrases) once per --arm. An arm
-# is a name plus JSON merged into the /api/query body, so a flag-gated change is
-# compared on one warm index with nothing else varying. Rerank stays off.
-#
-# The private server's settings home is a temp copy of the real settings.json
-# (embedding keys included) pointed at a private data dir, so nothing here writes
-# the live engine's settings or index. The live data dir is refused outright: the
-# LaunchAgent server on :6699 holds its RocksDB lock.
-#
 # Usage:
 #   scripts/retrieval_bench.sh <label> [repo_path] [options]
 # Options (each also settable by the env var in brackets):
@@ -103,8 +89,6 @@ OUT_JSON="${OUT_DIR}/${LABEL}.json"
 URL="http://127.0.0.1:${PORT}"
 [ -f "${REAL_CE}/settings.json" ] || die "no settings at ${REAL_CE}/settings.json"
 
-# Resolve a path that may not exist yet: resolve its deepest existing ancestor
-# with symlinks followed, then re-append the rest.
 resolve_path() {
   local p="${1/#\~/$HOME}" rest=""
   while [ ! -e "$p" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do
@@ -114,8 +98,6 @@ resolve_path() {
   echo "$(cd "$p" && pwd -P)${rest}"
 }
 
-# The live engine owns this directory. Refuse it, anything inside it, and any
-# directory that contains it, before a server or an index is created anywhere.
 refuse_live_dir() {
   local live got
   live="$(resolve_path "$REAL_CE")"

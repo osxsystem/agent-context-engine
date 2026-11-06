@@ -1,12 +1,3 @@
-//! The multi-set, multi-arm retrieval run behind `scripts/retrieval_bench.sh`.
-//!
-//! One run scores several case sets (doc, ident, mixed by template, para)
-//! against one warm index, once per arm. An arm is a name plus JSON merged into
-//! the `/api/query` body, so a retrieval change that ships behind a request flag
-//! can be A/B-ed on the same server, case by case, with nothing else varying.
-//!
-//! A query that fails or comes back "warming" is counted on its own and never
-//! scored as a miss, because a dead server and a bad ranking must not look alike.
 
 use std::time::Instant;
 
@@ -21,7 +12,6 @@ use crate::scoring::{
 };
 use crate::{EVAL_LIMIT, QueryOutcome, query_once, warm_up};
 
-/// A named variation of the `/api/query` body.
 #[derive(serde::Serialize, Debug, Clone, PartialEq)]
 pub struct Arm {
     pub name: String,
@@ -29,8 +19,6 @@ pub struct Arm {
 }
 
 impl Arm {
-    /// Parse `NAME=JSON`. The JSON must be an object that leaves `query` and
-    /// `repo` alone, since those are the case itself.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (name, json) = spec
             .split_once('=')
@@ -57,7 +45,6 @@ impl Arm {
     }
 }
 
-/// Which case sets a run scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetGroup {
     Doc,
@@ -90,7 +77,6 @@ impl SetGroup {
     }
 }
 
-/// Derive the requested sets, in the fixed order doc, ident, mixed, para.
 fn build_sets(repo: &str, wanted: &[SetGroup]) -> Vec<CaseSet> {
     let wants = |g| wanted.contains(&g);
     let mut sets = Vec::new();
@@ -115,7 +101,6 @@ fn build_sets(repo: &str, wanted: &[SetGroup]) -> Vec<CaseSet> {
     sets
 }
 
-/// One arm's results over one set.
 pub(crate) struct ArmRun {
     pub(crate) tally: RecallTally,
     pub(crate) failed: u64,
@@ -131,8 +116,6 @@ impl ArmRun {
         }
     }
 
-    /// Fold one query outcome in. Only a ranking is scored. A failure or a
-    /// "warming" answer is counted and kept out of the denominator.
     pub(crate) fn record(&mut self, case: &EvalCase, arm: &str, outcome: QueryOutcome) {
         match outcome {
             QueryOutcome::Ranked(rows) => self.tally.observe(
@@ -170,7 +153,6 @@ struct ArmReport {
     queries_warming: u64,
 }
 
-/// The second arm against the first, per cutoff.
 #[derive(serde::Serialize, Debug)]
 struct PairedReport {
     baseline: String,
@@ -279,7 +261,6 @@ fn score_set(
     }
 }
 
-/// Run every requested set against `server` once per arm and return the report.
 pub fn run(
     repo: &str,
     server: &str,
@@ -332,12 +313,10 @@ pub fn run(
 }
 
 impl SetsReport {
-    /// Cases scored across all sets, one count per set not per arm.
     pub fn case_count(&self) -> usize {
         self.sets.iter().map(|s| s.cases).sum()
     }
 
-    /// One table per set, then the failure line a run must end on.
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(

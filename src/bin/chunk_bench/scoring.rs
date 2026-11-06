@@ -66,40 +66,25 @@ impl ScoreDeltas {
     }
 }
 
-/// Results past this rank are not scored: R@10, MRR and the paired counts all
-/// look at the same ten.
 const RANK_CUTOFF: usize = 10;
 
-/// How one eval case ended for one ranking.
 #[derive(serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CaseRank {
-    /// The expected result, at this 1-based rank.
     Hit(u32),
-    /// Ranked, and the expected result is not in the first ten.
     Miss,
-    /// The query failed or was answered "warming", so there is no ranking.
     Unscored,
 }
 
-/// What a tally knows beyond recall and IoU.
 #[derive(serde::Serialize, Debug, Clone)]
 pub struct RankingDetail {
-    /// Mean reciprocal rank over the observed cases.
     pub mrr: f64,
-    /// Mean number of source lines in the first five results.
     pub lines_at_5: f64,
-    /// One entry per case, in case order.
     pub ranks: Vec<CaseRank>,
-    /// Hash of each case's result list, `None` for an unscored case.
     pub case_hashes: Vec<Option<String>>,
-    /// Hash of every list in order, so two arms that returned the same lists
-    /// show the same value.
     pub result_hash: String,
 }
 
-/// How many cases got a different result list from each ranking. Cases either
-/// ranking left unscored are left out.
 pub fn lists_differing(a: &[Option<String>], b: &[Option<String>]) -> usize {
     a.iter()
         .zip(b)
@@ -107,7 +92,6 @@ pub fn lists_differing(a: &[Option<String>], b: &[Option<String>]) -> usize {
         .count()
 }
 
-/// Wins, losses and ties of the second ranking against the first at one cutoff.
 #[derive(serde::Serialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Paired {
     pub wins: u32,
@@ -115,9 +99,6 @@ pub struct Paired {
     pub ties: u32,
 }
 
-/// Compare two rankings case by case at "hit within the first `k`". A win is a
-/// case `b` hits and `a` does not. Equal outcomes are ties, and a case either
-/// ranking left unscored is left out.
 pub fn paired_at(a: &[CaseRank], b: &[CaseRank], k: u32) -> Paired {
     let hit = |r: &CaseRank| matches!(r, CaseRank::Hit(rank) if *rank <= k);
     let mut out = Paired::default();
@@ -229,9 +210,6 @@ impl RecallTally {
         self.n += 1;
     }
 
-    /// Record a case with no ranking to score: the query failed or the server
-    /// answered "warming". It stays out of the denominator, so it can neither
-    /// help nor hurt recall, and the caller reports it as its own count.
     pub fn observe_unscored(&mut self) {
         self.ranks.push(CaseRank::Unscored);
         self.case_hashes.push(None);
@@ -418,9 +396,7 @@ mod tests {
         use CaseRank::{Hit, Miss};
         let a = [Miss, Hit(1), Hit(3), Miss, Hit(2)];
         let b = [Hit(1), Miss, Hit(2), Miss, Hit(4)];
-        // b wins case 0, loses case 1, ties 2 and 3, and ties case 4 at k=5.
         assert_eq!(paired_at(&a, &b, 5), Paired { wins: 1, losses: 1, ties: 3 });
-        // At k=1 case 4 is still a tie and case 2 stays one.
         assert_eq!(paired_at(&a, &b, 1), Paired { wins: 1, losses: 1, ties: 3 });
     }
 
@@ -434,7 +410,6 @@ mod tests {
     #[test]
     fn paired_cutoff_decides_what_counts_as_a_hit() {
         use CaseRank::Hit;
-        // Rank 3 vs rank 1: a loss at k=1 for the second ranking, a tie at k=5.
         assert_eq!(paired_at(&[Hit(1)], &[Hit(3)], 1), Paired { wins: 0, losses: 1, ties: 0 });
         assert_eq!(paired_at(&[Hit(1)], &[Hit(3)], 5), Paired { wins: 0, losses: 0, ties: 1 });
     }

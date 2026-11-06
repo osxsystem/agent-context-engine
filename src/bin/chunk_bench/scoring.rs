@@ -66,6 +66,76 @@ impl ScoreDeltas {
     }
 }
 
+const RANK_CUTOFF: usize = 10;
+
+#[derive(serde::Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaseRank {
+    Hit(u32),
+    Miss,
+    Unscored,
+}
+
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct RankingDetail {
+    pub mrr: f64,
+    pub lines_at_5: f64,
+    pub ranks: Vec<CaseRank>,
+    pub case_hashes: Vec<Option<String>>,
+    pub result_hash: String,
+}
+
+pub fn lists_differing(a: &[Option<String>], b: &[Option<String>]) -> usize {
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| matches!((x, y), (Some(x), Some(y)) if x != y))
+        .count()
+}
+
+#[derive(serde::Serialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Paired {
+    pub wins: u32,
+    pub losses: u32,
+    pub ties: u32,
+}
+
+pub fn paired_at(a: &[CaseRank], b: &[CaseRank], k: u32) -> Paired {
+    let hit = |r: &CaseRank| matches!(r, CaseRank::Hit(rank) if *rank <= k);
+    let mut out = Paired::default();
+    for (ra, rb) in a.iter().zip(b) {
+        if matches!(ra, CaseRank::Unscored) || matches!(rb, CaseRank::Unscored) {
+            continue;
+        }
+        match (hit(ra), hit(rb)) {
+            (false, true) => out.wins += 1,
+            (true, false) => out.losses += 1,
+            _ => out.ties += 1,
+        }
+    }
+    out
+}
+
+/// FNV-1a. The hash only has to be stable across runs and builds, which
+/// `DefaultHasher` does not promise.
+struct Fnv(u64);
+
+impl Fnv {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+}
+
+impl Default for Fnv {
+    fn default() -> Self {
+        Self(Self::OFFSET)
+    }
+}
+
 /// Running recall/IoU tally across eval cases.
 #[derive(Default)]
 pub struct RecallTally {
@@ -73,7 +143,11 @@ pub struct RecallTally {
     r5: u64,
     r10: u64,
     iou_sum: f64,
+    rr_sum: f64,
+    lines5_sum: u64,
     n: u64,
+    ranks: Vec<CaseRank>,
+    case_hashes: Vec<Option<u64>>,
 }
 
 impl RecallTally {
@@ -102,6 +176,25 @@ impl RecallTally {
                 hit_rank = Some(rank);
             }
         }
+        self.lines5_sum += ranking
+            .iter()
+            .take(5)
+            .map(|r| u64::from(r.line_end.saturating_sub(r.line_start)) + 1)
+            .sum::<u64>();
+        let mut list_hash = Fnv::default();
+        for r in ranking {
+            list_hash.write(r.file.as_bytes());
+            list_hash.write(format!(":{}-{};", r.line_start, r.line_end).as_bytes());
+        }
+        self.case_hashes.push(Some(list_hash.0));
+        let scored_rank = hit_rank.filter(|rank| *rank < RANK_CUTOFF);
+        self.ranks.push(match scored_rank {
+            Some(rank) => {
+                self.rr_sum += 1.0 / (rank + 1) as f64;
+                CaseRank::Hit(rank as u32 + 1)
+            }
+            None => CaseRank::Miss,
+        });
         if let Some(rank) = hit_rank {
             if rank < 1 {
                 self.r1 += 1;
@@ -117,9 +210,33 @@ impl RecallTally {
         self.n += 1;
     }
 
+    pub fn observe_unscored(&mut self) {
+        self.ranks.push(CaseRank::Unscored);
+        self.case_hashes.push(None);
+    }
+
     /// Number of cases observed — the denominator behind every rate below.
     pub fn observed(&self) -> u64 {
         self.n
+    }
+
+    pub fn detail(&self) -> RankingDetail {
+        let denom = self.n.max(1) as f64;
+        let mut all = Fnv::default();
+        for h in &self.case_hashes {
+            all.write(&h.unwrap_or(0).to_le_bytes());
+        }
+        RankingDetail {
+            mrr: self.rr_sum / denom,
+            lines_at_5: self.lines5_sum as f64 / denom,
+            ranks: self.ranks.clone(),
+            result_hash: format!("{:016x}", all.0),
+            case_hashes: self
+                .case_hashes
+                .iter()
+                .map(|h| h.map(|h| format!("{h:016x}")))
+                .collect(),
+        }
     }
 
     pub fn finish(&self, label: &str) -> RankingScore {
@@ -152,7 +269,10 @@ mod tests {
         let mut t = RecallTally::default();
         t.observe("/r/a.rs", (10, 20), &[row("/r/a.rs", 12, 18)]);
         let s = t.finish("t");
-        assert_eq!((s.recall_at_1, s.recall_at_5, s.recall_at_10), (1.0, 1.0, 1.0));
+        assert_eq!(
+            (s.recall_at_1, s.recall_at_5, s.recall_at_10),
+            (1.0, 1.0, 1.0)
+        );
     }
 
     #[test]
@@ -164,7 +284,10 @@ mod tests {
         ranking.push(row("/r/a.rs", 12, 18));
         t.observe("/r/a.rs", (10, 20), &ranking);
         let s = t.finish("t");
-        assert_eq!((s.recall_at_1, s.recall_at_5, s.recall_at_10), (0.0, 0.0, 1.0));
+        assert_eq!(
+            (s.recall_at_1, s.recall_at_5, s.recall_at_10),
+            (0.0, 0.0, 1.0)
+        );
     }
 
     #[test]
@@ -215,6 +338,160 @@ mod tests {
         t.observe("/r/a.rs", (10, 20), &[row("/r/b.rs", 12, 18)]); // miss
         assert_eq!(t.finish("t").recall_at_1, 0.5);
         assert_eq!(t.observed(), 2);
+    }
+
+    fn tally_of(rankings: &[Vec<QueryResultRow>]) -> RecallTally {
+        let mut t = RecallTally::default();
+        for ranking in rankings {
+            t.observe("/r/a.rs", (10, 20), ranking);
+        }
+        t
+    }
+
+    fn miss_row(i: u32) -> QueryResultRow {
+        row("/r/other.rs", i, i)
+    }
+
+    #[test]
+    fn mrr_is_the_mean_reciprocal_of_the_first_hit_rank() {
+        let t = tally_of(&[
+            vec![row("/r/a.rs", 12, 18)],
+            vec![miss_row(1), row("/r/a.rs", 12, 18)],
+            vec![miss_row(1), miss_row(2), miss_row(3)],
+        ]);
+        assert!((t.detail().mrr - (1.0 + 0.5 + 0.0) / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mrr_ignores_hits_past_the_tenth_result() {
+        let mut ranking: Vec<QueryResultRow> = (1..=10).map(miss_row).collect();
+        ranking.push(row("/r/a.rs", 12, 18));
+        let detail = tally_of(&[ranking]).detail();
+        assert_eq!(detail.mrr, 0.0);
+        assert_eq!(detail.ranks, [CaseRank::Miss]);
+    }
+
+    #[test]
+    fn lines_at_5_sums_the_first_five_results_and_averages_over_cases() {
+        let five_by_ten: Vec<QueryResultRow> = (0..7)
+            .map(|i| row("/r/b.rs", i * 100 + 1, i * 100 + 10))
+            .collect();
+        let t = tally_of(&[five_by_ten, vec![row("/r/b.rs", 1, 4)]]);
+        assert!((t.detail().lines_at_5 - (50.0 + 4.0) / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn per_case_ranks_are_one_based_and_in_case_order() {
+        let detail = tally_of(&[
+            vec![miss_row(1), miss_row(2), row("/r/a.rs", 12, 18)],
+            vec![miss_row(1)],
+        ])
+        .detail();
+        assert_eq!(detail.ranks, [CaseRank::Hit(3), CaseRank::Miss]);
+    }
+
+    #[test]
+    fn an_unscored_case_stays_out_of_the_denominator() {
+        let mut t = tally_of(&[vec![row("/r/a.rs", 12, 18)]]);
+        t.observe_unscored();
+        assert_eq!(t.observed(), 1);
+        assert_eq!(t.finish("t").recall_at_1, 1.0);
+        assert_eq!(t.detail().ranks, [CaseRank::Hit(1), CaseRank::Unscored]);
+    }
+
+    #[test]
+    fn paired_counts_wins_losses_and_ties_at_a_cutoff() {
+        use CaseRank::{Hit, Miss};
+        let a = [Miss, Hit(1), Hit(3), Miss, Hit(2)];
+        let b = [Hit(1), Miss, Hit(2), Miss, Hit(4)];
+        assert_eq!(
+            paired_at(&a, &b, 5),
+            Paired {
+                wins: 1,
+                losses: 1,
+                ties: 3
+            }
+        );
+        assert_eq!(
+            paired_at(&a, &b, 1),
+            Paired {
+                wins: 1,
+                losses: 1,
+                ties: 3
+            }
+        );
+    }
+
+    #[test]
+    fn paired_tie_counts_neither_a_win_nor_a_loss() {
+        use CaseRank::Hit;
+        let same = [Hit(1), Hit(4)];
+        assert_eq!(
+            paired_at(&same, &same, 5),
+            Paired {
+                wins: 0,
+                losses: 0,
+                ties: 2
+            }
+        );
+    }
+
+    #[test]
+    fn paired_cutoff_decides_what_counts_as_a_hit() {
+        use CaseRank::Hit;
+        assert_eq!(
+            paired_at(&[Hit(1)], &[Hit(3)], 1),
+            Paired {
+                wins: 0,
+                losses: 1,
+                ties: 0
+            }
+        );
+        assert_eq!(
+            paired_at(&[Hit(1)], &[Hit(3)], 5),
+            Paired {
+                wins: 0,
+                losses: 0,
+                ties: 1
+            }
+        );
+    }
+
+    #[test]
+    fn paired_skips_a_case_either_ranking_left_unscored() {
+        use CaseRank::{Hit, Miss, Unscored};
+        assert_eq!(
+            paired_at(&[Hit(1), Unscored], &[Unscored, Miss], 5),
+            Paired::default()
+        );
+    }
+
+    #[test]
+    fn identical_rankings_hash_alike_and_different_ones_do_not() {
+        let a = tally_of(&[vec![row("/r/a.rs", 12, 18), miss_row(1)]]).detail();
+        let same = tally_of(&[vec![row("/r/a.rs", 12, 18), miss_row(1)]]).detail();
+        let reordered = tally_of(&[vec![miss_row(1), row("/r/a.rs", 12, 18)]]).detail();
+        assert_eq!(a.result_hash, same.result_hash);
+        assert_ne!(a.result_hash, reordered.result_hash);
+    }
+
+    #[test]
+    fn lists_differing_counts_cases_whose_lists_disagree() {
+        let a = tally_of(&[
+            vec![row("/r/a.rs", 1, 9)],
+            vec![row("/r/a.rs", 1, 9), miss_row(1)],
+            vec![row("/r/a.rs", 1, 9)],
+        ]);
+        let mut b = tally_of(&[
+            vec![row("/r/a.rs", 1, 9)],
+            vec![miss_row(1), row("/r/a.rs", 1, 9)],
+        ]);
+        b.observe_unscored();
+        assert_eq!(
+            lists_differing(&a.detail().case_hashes, &b.detail().case_hashes),
+            1,
+            "one case differs, one matches, one is unscored"
+        );
     }
 
     #[test]

@@ -23,6 +23,12 @@
 //!   chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]
 //!   chunk_bench <repo_path> <legacy_url> <ab_out.json> --ab --new-server <new_url>
 //!   chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--top-k N] [--cases N] [--compare prior.json]
+//!   chunk_bench <repo_path> <server_url> <out.json> [--sets doc,ident,mixed,para] [--arm NAME=JSON]... [--top-k N]
+//!
+//! The last form scores the doc, ident, mixed (three templates) and para sets
+//! once per `--arm`, each arm's JSON merged into the `/api/query` body, and
+//! exits 3 if any query failed or came back warming. `scripts/retrieval_bench.sh`
+//! boots a private server for it.
 //!
 //! `--rerank-ab` needs a server with agentic RAG off unless Jev is the rerank
 //! provider; `scripts/rerank_bench.sh` boots one privately against the real
@@ -54,8 +60,10 @@ use context_engine_rs::parsing::symbols::Symbol;
 mod eval;
 mod rerank_ab;
 mod scoring;
+mod sets;
 use eval::derive_eval_set;
 use scoring::RecallTally;
+use sets::{Arm, SetGroup};
 
 /// How many retrieval cases to derive from the repo under test. Large enough
 /// that a few unlucky queries cannot swing recall, small enough that a run
@@ -91,6 +99,10 @@ struct Report {
     topk_results_total: u64,
     cut_through_results: u64,
     cut_through_rate: f64,
+    #[serde(default)]
+    queries_failed: u64,
+    #[serde(default)]
+    queries_warming: u64,
     // (4) retrieval — recall / IoU
     recall_at_1: f64,
     recall_at_5: f64,
@@ -147,7 +159,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "usage: chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]\n       chunk_bench <repo_path> <legacy_server_url> <ab_out.json> --ab --new-server <new_server_url>\n       chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--label NAME] [--top-k N] [--cases N] [--compare prior.json]"
+            "usage: chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--no-retrieval] [--legacy]\n       chunk_bench <repo_path> <legacy_server_url> <ab_out.json> --ab --new-server <new_server_url>\n       chunk_bench <repo_path> <server_url> <out.json> --rerank-ab [--label NAME] [--top-k N] [--cases N] [--compare prior.json]\n       chunk_bench <repo_path> <server_url> <out.json> [--label NAME] [--sets doc,ident,mixed,para] [--arm NAME=JSON]... [--top-k N]"
         );
         std::process::exit(2);
     }
@@ -163,6 +175,8 @@ fn main() {
     let mut cases = EVAL_LIMIT;
     let mut compare: Option<String> = None;
     let mut new_server: Option<String> = None;
+    let mut set_groups: Option<Vec<SetGroup>> = None;
+    let mut arms: Vec<Arm> = Vec::new();
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -221,9 +235,64 @@ fn main() {
                     new_server = Some(args[i].trim_end_matches('/').to_string());
                 }
             }
-            other => eprintln!("warning: ignoring unknown arg {other}"),
+            "--sets" => {
+                i += 1;
+                let list = args.get(i).map(String::as_str).unwrap_or_default();
+                set_groups = Some(SetGroup::parse_list(list).unwrap_or_else(|e| {
+                    eprintln!("[chunk_bench] {e}");
+                    std::process::exit(2);
+                }));
+            }
+            "--arm" => {
+                i += 1;
+                let spec = args.get(i).map(String::as_str).unwrap_or_default();
+                let arm = Arm::parse(spec).unwrap_or_else(|e| {
+                    eprintln!("[chunk_bench] {e}");
+                    std::process::exit(2);
+                });
+                if arms.iter().any(|a| a.name == arm.name) {
+                    eprintln!("[chunk_bench] --arm {} given twice", arm.name);
+                    std::process::exit(2);
+                }
+                arms.push(arm);
+            }
+            other => {
+                eprintln!("[chunk_bench] unknown argument {other}");
+                std::process::exit(2);
+            }
         }
         i += 1;
+    }
+
+    if set_groups.is_some() || !arms.is_empty() {
+        if ab || rerank_ab {
+            eprintln!(
+                "[chunk_bench] --sets and --arm are a different mode from --ab and --rerank-ab"
+            );
+            std::process::exit(2);
+        }
+        if arms.is_empty() {
+            arms.push(Arm::parse("base={}").expect("default arm parses"));
+        }
+        eprintln!("[chunk_bench] running retrieval sets against {server} ...");
+        let report = sets::run(
+            &repo,
+            &server,
+            &label,
+            &set_groups.unwrap_or_else(|| SetGroup::ALL.to_vec()),
+            arms,
+            top_k,
+        );
+        let json = serde_json::to_string_pretty(&report).expect("serialize sets report");
+        std::fs::write(&out_path, &json).expect("write sets report");
+        eprintln!("[chunk_bench] wrote {out_path}");
+        print!("{}", report.render());
+        if report.case_count() == 0 {
+            eprintln!("[chunk_bench] ERROR: no case could be derived from {repo}");
+            std::process::exit(2);
+        }
+        exit_on_failures(report.queries_failed, report.queries_warming);
+        return;
     }
 
     if rerank_ab {
@@ -274,6 +343,17 @@ fn main() {
     std::fs::write(&out_path, &json).expect("write report");
     eprintln!("[chunk_bench] wrote {out_path}");
     println!("{json}");
+    exit_on_failures(report.queries_failed, report.queries_warming);
+}
+
+fn exit_on_failures(failed: u64, warming: u64) {
+    if failed > 0 || warming > 0 {
+        eprintln!(
+            "[chunk_bench] FAILED: queries_failed={failed} queries_warming={warming}; \
+             recall is over the answered cases only"
+        );
+        std::process::exit(3);
+    }
 }
 
 /// A/B orchestration: build BOTH rows in one run with identical measurement code
@@ -354,6 +434,10 @@ fn run_ab(repo: &str, legacy_server: &str, new_server: &str, out_path: &str) {
     std::fs::write(out_path, &json).expect("write ab report");
     eprintln!("[chunk_bench] wrote {out_path}");
     println!("{json}");
+    exit_on_failures(
+        ab.legacy.queries_failed + ab.new.queries_failed,
+        ab.legacy.queries_warming + ab.new.queries_warming,
+    );
 }
 
 /// Count non-whitespace characters — the same size metric the chunker uses, so
@@ -536,6 +620,65 @@ struct QueryResultRow {
 struct QueryResp {
     #[serde(default)]
     results: Vec<QueryResultRow>,
+    #[serde(default)]
+    graph_pending: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct RankedBody {
+    results: Vec<QueryResultRow>,
+    #[serde(default)]
+    warming: bool,
+    #[serde(default)]
+    graph_pending: bool,
+}
+
+pub(crate) enum QueryOutcome {
+    Ranked(Vec<QueryResultRow>),
+    Warming,
+    Failed(String),
+}
+
+// Mirrors `mcp::query_gate::WARMING_STATUS`, which is pub(crate) and so out of reach here.
+const WARMING_STATUS: u16 = 503;
+
+pub(crate) async fn query_once(
+    client: &reqwest::Client,
+    server: &str,
+    body: &serde_json::Value,
+) -> QueryOutcome {
+    let resp = match client
+        .post(format!("{server}/api/query"))
+        .json(body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return QueryOutcome::Failed(format!("request error: {e}")),
+    };
+    let status = resp.status();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return QueryOutcome::Failed(format!("HTTP {status}: body error: {e}")),
+    };
+    classify_response(status.as_u16(), &bytes)
+}
+
+fn classify_response(status: u16, body: &[u8]) -> QueryOutcome {
+    let snippet = || String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned();
+    if status == WARMING_STATUS
+        && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v["status"] == "warming")
+    {
+        return QueryOutcome::Warming;
+    }
+    if !(200..300).contains(&status) {
+        return QueryOutcome::Failed(format!("HTTP {status}: {}", snippet()));
+    }
+    match serde_json::from_slice::<RankedBody>(body) {
+        Ok(b) if b.warming || b.graph_pending => QueryOutcome::Warming,
+        Ok(b) => QueryOutcome::Ranked(b.results),
+        Err(e) => QueryOutcome::Failed(format!("decode error: {e}: {}", snippet())),
+    }
 }
 
 /// Wait until the server answers a query for `repo` with results.
@@ -563,7 +706,7 @@ pub(crate) async fn warm_up(client: &reqwest::Client, server: &str, repo: &str) 
             Ok(r) => r
                 .json::<QueryResp>()
                 .await
-                .is_ok_and(|q| !q.results.is_empty()),
+                .is_ok_and(|q| !q.results.is_empty() && !q.graph_pending),
             Err(_) => false,
         };
         if answered {
@@ -659,31 +802,24 @@ fn run_retrieval(repo: &str, server: &str, report: &mut Report) {
                 "top_k": 10,
                 "rerank": false,
             });
-            let resp = match client
-                .post(format!("{server}/api/query"))
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[chunk_bench] query error for {query:?}: {e}");
+            let results = match query_once(&client, server, &body).await {
+                QueryOutcome::Ranked(rows) => rows,
+                QueryOutcome::Warming => {
+                    report.queries_warming += 1;
                     continue;
                 }
-            };
-            let parsed: QueryResp = match resp.json().await {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("[chunk_bench] decode error for {query:?}: {e}");
+                QueryOutcome::Failed(why) => {
+                    eprintln!("[chunk_bench] query failed for {query:?}: {why}");
+                    report.queries_failed += 1;
                     continue;
                 }
             };
             report.queries_run += 1;
-            report.topk_results_total += parsed.results.len() as u64;
+            report.topk_results_total += results.len() as u64;
 
             // Cut-through is measured over ALL top-k results, any file — a
             // separate question from recall, so it keeps its own pass.
-            for r in parsed.results.iter() {
+            for r in results.iter() {
                 if let Ok(src) = std::fs::read_to_string(&r.file) {
                     let p = parse_file(&r.file, &src);
                     if is_cut_through(r.line_start, r.line_end, &p.symbols) {
@@ -693,7 +829,7 @@ fn run_retrieval(repo: &str, server: &str, report: &mut Report) {
             }
             // Recall/IoU go through the shared tally in `scoring`, the single
             // definition of a hit — see that module for why this is not inlined.
-            tally.observe(&exp_file_norm, (exp_start, exp_end), &parsed.results);
+            tally.observe(&exp_file_norm, (exp_start, exp_end), &results);
         }
     });
 
@@ -707,4 +843,143 @@ fn run_retrieval(repo: &str, server: &str, report: &mut Report) {
     } else {
         0.0
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn stub(status: u16, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = sock.read(&mut buf).await else {
+                            return;
+                        };
+                        seen.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&seen).to_lowercase();
+                        let Some(head_end) = text.find("\r\n\r\n") else {
+                            if n == 0 {
+                                return;
+                            }
+                            continue;
+                        };
+                        let want = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if seen.len() >= head_end + 4 + want || n == 0 {
+                            break;
+                        }
+                    }
+                    let reply = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        url
+    }
+
+    async fn outcome(status: u16, body: &'static str) -> QueryOutcome {
+        let url = stub(status, body).await;
+        query_once(
+            &reqwest::Client::new(),
+            &url,
+            &serde_json::json!({"query": "q"}),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn http_502_is_a_failure_and_not_a_miss() {
+        let out = outcome(502, r#"{"error":"query failed: boom"}"#).await;
+        assert!(matches!(out, QueryOutcome::Failed(ref why) if why.contains("502")));
+
+        let case = eval::EvalCase {
+            query: "q".into(),
+            file: "/r/a.rs".into(),
+            symbol: "s".into(),
+            line_start: 1,
+            line_end: 9,
+        };
+        let mut run = sets::ArmRun::new();
+        run.record(&case, "a", out);
+        assert_eq!(run.failed, 1);
+        assert_eq!(
+            run.tally.observed(),
+            0,
+            "a failure must not enter the denominator"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_body_with_status_200_is_a_failure() {
+        let out = outcome(200, r#"{"error":"No repositories configured."}"#).await;
+        assert!(matches!(out, QueryOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_body_is_a_failure() {
+        assert!(matches!(
+            outcome(200, "not json").await,
+            QueryOutcome::Failed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_503_with_the_warming_body_is_warming() {
+        let body = r#"{"status":"warming","error":"indexing is still in progress; retry shortly","retry":true}"#;
+        assert!(matches!(outcome(503, body).await, QueryOutcome::Warming));
+    }
+
+    #[tokio::test]
+    async fn a_503_without_the_warming_body_is_a_failure() {
+        assert!(matches!(outcome(503, "{}").await, QueryOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn a_200_flagged_warming_is_warming_not_an_empty_ranking() {
+        let out = outcome(200, r#"{"results":[],"warming":true}"#).await;
+        assert!(matches!(out, QueryOutcome::Warming));
+    }
+
+    #[tokio::test]
+    async fn a_200_with_the_graph_still_pending_is_warming() {
+        let out = outcome(
+            200,
+            r#"{"results":[],"warming":false,"graph_pending":true}"#,
+        )
+        .await;
+        assert!(matches!(out, QueryOutcome::Warming));
+    }
+
+    #[tokio::test]
+    async fn a_200_with_results_is_ranked() {
+        let body = r#"{"results":[{"file":"/r/a.rs","line_start":1,"line_end":9,"score":0.5}],"warming":false}"#;
+        match outcome(200, body).await {
+            QueryOutcome::Ranked(rows) => assert_eq!(rows.len(), 1),
+            _ => panic!("expected a ranking"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_a_failure() {
+        let url = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let out = query_once(&reqwest::Client::new(), &url, &serde_json::json!({})).await;
+        assert!(matches!(out, QueryOutcome::Failed(_)));
+    }
 }

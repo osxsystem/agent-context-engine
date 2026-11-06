@@ -2072,3 +2072,32 @@ fn adjacent_blocks_with_the_same_copies_merge_and_keep_the_note_once() {
         vec!["a.rs#L1-20 (+2 identical: x.rs, y.rs)"]
     );
 }
+
+#[test]
+fn worktree_redirect_note_states_what_the_agent_cannot_see() {
+    let note = worktree_redirect_note("/work/wt", "/work/main");
+    assert!(note.contains("linked git worktree"), "{note}");
+    assert!(note.contains("'/work/wt'"), "{note}");
+    assert!(note.contains("'/work/main'"), "{note}");
+    assert!(note.contains("not visible"), "{note}");
+    assert!(note.contains("uncommitted"), "{note}");
+    assert!(note.contains("branch"), "{note}");
+    assert!(note.contains("Line numbers may differ"), "{note}");
+    assert!(note.contains("worktree copy"), "{note}");
+    assert!(note.ends_with("\n\n"), "{note:?}");
+}
+
+#[test]
+fn server_instructions_state_the_worktree_limitation() {
+    for text in [
+        crate::prompts::MCP_SERVER_INSTRUCTIONS,
+        crate::prompts::MCP_SERVER_INSTRUCTIONS_REPO,
+    ] {
+        assert!(text.contains("not visible"), "{text}");
+        assert!(text.contains("line numbers may differ"), "{text}");
+        assert!(
+            !text.contains("prefer passing the main checkout path"),
+            "{text}"
+        );
+    }
+}

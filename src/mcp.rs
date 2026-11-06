@@ -940,8 +940,11 @@ pub async fn run_codebase_retrieval(
 /// monolith/worker funnels here and the router proxy (`router::mcp_proxy`).
 pub fn worktree_redirect_note(worktree: &str, main_root: &str) -> String {
     format!(
-        "(note: '{worktree}' is a linked git worktree; results come from the main \
-         repository index at '{main_root}' - file paths below are under that root)\n\n"
+        "(note: '{worktree}' is a linked git worktree. Results come from the main \
+         checkout's index and files at '{main_root}'. File paths below are under that \
+         root. Edits in the worktree that are uncommitted or exist only on its branch \
+         are not visible here. Line numbers may differ from your worktree. Before you edit a \
+         file, open its worktree copy.)\n\n"
     )
 }
 

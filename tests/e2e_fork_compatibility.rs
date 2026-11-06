@@ -140,6 +140,9 @@ async fn global_mcp_preserves_worktree_scope_and_progress() {
     let result = messages.iter().find(|m| m["id"] == 2).expect("tool result");
     let text = result["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("linked git worktree"), "{text}");
+    assert!(text.contains("not visible"), "{text}");
+    assert!(text.contains("Line numbers may differ"), "{text}");
+    assert!(text.contains("worktree copy"), "{text}");
     assert!(text.contains(&repo), "{text}");
     assert!(text.contains("probe.rs#L"), "{text}");
     assert!(

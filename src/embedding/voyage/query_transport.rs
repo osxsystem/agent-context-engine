@@ -9,7 +9,17 @@ use crate::embedding::InputType;
 use super::VoyageClient;
 
 impl VoyageClient {
+    /// Embeds a search query. Identical text returns the identical vector for the
+    /// life of the client with no request. Failures are never cached.
     pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        if let Some(cached) = self.inner.query_cache.get(text) {
+            return Ok(cached.to_vec());
+        }
+        let fetched = self.fetch_query_embedding(text).await?;
+        Ok(self.inner.query_cache.insert(text, fetched).to_vec())
+    }
+
+    async fn fetch_query_embedding(&self, text: &str) -> Result<Vec<f32>> {
         let texts = vec![text.to_string()];
         let key_count = self.inner.api_keys.len();
         let start = self.inner.key_cursor.fetch_add(1, Ordering::Relaxed) % key_count;

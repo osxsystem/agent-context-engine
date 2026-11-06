@@ -8,6 +8,7 @@ use reqwest::Client;
 mod batch_transport;
 mod batching;
 mod http_transport;
+mod query_cache;
 mod query_transport;
 mod retry;
 
@@ -82,6 +83,7 @@ pub(super) struct VoyageInner {
     pub(super) endpoint: String,
     pub(super) dimensions: Option<u32>,
     pub(super) key_cursor: AtomicUsize,
+    pub(super) query_cache: query_cache::QueryEmbeddingCache,
 }
 
 impl VoyageClient {
@@ -117,6 +119,7 @@ impl VoyageClient {
                 endpoint: embedding_url(provider, base_url),
                 dimensions,
                 key_cursor: AtomicUsize::new(0),
+                query_cache: query_cache::QueryEmbeddingCache::new(),
             }),
         })
     }

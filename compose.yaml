@@ -1,0 +1,23 @@
+name: context-engine
+
+# Per-machine values come from `.env` next to this file (gitignored):
+#   CODE_ROOT=C:\Users\me\Codes   # host folder holding the repos to index
+services:
+  context-engine:
+    image: osxsystem-context-engine:local
+    build: .
+    container_name: context-engine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT:-6699}:6699"
+    environment:
+      # MCP clients on the host send host paths; translate them to the mount below.
+      CONTEXT_ENGINE_PATH_MAP: "${CODE_ROOT:?set CODE_ROOT in .env}=/workspace"
+      # Windows-host bind mounts deliver no inotify events; rescan every 30s instead.
+      CONTEXT_ENGINE_FORCE_POLLING: "1"
+    volumes:
+      - "${CODE_ROOT}:/workspace"
+      - context-engine-data:/home/engine/.vibervn
+
+volumes:
+  context-engine-data:

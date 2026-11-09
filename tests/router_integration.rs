@@ -595,6 +595,30 @@ async fn put_config_without_new_repo_does_not_spawn() {
     );
 }
 
+/// The UI sends repo paths as typed and adopts the PUT reply, so the router is
+/// the only place two spellings of one repo collapse into a single entry.
+#[tokio::test]
+async fn put_config_collapses_repo_spellings_to_one_entry() {
+    let home = TempDir::new().unwrap();
+    let repo = normalize(r"d:\projects\rust\existing");
+    seed_settings(&home, &[&repo]);
+    let addr = start_router(&home).await;
+
+    let mut cfg = context_engine_rs::config::ensure_dir_and_load(home.path()).unwrap();
+    cfg.repos = vec![repo.clone(), format!("{repo}/")];
+    let saved: serde_json::Value = Client::new()
+        .put(format!("http://{addr}/api/config"))
+        .json(&serde_json::to_value(&cfg).unwrap())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(saved["repos"], serde_json::json!([repo]));
+}
+
 /// Booting the router on a brand-new (empty) home dir must seed + persist
 /// `machine_id` into settings.json — so a router-first install ends up with the
 /// same settings.json shape as an engine-first one, rather than depending on

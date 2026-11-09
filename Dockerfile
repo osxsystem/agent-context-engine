@@ -15,12 +15,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cargo build --release --locked --bin context-engine-rs \
  && cp target/release/context-engine-rs /usr/local/bin/context-engine-rs
 
-# Optional: `docker build --target test --build-arg TEST_FILTER=... .`
+# Optional: `docker build --target test --build-arg CARGO_TEST_ARGS="--test router_integration" .`
 FROM build AS test
-ARG TEST_FILTER=""
+ARG CARGO_TEST_ARGS="--lib"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo test --release --locked --lib -- ${TEST_FILTER}
+    cargo test --release --locked ${CARGO_TEST_ARGS}
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

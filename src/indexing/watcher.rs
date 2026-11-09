@@ -139,6 +139,13 @@ fn dispatch(result: DebounceEventResult, gate: &RescanGate) {
 /// Events are debounced with a 3-second window and sent through `tx` as `IndexTrigger`.
 /// Falls back to 30-second polling if the watcher fails to initialise.
 pub async fn start_watcher(repo_path: String, tx: Sender<IndexTrigger>) {
+    // Docker Desktop bind mounts from a Windows host accept inotify watches but
+    // never deliver events for host-side edits, so watch() "succeeds" and changes
+    // would only surface on the safety-net scan. Such deployments opt into polling.
+    if std::env::var_os("CONTEXT_ENGINE_FORCE_POLLING").is_some() {
+        run_polling_fallback(repo_path, tx).await;
+        return;
+    }
     let path = PathBuf::from(&repo_path);
 
     // Try to start a real watcher.

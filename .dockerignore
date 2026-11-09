@@ -1,0 +1,7 @@
+target
+.git
+bench-results
+screenshot*.png
+npm/*/bin
+.env
+compose.yaml

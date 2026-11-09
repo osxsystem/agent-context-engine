@@ -587,7 +587,7 @@ pub struct FileRetrievalArgs {
 #[derive(Clone)]
 pub struct McpHandler {
     /// Used ONLY for `settings.json` access (config_path / ensure_dir_and_load).
-    /// settings.json's location is fixed at `~/.vibervn/context-engine/settings.json`.
+    /// settings.json's location is fixed at `~/.hugues/context-engine/settings.json`.
     home_dir: PathBuf,
     /// Boot-resolved data directory (CLI > env > `Settings.data_dir` > builtin
     /// default). Used for store/embedding paths. Captured once at startup —

@@ -69,8 +69,16 @@ pub fn add_exclusions(_data_dir: &str) -> DefenderExcludeResult {
 }
 
 #[cfg(windows)]
+fn process_image_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "context-engine-rs.exe".to_string())
+}
+
+#[cfg(windows)]
 pub fn check_status(data_dir: &str) -> DefenderStatus {
-    let process_name = "context-engine.exe";
+    let process_name = process_image_name();
     let normalized_dir = data_dir
         .replace('/', "\\")
         .trim_end_matches('\\')
@@ -195,7 +203,7 @@ try {{
 pub fn add_exclusions(data_dir: &str) -> DefenderExcludeResult {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-    let process_name = "context-engine.exe";
+    let process_name = process_image_name();
     let normalized_dir = data_dir
         .replace('/', "\\")
         .trim_end_matches('\\')

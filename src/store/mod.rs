@@ -52,12 +52,63 @@ pub type RepoDbMap = Arc<RwLock<HashMap<String, Surreal<Db>>>>;
 /// On Unix: forward slashes only (case-sensitive filesystems — no case fold).
 /// Trailing separators are stripped on both platforms.
 pub fn normalize_repo_path(repo: &str) -> String {
+    let repo = map_client_path(repo);
     let s = if cfg!(windows) {
         repo.replace('/', "\\").to_lowercase()
     } else {
         repo.replace('\\', "/")
     };
     s.trim_end_matches(['/', '\\']).to_string()
+}
+
+/// Translate a path as the MCP client sees it into this process's filesystem view,
+/// using `CONTEXT_ENGINE_PATH_MAP` (`CLIENT=LOCAL[;CLIENT=LOCAL...]`). A containerized
+/// engine needs this because clients send host paths like `C:\Users\me\Codes\app`
+/// while the repo is mounted at `/workspace/app`. Unset → the path is returned as-is.
+fn map_client_path(path: &str) -> String {
+    match std::env::var("CONTEXT_ENGINE_PATH_MAP") {
+        Ok(spec) => map_client_path_with(&spec, path),
+        Err(_) => path.to_string(),
+    }
+}
+
+fn map_client_path_with(spec: &str, path: &str) -> String {
+    let unify = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_string();
+    let p = unify(path);
+    for (client, local) in spec.split(';').filter_map(|pair| pair.split_once('=')) {
+        let client = unify(client.trim());
+        if client.is_empty() {
+            continue;
+        }
+        let Some(head) = p.get(..client.len()) else { continue };
+        let rest = &p[client.len()..];
+        if head.eq_ignore_ascii_case(&client) && (rest.is_empty() || rest.starts_with('/')) {
+            return format!("{}{rest}", local.trim().trim_end_matches('/'));
+        }
+    }
+    path.to_string()
+}
+
+#[cfg(test)]
+mod map_client_path_tests {
+    use super::map_client_path_with;
+
+    const SPEC: &str = r"C:\Users\me\Codes=/workspace;D:\other=/other";
+
+    #[test]
+    fn maps_windows_host_path_case_insensitively() {
+        assert_eq!(map_client_path_with(SPEC, r"c:\users\me\Codes\app"), "/workspace/app");
+        assert_eq!(map_client_path_with(SPEC, r"D:\other\x\"), "/other/x");
+        assert_eq!(map_client_path_with(SPEC, r"C:\Users\me\Codes"), "/workspace");
+        assert_eq!(map_client_path_with(SPEC, r"C:\Users\me\Codes\MyApp"), "/workspace/MyApp");
+    }
+
+    #[test]
+    fn leaves_unmapped_and_sibling_prefix_paths_alone() {
+        assert_eq!(map_client_path_with(SPEC, r"C:\Users\me\CodesX\app"), r"C:\Users\me\CodesX\app");
+        assert_eq!(map_client_path_with(SPEC, "/workspace/app"), "/workspace/app");
+        assert_eq!(map_client_path_with("", "/repo"), "/repo");
+    }
 }
 
 /// If `repo` is a linked git worktree, return the main repository's working

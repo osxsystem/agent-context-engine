@@ -51,7 +51,7 @@ fn migrate_v1_to_v2(mut value: Value) -> Result<Value, ConfigError> {
 /// SHARED path across multiple instances, so identical code chunks are embedded
 /// once (the cache is concurrency-safe; only RocksDB needs per-instance
 /// isolation). `None` means the builtin default
-/// `~/.vibervn/context-engine/embeddings` (anchored to home, not `data_dir`).
+/// `~/.hugues/context-engine/embeddings` (anchored to home, not `data_dir`).
 fn migrate_v2_to_v3(mut value: Value) -> Result<Value, ConfigError> {
     if let Value::Object(ref mut obj) = value {
         obj.entry("embeddings_dir".to_string())
@@ -620,9 +620,9 @@ pub struct Settings {
     /// `<data_dir>/rocksdb/`. The embedding cache defaults to
     /// `<data_dir>/embeddings/` but can be relocated independently via
     /// `embeddings_dir`. `settings.json` itself ALWAYS lives at
-    /// `~/.vibervn/context-engine/settings.json` regardless of this value.
+    /// `~/.hugues/context-engine/settings.json` regardless of this value.
     ///
-    /// `None` means "use the builtin default" (`~/.vibervn/context-engine`),
+    /// `None` means "use the builtin default" (`~/.hugues/context-engine`),
     /// distinguishing an unset preference from an explicit choice.
     /// Boot precedence: CLI flag > env `CONTEXT_ENGINE_DATA_DIR` >
     /// `Settings.data_dir` > builtin default.
@@ -639,11 +639,11 @@ pub struct Settings {
     /// needs per-instance isolation.
     ///
     /// `None` means "use the builtin default" —
-    /// `~/.vibervn/context-engine/embeddings`, anchored to home (NOT to
+    /// `~/.hugues/context-engine/embeddings`, anchored to home (NOT to
     /// `data_dir`) so multiple instances with different `--data-dir` values
     /// share ONE cache by default.
     /// Boot precedence: CLI flag > env `CONTEXT_ENGINE_EMBEDDINGS_DIR` >
-    /// `Settings.embeddings_dir` > `~/.vibervn/context-engine/embeddings`.
+    /// `Settings.embeddings_dir` > `~/.hugues/context-engine/embeddings`.
     /// Like `data_dir`, this is boot-frozen: a PUT change persists for the next
     /// launch only.
     #[serde(default)]
@@ -795,23 +795,20 @@ impl std::error::Error for ConfigError {}
 /// so deriving its location from the field would be circular. See the bootstrap
 /// notes on `Settings.data_dir`.
 pub fn config_path(home_dir: &Path) -> PathBuf {
-    home_dir
-        .join(".vibervn")
-        .join("context-engine")
-        .join("settings.json")
+    default_data_dir(home_dir).join("settings.json")
 }
 
 /// Return the builtin-default data directory under `home_dir`
-/// (`~/.vibervn/context-engine`).
+/// (`~/.hugues/context-engine`).
 ///
 /// Used as the lowest-precedence fallback in boot resolution when no CLI flag,
 /// env var, or persisted `Settings.data_dir` is set.
 pub fn default_data_dir(home_dir: &Path) -> PathBuf {
-    home_dir.join(".vibervn").join("context-engine")
+    home_dir.join(".hugues").join("context-engine")
 }
 
 /// Return the default embedding-cache root under `home_dir`
-/// (`~/.vibervn/context-engine/embeddings`).
+/// (`~/.hugues/context-engine/embeddings`).
 ///
 /// Used as the lowest-precedence fallback in boot resolution when no CLI flag,
 /// env var, or persisted `Settings.embeddings_dir` is set. Anchored to
@@ -819,7 +816,7 @@ pub fn default_data_dir(home_dir: &Path) -> PathBuf {
 /// cache is concurrency-safe and meant to be shared, so multiple instances
 /// running with different `--data-dir` values share ONE cache by default —
 /// identical chunks are embedded once. A pure default install (no flags) still
-/// lands at `~/.vibervn/context-engine/embeddings`, byte-identical to the
+/// lands at `~/.hugues/context-engine/embeddings`, byte-identical to the
 /// historical layout, because `default_data_dir(home)` is the same base.
 pub fn default_embeddings_dir(home_dir: &Path) -> PathBuf {
     default_data_dir(home_dir).join("embeddings")
@@ -1297,13 +1294,13 @@ mod tests {
         let dd = default_data_dir(home.path());
         assert_eq!(
             dd,
-            home.path().join(".vibervn").join("context-engine"),
+            home.path().join(".hugues").join("context-engine"),
             "default data_dir must match historical layout for byte-identical default install"
         );
     }
 
     /// `default_embeddings_dir` is anchored to `home_dir`
-    /// (`~/.vibervn/context-engine/embeddings`), NOT to the resolved data_dir,
+    /// (`~/.hugues/context-engine/embeddings`), NOT to the resolved data_dir,
     /// so instances with different data dirs share one cache by default. A pure
     /// default install still matches the historical layout.
     #[test]
@@ -1313,7 +1310,7 @@ mod tests {
         assert_eq!(
             ed,
             home.path()
-                .join(".vibervn")
+                .join(".hugues")
                 .join("context-engine")
                 .join("embeddings"),
             "default embeddings_dir must match historical layout for byte-identical default install"

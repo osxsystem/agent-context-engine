@@ -8661,7 +8661,7 @@ mod mmap_warm_microbench {
 // ground truth for a probe set, then measures i8 recall@10 / recall@30 + score drift.
 // GATE: recall@10 >= 0.98. Below that → pivot to mmap fallback, do NOT ship i8.
 //
-// Runs against the production data dir by default (~/.vibervn/context-engine), repo
+// Runs against the production data dir by default (~/.hugues/context-engine), repo
 // chosen via env. #[ignore]d — run explicitly:
 //   RECALL_REPO='c:/users/0x317/downloads/linux' \
 //     cargo test --release --lib recall_gate_i8_vs_f32 -- --ignored --nocapture
@@ -8677,12 +8677,7 @@ mod recall_gate {
             .expect("set RECALL_REPO to a repo path that is already indexed");
         let data_dir = std::env::var("RECALL_DATA_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap()
-                    .join(".vibervn")
-                    .join("context-engine")
-            });
+            .unwrap_or_else(|_| crate::config::default_data_dir(&dirs::home_dir().unwrap()));
         let n_probes: usize = std::env::var("RECALL_PROBES")
             .ok()
             .and_then(|v| v.parse().ok())

@@ -30,8 +30,8 @@ COPY --from=build /usr/local/bin/context-engine-rs /usr/local/bin/context-engine
 ENV HOME=/home/engine \
     CONTEXT_ENGINE_BIND=0.0.0.0 \
     CONTEXT_ENGINE_PORT=6699
-RUN mkdir -p /home/engine/.vibervn/context-engine /workspace
-VOLUME ["/home/engine/.vibervn"]
+RUN mkdir -p /home/engine/.hugues/context-engine /workspace
+VOLUME ["/home/engine/.hugues"]
 EXPOSE 6699
 # tini reaps the per-repo worker processes the router spawns and forwards SIGTERM.
 ENTRYPOINT ["/usr/bin/tini", "--", "context-engine-rs"]

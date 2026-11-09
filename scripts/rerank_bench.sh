@@ -21,7 +21,7 @@
 #   TOP_K         default 10
 #   CASES         default 50; each case is one rerank LLM call, so sample scarce-quota models
 #   PORT          default 7911
-#   SETTINGS_HOME default $HOME (reads $SETTINGS_HOME/.vibervn/context-engine/settings.json)
+#   SETTINGS_HOME default $HOME (reads $SETTINGS_HOME/.hugues/context-engine/settings.json)
 #   NOTE          free text stamped into the artifact (e.g. why a model was substituted)
 #
 # Output:
@@ -45,7 +45,7 @@ TOP_K="${TOP_K:-10}"
 PORT="${PORT:-7911}"
 URL="http://127.0.0.1:${PORT}"
 REAL_HOME="${SETTINGS_HOME:-$HOME}"
-REAL_CE="${REAL_HOME}/.vibervn/context-engine"
+REAL_CE="${REAL_HOME}/.hugues/context-engine"
 OUT_DIR="${CRATE_DIR}/bench-results/rerank"
 OUT_JSON="${OUT_DIR}/${LABEL}.json"
 mkdir -p "$OUT_DIR"
@@ -70,7 +70,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${TMP_HOME}/.vibervn/context-engine"
+mkdir -p "${TMP_HOME}/.hugues/context-engine"
 jq --arg d "$REAL_CE" --arg repo "$REPO" --arg model "${RERANK_MODEL:-}" \
    --arg provider "${RERANK_PROVIDER:-}" --arg jev_keys "${JEV_API_KEYS:-}" '
   .llm.agentic_rag = false
@@ -80,8 +80,8 @@ jq --arg d "$REAL_CE" --arg repo "$REPO" --arg model "${RERANK_MODEL:-}" \
   | .data_dir = (.data_dir // $d)
   | .embeddings_dir = (.embeddings_dir // ($d + "/embeddings"))
   | .repos = [$repo]
-' "${REAL_CE}/settings.json" > "${TMP_HOME}/.vibervn/context-engine/settings.json"
-chmod 600 "${TMP_HOME}/.vibervn/context-engine/settings.json"
+' "${REAL_CE}/settings.json" > "${TMP_HOME}/.hugues/context-engine/settings.json"
+chmod 600 "${TMP_HOME}/.hugues/context-engine/settings.json"
 
 echo "[rerank_bench] building release binaries ..."
 (cd "$CRATE_DIR" && cargo build --release --bin context-engine-rs --bin chunk_bench)

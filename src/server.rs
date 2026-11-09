@@ -106,7 +106,7 @@ impl IntoResponse for ConfigError {
 #[derive(Clone)]
 pub struct AppState {
     /// Resolved home directory. Used ONLY for `settings.json` access (its
-    /// location is fixed at `~/.vibervn/context-engine/settings.json` — see
+    /// location is fixed at `~/.hugues/context-engine/settings.json` — see
     /// the bootstrap notes on `Settings.data_dir`).
     pub home_dir: PathBuf,
     /// Boot-resolved data directory (CLI > env > `Settings.data_dir` > builtin
@@ -451,7 +451,7 @@ async fn put_config(State(state): State<AppState>, body: axum::body::Bytes) -> R
     }
 
     // (4b) Same boot-frozen treatment for embeddings_dir. The default is
-    // anchored to home (`~/.vibervn/context-engine/embeddings`), matching how
+    // anchored to home (`~/.hugues/context-engine/embeddings`), matching how
     // boot resolution computes it — NOT derived from the configured data_dir.
     // A mismatch is lower-risk than data_dir (a cache-root switch only causes
     // cache misses, not split-brain), but the running process still keeps its

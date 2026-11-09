@@ -17,7 +17,7 @@ services:
       CONTEXT_ENGINE_FORCE_POLLING: "1"
     volumes:
       - "${CODE_ROOT}:/workspace"
-      - context-engine-data:/home/engine/.vibervn
+      - context-engine-data:/home/engine/.hugues
 
 volumes:
   context-engine-data:

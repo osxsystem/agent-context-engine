@@ -52,6 +52,7 @@ pub type RepoDbMap = Arc<RwLock<HashMap<String, Surreal<Db>>>>;
 /// On Unix: forward slashes only (case-sensitive filesystems — no case fold).
 /// Trailing separators are stripped on both platforms.
 pub fn normalize_repo_path(repo: &str) -> String {
+    let repo = map_client_path(repo);
     let s = if cfg!(windows) {
         repo.replace('/', "\\").to_lowercase()
     } else {
@@ -64,7 +65,7 @@ pub fn normalize_repo_path(repo: &str) -> String {
 /// using `CONTEXT_ENGINE_PATH_MAP` (`CLIENT=LOCAL[;CLIENT=LOCAL...]`). A containerized
 /// engine needs this because clients send host paths like `C:\Users\me\Codes\app`
 /// while the repo is mounted at `/workspace/app`. Unset → the path is returned as-is.
-pub fn map_client_path(path: &str) -> String {
+fn map_client_path(path: &str) -> String {
     match std::env::var("CONTEXT_ENGINE_PATH_MAP") {
         Ok(spec) => map_client_path_with(&spec, path),
         Err(_) => path.to_string(),
@@ -99,6 +100,7 @@ mod map_client_path_tests {
         assert_eq!(map_client_path_with(SPEC, r"c:\users\me\Codes\app"), "/workspace/app");
         assert_eq!(map_client_path_with(SPEC, r"D:\other\x\"), "/other/x");
         assert_eq!(map_client_path_with(SPEC, r"C:\Users\me\Codes"), "/workspace");
+        assert_eq!(map_client_path_with(SPEC, r"C:\Users\me\Codes\MyApp"), "/workspace/MyApp");
     }
 
     #[test]

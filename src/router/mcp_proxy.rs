@@ -32,7 +32,7 @@ use serde_json::json;
 
 use super::proxy::{ProxyCtx, forward_json_to_worker};
 use crate::mcp::{MCP_PROGRESS_HEARTBEAT, with_progress_heartbeat};
-use crate::store::{map_client_path, normalize_repo_path};
+use crate::store::normalize_repo_path;
 
 /// Args for the proxied global `codebase-retrieval` tool. Mirrors
 /// `mcp::CodebaseRetrievalArgs` (the fields the funnel reads): the free-form
@@ -103,7 +103,7 @@ impl ProxyMcpHandler {
         Parameters(args): Parameters<ProxyCodebaseRetrievalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let repo = normalize_repo_path(&map_client_path(args.workspace_full_path.trim()));
+        let repo = normalize_repo_path(args.workspace_full_path.trim());
         if repo.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "Error: workspace_full_path is required.".to_string(),
@@ -141,7 +141,7 @@ impl ProxyMcpHandler {
         Parameters(args): Parameters<ProxyFileRetrievalArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let repo = normalize_repo_path(&map_client_path(args.workspace_full_path.trim()));
+        let repo = normalize_repo_path(args.workspace_full_path.trim());
         if repo.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "Error: workspace_full_path is required.".to_string(),

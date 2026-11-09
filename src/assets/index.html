@@ -1231,26 +1231,6 @@ function exampleRepoPath() {
   return isWindowsOS() ? 'D:\\projects\\my-app' : '~/projects/my-app';
 }
 
-// Mirrors Rust store::normalize_repo_path so a freshly-added repo's identity
-// matches the value the server persists and keys indexStatuses by. Without this
-// the optimistic row carries raw case (D:\…) while the server returns lowercase
-// (d:\…): the row's status badge never binds, and the index poll's "unknown
-// repo" heuristic misfires every tick. Windows → backslashes + lowercase;
-// elsewhere → forward slashes. Both trim trailing separators.
-//
-// The branch is chosen from the SHAPE OF THE PATH (drive letter / UNC → the
-// server is Windows), NOT from the browser's OS (isWindowsOS). The browser and
-// the server can differ — e.g. a Windows browser managing a Linux/Docker server.
-// Keying off the browser lowercased "/home/User/Proj" into "\home\user\proj",
-// which the case-sensitive Linux filesystem can't find, so indexing failed.
-function normalizeRepoPath(repo) {
-  const isWindowsPath = /^[A-Za-z]:[\\/]/.test(repo) || repo.startsWith('\\\\');
-  let s = isWindowsPath
-    ? repo.replace(/\//g, '\\').toLowerCase()
-    : repo.replace(/\\/g, '/');
-  return s.replace(/[\\/]+$/, '');
-}
-
 // MCP endpoints are for MCP clients on the machine the engine runs on, so the
 // host is ALWAYS localhost and the port is the backend's real listen port
 // (GET /api/server-info) — never window.location. The page origin is wrong
@@ -2576,10 +2556,9 @@ function handleAddRepo() {
   const warning = document.getElementById('repo-warning');
   const isAbsolute = raw.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(raw);
   if (!isAbsolute) { warning.classList.remove('hidden'); } else { warning.classList.add('hidden'); }
-  // Normalize to the server's canonical form so the optimistic row's identity
-  // matches what the PUT response returns and what indexStatuses is keyed by —
-  // otherwise the status badge never binds and the poll re-syncs on every tick.
-  const val = normalizeRepoPath(raw);
+  // The server canonicalizes (case, separators, container path mapping) and
+  // saveNow() adopts its reply, so send the path exactly as typed.
+  const val = raw.replace(/[\\/]+$/, '');
   if (!cfg.repos) cfg.repos = [];
   if (cfg.repos.includes(val)) { input.value = ''; return; }  // already configured — no-op
   cfg.repos.push(val);

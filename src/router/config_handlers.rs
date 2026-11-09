@@ -53,10 +53,12 @@ async fn put_config(State(state): State<RouterState>, body: axum::body::Bytes) -
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
         }
     }
+    let mut seen = std::collections::HashSet::new();
     settings.repos = settings
         .repos
         .iter()
         .map(|r| normalize_repo_path(r))
+        .filter(|r| seen.insert(r.clone()))
         .collect();
 
     // FIRST-ADD auto-index: capture the repo set BEFORE the write so we can diff
